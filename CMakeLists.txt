@@ -260,6 +260,7 @@ add_subdirectory(src/graphics)
 add_subdirectory(src/system)
 add_subdirectory(src/kernel)
 add_subdirectory(src/codegen)
+add_subdirectory(src/discord)
 add_subdirectory(src/rexglue)
 
 # Add tests subdirectory if tests are enabled
