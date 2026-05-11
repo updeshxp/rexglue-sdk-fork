@@ -111,9 +111,11 @@ if(REXGLUE_ENABLE_PERF_COUNTERS)
 endif()
 
 if(WIN32)
-    target_link_libraries(rexruntime PRIVATE ws2_32)
+target_link_libraries(rexruntime PRIVATE rexdiscord ws2_32)
     target_link_libraries(rexruntime PUBLIC dxgi dxguid)
     target_compile_definitions(rexruntime PUBLIC NOMINMAX WIN32_LEAN_AND_MEAN)
+elseif(LINUX)
+    target_link_libraries(rexruntime PRIVATE rexdiscord)
 endif()
 
 if(REXGLUE_USE_D3D12)
