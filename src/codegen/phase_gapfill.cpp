@@ -13,7 +13,9 @@
 
 #include <unordered_set>
 
+#include <rex/codegen/function_scanner.h>
 #include <rex/codegen/phases.h>
+#include "decoded_binary.h"
 #include "phase_helpers.h"
 
 #include <rex/logging.h>
@@ -37,10 +39,18 @@ namespace {
 
 // Split a code region into function segments based on terminators (blr, tail calls).
 std::vector<CodeRegion> splitRegionOnTerminators(
-    const CodeRegion& region, const BinaryView& binary,
+    const CodeRegion& region, const BinaryView& binary, DecodedBinary& decodedBinary,
     const std::unordered_set<uint32_t>& knownCallables) {
   std::vector<CodeRegion> segments;
   uint32_t segmentStart = region.start;
+
+  // Track the furthest forward target seen from conditional branches within
+  // the current segment. A conditional branch (bc/beq/bne/…) always has a
+  // fall-through, so its target is guaranteed to be inside the same function.
+  // We must not split a segment on a terminator (blr, bctr, b) while a
+  // conditional branch is still pointing to code ahead of it — that would
+  // fragment a real function in a gap region into bogus pieces.
+  uint32_t maxConditionalForwardTarget = region.start;
 
   for (uint32_t addr = region.start; addr < region.end; addr += 4) {
     const uint8_t* data = binary.translate(addr);
@@ -52,16 +62,74 @@ std::vector<CodeRegion> splitRegionOnTerminators(
     bool shouldSplit = false;
     const char* reason = nullptr;
 
+    // Extend the forward-span window on conditional branches. These unambiguously
+    // stay inside the same function (they have a fall-through path), so any
+    // terminator before their target must not end the segment.
+    if (decoded.is_conditional() && decoded.branch_target.has_value()) {
+      uint32_t target = decoded.branch_target.value();
+      if (target > addr && target < region.end) {
+        maxConditionalForwardTarget = std::max(maxConditionalForwardTarget, target);
+      }
+    }
+
+    // Only treat a terminator as a segment boundary once we are past all
+    // forward conditional-branch targets in this segment. Before that point
+    // the terminator is inside a function body, not at its end.
+    bool pastForwardSpan = (addr >= maxConditionalForwardTarget);
+
     // Check for terminators
     if (decoded.is_return()) {
-      shouldSplit = true;
-      reason = "blr";
+      if (pastForwardSpan) {
+        shouldSplit = true;
+        reason = "blr";
+      }
+    } else if (decoded.opcode == Opcode::bcctr && !decoded.is_conditional()) {
+      // Unconditional `bctr` is either:
+      //  (a) a vtable-forwarder thunk tail-dispatch (plain lwz → mtctr → bctr, no lis
+      //      table base) → should split so each thunk is a separate callable.
+      //  (b) a switch/jump-table dispatcher (indexed lwzx/lbzx + lis table → mtctr →
+      //      bctr, with the jump table data and case bodies immediately following) →
+      //      must NOT split: the table bytes + case bodies belong to the same function,
+      //      and splitting here registers the table as a bogus gap function that
+      //      overlaps the real function, causing internal labels to fail classifyTarget
+      //      and emit REX_FATAL "Unresolved conditional branch".
+      //
+      // Use detectJumpTable() — the same detector the recompiler uses — to distinguish
+      // them. It returns a table (with .targets) only for switch dispatchers; for vtable
+      // thunks (no indexed load, no lis) it returns nullopt.
+      if (auto jt = detectJumpTable(decodedBinary, addr, region, region.start, region.end)) {
+        // Switch dispatch: extend the forward-span window to cover all case-body
+        // targets so no terminator inside the table or case bodies splits the segment.
+        for (uint32_t t : jt->targets) {
+          if (t > addr && t < region.end) {
+            maxConditionalForwardTarget = std::max(maxConditionalForwardTarget, t);
+          }
+        }
+        REXCODEGEN_TRACE(
+            "GapFill: bctr at 0x{:08X} is switch dispatch (table=0x{:08X}, {} cases) — "
+            "no split, extended span to 0x{:08X}",
+            addr, jt->tableAddress, jt->targets.size(), maxConditionalForwardTarget);
+        // Do not set shouldSplit — the switch and its case bodies stay in one segment.
+      } else if (pastForwardSpan) {
+        // Vtable thunk or other non-switch bctr: split so each thunk is registered.
+        shouldSplit = true;
+        reason = "bctr";
+      }
     } else if (decoded.opcode == Opcode::b && decoded.branch_target.has_value()) {
       uint32_t target = decoded.branch_target.value();
-      // Don't split on tail recursion (branch to own segment start)
-      if (target != segmentStart && knownCallables.contains(target)) {
+      // An unconditional `b` never falls through, so the following instruction
+      // begins a new segment unless this is a backward branch into the segment
+      // we are currently accumulating (an intra-function loop). A forward or
+      // far branch is a tail call / function exit. Previously we only split when
+      // the target was an already-known callable, which missed tail calls to
+      // not-yet-discovered functions: the segment then swallowed the function
+      // that physically follows the branch, and block discovery (which stops at
+      // the branch) left that following function unregistered -> runtime trap
+      // "Call to invalid or unregistered function".
+      bool loopsBack = (target >= segmentStart && target <= addr);
+      if (pastForwardSpan && (!loopsBack || knownCallables.contains(target))) {
         shouldSplit = true;
-        reason = "tail call";
+        reason = "tail branch";
       }
     }
 
@@ -73,6 +141,8 @@ std::vector<CodeRegion> splitRegionOnTerminators(
                          segmentEnd, reason, addr);
       }
       segmentStart = segmentEnd;
+      // Reset the forward-span window for the new segment.
+      maxConditionalForwardTarget = segmentStart;
     }
   }
 
@@ -124,6 +194,7 @@ void gapFillCodeRegions(CodegenContext& ctx) {
 
   auto& graph = ctx.graph;
   auto& binary = ctx.binary();
+  auto& decodedBinary = ctx.decoded();
   auto& scan = ctx.scan;
 
   // Build set of known callables for tail call detection
@@ -137,7 +208,7 @@ void gapFillCodeRegions(CodegenContext& ctx) {
 
   for (const auto& region : scan.codeRegions) {
     // Split region on terminators (blr, tail calls), then check each segment
-    auto segments = splitRegionOnTerminators(region, binary, knownCallables);
+    auto segments = splitRegionOnTerminators(region, binary, decodedBinary, knownCallables);
 
     for (const auto& segment : segments) {
       // Skip if this segment's start is already a registered function entry
