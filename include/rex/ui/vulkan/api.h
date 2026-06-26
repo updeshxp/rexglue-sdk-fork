@@ -36,6 +36,9 @@
 #ifndef VK_USE_PLATFORM_XCB_KHR
 #define VK_USE_PLATFORM_XCB_KHR
 #endif
+#ifdef VK_USE_PLATFORM_WAYLAND_KHR
+#include <wayland-client.h>
+#endif
 #endif
 
 #if REX_PLATFORM_WIN32

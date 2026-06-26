@@ -221,6 +221,12 @@ void* WindowSDL::GetNativeWindowHandle() const {
 #endif
 }
 
+void WindowSDL::WarpMouseInWindow(int32_t x, int32_t y) {
+  if (sdl_window_) {
+    SDL_WarpMouseInWindow(sdl_window_, float(x), float(y));
+  }
+}
+
 uint32_t WindowSDL::GetLatestDpiImpl() const {
   float scale = sdl_window_ ? SDL_GetWindowDisplayScale(sdl_window_)
                             : SDL_GetDisplayContentScale(SDL_GetPrimaryDisplay());
@@ -246,10 +252,16 @@ void WindowSDL::ApplyNewTitle() {
 
 void WindowSDL::ApplyNewMouseCapture() {
   SDL_CaptureMouse(true);
+  if (sdl_window_) {
+    SDL_StopTextInput(sdl_window_);
+  }
 }
 
 void WindowSDL::ApplyNewMouseRelease() {
   SDL_CaptureMouse(false);
+  if (sdl_window_) {
+    SDL_StartTextInput(sdl_window_);
+  }
 }
 
 void WindowSDL::ApplyNewCursorVisibility(CursorVisibility old_cursor_visibility) {
@@ -313,6 +325,17 @@ std::unique_ptr<Surface> WindowSDL::CreateSurfaceImpl(Surface::TypeFlags allowed
     }
   }
 #else
+#ifdef VK_USE_PLATFORM_WAYLAND_KHR
+  if (allowed_types & Surface::kTypeFlag_WaylandSurface) {
+    auto* wl_display_ptr = static_cast<struct wl_display*>(
+        SDL_GetPointerProperty(props, SDL_PROP_WINDOW_WAYLAND_DISPLAY_POINTER, nullptr));
+    auto* wl_surface_ptr = static_cast<struct wl_surface*>(
+        SDL_GetPointerProperty(props, SDL_PROP_WINDOW_WAYLAND_SURFACE_POINTER, nullptr));
+    if (wl_display_ptr && wl_surface_ptr) {
+      return std::make_unique<WaylandSurface>(wl_display_ptr, wl_surface_ptr, sdl_window_);
+    }
+  }
+#endif
   if (allowed_types & Surface::kTypeFlag_XcbWindow) {
     auto* display = static_cast<Display*>(
         SDL_GetPointerProperty(props, SDL_PROP_WINDOW_X11_DISPLAY_POINTER, nullptr));

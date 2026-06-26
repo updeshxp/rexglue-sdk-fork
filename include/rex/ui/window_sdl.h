@@ -32,6 +32,7 @@ class WindowSDL final : public Window {
   ~WindowSDL() override;
 
   void* GetNativeWindowHandle() const override;
+  void WarpMouseInWindow(int32_t x, int32_t y) override;
 
   // Called by SDLWindowedAppContext on the UI thread.
   void HandleWindowEvent(SDL_Event& event);

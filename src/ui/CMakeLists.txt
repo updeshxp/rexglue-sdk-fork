@@ -148,6 +148,13 @@ if(NOT WIN32)
     target_link_libraries(rexui PUBLIC
         ${X11_XCB_LIBRARIES}
     )
+
+    pkg_check_modules(WAYLAND QUIET wayland-client)
+    if(WAYLAND_FOUND)
+        target_include_directories(rexui PRIVATE ${WAYLAND_INCLUDE_DIRS})
+        target_link_libraries(rexui PUBLIC ${WAYLAND_LIBRARIES})
+        target_compile_definitions(rexui PUBLIC VK_USE_PLATFORM_WAYLAND_KHR=1)
+    endif()
 endif()
 
 # D3D12 backend dependencies

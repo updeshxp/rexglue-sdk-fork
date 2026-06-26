@@ -301,6 +301,10 @@ class Window {
   bool IsMouseCaptureRequested() const { return mouse_capture_request_count_ != 0; }
   void CaptureMouse();
   void ReleaseMouse();
+  virtual void WarpMouseInWindow(int32_t x, int32_t y) {
+    (void)x;
+    (void)y;
+  }
 
   // Desired state stored by the common Window, externally modifiable, read-only
   // in the implementation.
