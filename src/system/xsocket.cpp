@@ -26,6 +26,7 @@
 #include <WS2tcpip.h>
 #else
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <netinet/ip.h>
 #include <sys/socket.h>
@@ -56,6 +57,18 @@ X_STATUS XSocket::Initialize(AddressFamily af, Type type, Protocol proto) {
   if (native_handle_ == -1) {
     return X_STATUS_UNSUCCESSFUL;
   }
+
+#if !REX_PLATFORM_WIN32
+  // Guest code may call ioctlsocket(FIONBIO) using Winsock constants that
+  // differ from POSIX FIONBIO, and the arg value is big-endian.  Force every
+  // socket non-blocking at creation so that recvfrom/recv never block
+  // indefinitely — Xbox Live networking is non-functional in a recomp anyway.
+  {
+    int flags = fcntl(static_cast<int>(native_handle_), F_GETFL, 0);
+    if (flags >= 0)
+      fcntl(static_cast<int>(native_handle_), F_SETFL, flags | O_NONBLOCK);
+  }
+#endif
 
   return X_STATUS_SUCCESS;
 }
