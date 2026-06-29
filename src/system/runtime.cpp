@@ -9,8 +9,11 @@
  *              See LICENSE file in the project root for full license text.
  */
 
+#include <sstream>
+
 #include <rex/chrono/clock.h>
 #include <rex/cvar.h>
+#include <rex/filesystem.h>
 #include <rex/filesystem/devices/host_path_device.h>
 #include <rex/filesystem/devices/null_device.h>
 #include <rex/filesystem/vfs.h>
@@ -33,6 +36,12 @@ REXCVAR_DEFINE_STRING(user_data_root, "", "Runtime", "Override user data path");
 REXCVAR_DEFINE_STRING(update_data_root, "", "Runtime", "Override update data path");
 REXCVAR_DEFINE_STRING(cache_root, "", "Runtime", "Override shader cache path");
 REXCVAR_DEFINE_STRING(metadata_root, "", "Runtime", "Override metadata path");
+REXCVAR_DEFINE_STRING(mods_data_root, "", "Runtime", "Host directory containing mod folders");
+REXCVAR_DEFINE_STRING(enabled_mods, "", "Runtime",
+                      "Comma-separated mod folder names to layer over game data");
+REXCVAR_DEFINE_STRING(mods_dump_root, "", "Runtime",
+                      "Host directory dumped assets (textures, shaders) are written under; "
+                      "defaults to <exe folder>/dumps");
 
 namespace rex {
 
@@ -285,6 +294,64 @@ uint8_t* Runtime::virtual_membase() const {
   return memory_ ? memory_->virtual_membase() : nullptr;
 }
 
+void Runtime::ResolveEnabledMods() {
+  enabled_mod_roots_.clear();
+
+  std::string mods_root_cvar = REXCVAR_GET(mods_data_root);
+  std::string enabled_cvar = REXCVAR_GET(enabled_mods);
+  if (mods_root_cvar.empty() || enabled_cvar.empty()) {
+    return;
+  }
+
+  auto mods_root = std::filesystem::absolute(std::filesystem::path(mods_root_cvar));
+  if (!std::filesystem::is_directory(mods_root)) {
+    REXSYS_WARN("  mods_data_root does not exist: {}", mods_root.string());
+    return;
+  }
+
+  // Split comma-separated mod names, trim whitespace. Order is preserved:
+  // earlier entries are higher priority (see ModOverlayRoots).
+  std::istringstream ss(enabled_cvar);
+  std::string name;
+  while (std::getline(ss, name, ',')) {
+    auto start = name.find_first_not_of(" \t");
+    auto end = name.find_last_not_of(" \t");
+    if (start == std::string::npos)
+      continue;
+    name = name.substr(start, end - start + 1);
+    if (name.empty())
+      continue;
+
+    auto mod_dir = mods_root / name;
+    if (std::filesystem::is_directory(mod_dir)) {
+      enabled_mod_roots_.push_back(mod_dir);
+      REXSYS_INFO("  Mod enabled: {} ({})", name, mod_dir.string());
+    } else {
+      REXSYS_WARN("  Mod '{}' not found at {}, skipping", name, mod_dir.string());
+    }
+  }
+}
+
+std::vector<std::filesystem::path> Runtime::ModOverlayRoots(std::string_view subpath) const {
+  std::vector<std::filesystem::path> roots;
+  roots.reserve(enabled_mod_roots_.size());
+  for (auto& mod_root : enabled_mod_roots_) {
+    auto partition_dir = mod_root / rex::to_path(subpath);
+    if (std::filesystem::is_directory(partition_dir)) {
+      roots.push_back(partition_dir);
+    }
+  }
+  return roots;
+}
+
+std::filesystem::path Runtime::ModDumpRoot() const {
+  std::string dump_root_cvar = REXCVAR_GET(mods_dump_root);
+  if (dump_root_cvar.empty()) {
+    return rex::filesystem::GetExecutableFolder() / "dumps";
+  }
+  return std::filesystem::absolute(std::filesystem::path(dump_root_cvar));
+}
+
 bool Runtime::SetupVfs() {
   if (game_data_root_.empty()) {
     REXSYS_WARN("Runtime::SetupVfs: No game_data_root specified, skipping VFS setup");
@@ -297,10 +364,14 @@ bool Runtime::SetupVfs() {
     return false;
   }
 
+  // Resolve enabled mods once; reused for game, update and (later) DLC overlays.
+  ResolveEnabledMods();
+
   // Mount game_data_root as \Device\Harddisk0\Partition1
   auto mount_path = "\\Device\\Harddisk0\\Partition1";
   auto device = std::make_unique<rex::filesystem::HostPathDevice>(
       mount_path, abs_game_root, !REXCVAR_GET(allow_game_relative_writes));
+  device->set_overlay_roots(ModOverlayRoots("game"));
   if (!device->Initialize()) {
     REXSYS_ERROR("Runtime::SetupVfs: Failed to initialize host path device");
     return false;
@@ -323,6 +394,7 @@ bool Runtime::SetupVfs() {
       auto update_mount = "\\Device\\Harddisk0\\PartitionUpdate";
       auto update_device =
           std::make_unique<rex::filesystem::HostPathDevice>(update_mount, abs_update_root, true);
+      update_device->set_overlay_roots(ModOverlayRoots("update"));
       if (update_device->Initialize() && file_system_->RegisterDevice(std::move(update_device))) {
         file_system_->RegisterSymbolicLink("update:", update_mount);
         REXSYS_INFO("  Mounted {} at update:", abs_update_root.string());

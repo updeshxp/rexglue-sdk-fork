@@ -46,7 +46,21 @@ bool HostPathDevice::Initialize() {
   auto root_entry = new HostPathEntry(this, nullptr, "", host_path_);
   root_entry->attributes_ = kFileAttributeDirectory;
   root_entry_ = std::unique_ptr<Entry>(root_entry);
-  PopulateEntry(root_entry);
+
+  if (overlay_roots_.empty()) {
+    PopulateEntry(root_entry);
+  } else {
+    // Build the full list of layer dirs: overlays (highest priority first),
+    // then the base host_path_.
+    std::vector<std::filesystem::path> layers;
+    layers.reserve(overlay_roots_.size() + 1);
+    for (auto& r : overlay_roots_) {
+      layers.push_back(r);
+    }
+    layers.push_back(host_path_);
+    PopulateEntryMerged(root_entry, layers);
+    REXFS_INFO("Overlay merge complete; root has {} children", root_entry->children_.size());
+  }
 
   return true;
 }
@@ -96,6 +110,81 @@ Entry* HostPathDevice::ResolvePath(const std::string_view path) {
   }
 
   return current_entry;
+}
+
+void HostPathDevice::PopulateEntryMerged(HostPathEntry* parent_entry,
+                                         const std::vector<std::filesystem::path>& layer_dirs) {
+  // Track which child names we've already added (case-insensitive).
+  // For directories that appear in multiple layers, we accumulate the
+  // per-layer host paths so we can recurse with a merged source list.
+  struct MergedDir {
+    HostPathEntry* entry;
+    std::vector<std::filesystem::path> source_dirs;
+  };
+  std::vector<std::pair<std::string, MergedDir>> merged_dirs;  // name -> info
+
+  auto find_merged = [&](const std::string_view name) -> MergedDir* {
+    for (auto& [n, md] : merged_dirs) {
+      if (rex::string::utf8_equal_case(n, name)) {
+        return &md;
+      }
+    }
+    return nullptr;
+  };
+
+  auto is_known = [&](const std::string_view name) -> bool {
+    for (auto& child : parent_entry->children_) {
+      if (rex::string::utf8_equal_case(child->name(), name)) {
+        return true;
+      }
+    }
+    return find_merged(name) != nullptr;
+  };
+
+  for (const auto& layer_dir : layer_dirs) {
+    if (!std::filesystem::exists(layer_dir)) {
+      continue;
+    }
+    auto child_infos = rex::filesystem::ListFiles(layer_dir);
+    for (auto& child_info : child_infos) {
+      auto child_name = rex::path_to_utf8(child_info.name);
+      bool is_dir = child_info.type == rex::filesystem::FileInfo::Type::kDirectory;
+
+      if (is_dir) {
+        auto* existing = find_merged(child_name);
+        if (existing) {
+          // Directory already created by a higher-priority layer; just
+          // accumulate this layer's host path for the recursive merge.
+          existing->source_dirs.push_back(layer_dir / child_info.name);
+          continue;
+        }
+        // First layer to introduce this directory — create the entry.
+        auto child =
+            HostPathEntry::Create(this, parent_entry, layer_dir / child_info.name, child_info);
+        if (!child)
+          continue;
+        MergedDir md;
+        md.entry = child;
+        md.source_dirs.push_back(layer_dir / child_info.name);
+        merged_dirs.push_back({child_name, std::move(md)});
+        parent_entry->children_.push_back(std::unique_ptr<Entry>(child));
+      } else {
+        // File: first layer wins, skip if already known.
+        if (is_known(child_name))
+          continue;
+        auto child =
+            HostPathEntry::Create(this, parent_entry, layer_dir / child_info.name, child_info);
+        if (child) {
+          parent_entry->children_.push_back(std::unique_ptr<Entry>(child));
+        }
+      }
+    }
+  }
+
+  // Recurse into merged directories.
+  for (auto& [name, md] : merged_dirs) {
+    PopulateEntryMerged(md.entry, md.source_dirs);
+  }
 }
 
 void HostPathDevice::PopulateEntry(HostPathEntry* parent_entry) {

@@ -11,7 +11,9 @@
 
 #pragma once
 
+#include <filesystem>
 #include <string>
+#include <vector>
 
 #include <rex/filesystem/device.h>
 
@@ -37,6 +39,12 @@ class HostPathDevice : public Device {
   bool allow_share_delete() const { return allow_share_delete_; }
   const std::filesystem::path& host_path() const { return host_path_; }
 
+  /// Set overlay roots (highest priority first) to merge on top of host_path.
+  /// Must be called before Initialize().
+  void set_overlay_roots(std::vector<std::filesystem::path> roots) {
+    overlay_roots_ = std::move(roots);
+  }
+
   const std::string& name() const override { return name_; }
   uint32_t attributes() const override { return 0; }
   uint32_t component_name_max_length() const override { return 255; }
@@ -48,9 +56,12 @@ class HostPathDevice : public Device {
 
  private:
   void PopulateEntry(HostPathEntry* parent_entry);
+  void PopulateEntryMerged(HostPathEntry* parent_entry,
+                           const std::vector<std::filesystem::path>& layer_dirs);
 
   std::string name_;
   std::filesystem::path host_path_;
+  std::vector<std::filesystem::path> overlay_roots_;
   std::unique_ptr<Entry> root_entry_;
   bool read_only_;
   bool allow_share_delete_;
