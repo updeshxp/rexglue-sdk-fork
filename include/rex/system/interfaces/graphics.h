@@ -13,6 +13,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <vector>
 
 #include <rex/system/xtypes.h>
 
@@ -30,6 +31,17 @@ class KernelState;
 }
 
 namespace rex::system {
+
+// Host-resolved mod overlay roots for GPU asset replacement, plus the root
+// dumped assets are written under. Roots are ordered by mod priority (first
+// = highest, matches Runtime::ModOverlayRoots); a graphics system that
+// supports texture/shader replacement should let an earlier root win over a
+// later one for the same content hash.
+struct AssetReplacementConfig {
+  std::vector<std::filesystem::path> texture_mod_roots;
+  std::vector<std::filesystem::path> shader_mod_roots;
+  std::filesystem::path dump_root;
+};
 
 class IGraphicsSystem {
  public:
@@ -78,6 +90,12 @@ class IGraphicsSystem {
     (void)title_id;
     (void)blocking;
   }
+
+  // Texture/shader mod replacement and dumping. Default: unsupported.
+  // Graphics systems that emulate a GPU (e.g. rexgpu-xenos) may override
+  // this to enable content-hash-keyed asset substitution; custom renderers
+  // are free to leave it a no-op.
+  virtual void InitializeAssetReplacement(const AssetReplacementConfig& config) { (void)config; }
 
   // One-shot convenience for callers that don't care about the split.
   X_STATUS Setup(runtime::FunctionDispatcher* function_dispatcher, KernelState* kernel_state,

@@ -19,6 +19,7 @@
 #include <rex/filesystem.h>
 #include <rex/filesystem/devices/host_path_device.h>
 #include <rex/filesystem/devices/stfs_container_device.h>
+#include <rex/runtime.h>
 #include <rex/string.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/xam/content_device.h>
@@ -40,7 +41,8 @@ static int content_device_id_ = 0;
 
 ContentPackage::ContentPackage(KernelState* kernel_state, const std::string_view root_name,
                                const XCONTENT_AGGREGATE_DATA& data,
-                               const std::filesystem::path& package_path)
+                               const std::filesystem::path& package_path,
+                               std::vector<std::filesystem::path> overlay_roots)
     : kernel_state_(kernel_state), root_name_(root_name), package_path_(package_path), license_(0) {
   device_path_ = fmt::format("\\Device\\Content\\{0}\\", ++content_device_id_);
   content_data_ = data;
@@ -48,6 +50,7 @@ ContentPackage::ContentPackage(KernelState* kernel_state, const std::string_view
   auto fs = kernel_state_->file_system();
   auto device = std::make_unique<rex::filesystem::HostPathDevice>(device_path_, package_path, false,
                                                                   /*allow_share_delete=*/true);
+  device->set_overlay_roots(std::move(overlay_roots));
   device->Initialize();
   fs->RegisterDevice(std::move(device));
   fs->RegisterSymbolicLink(root_name_ + ":", device_path_);
@@ -179,7 +182,17 @@ std::unique_ptr<ContentPackage> ContentManager::ResolvePackage(
   if (!std::filesystem::exists(package_path)) {
     return nullptr;
   }
-  auto package = std::make_unique<ContentPackage>(kernel_state_, root_name, data, package_path);
+
+  // DLC packages can be overlaid by mods, keyed by their installed folder
+  // name (data.file_name()). Other content types (saves, profiles, etc.)
+  // are per-user/per-install and are not mod targets.
+  std::vector<std::filesystem::path> overlay_roots;
+  if (data.content_type == XContentType::kMarketplaceContent) {
+    overlay_roots = kernel_state_->emulator()->ModOverlayRoots("dlc/" + data.file_name());
+  }
+
+  auto package = std::make_unique<ContentPackage>(kernel_state_, root_name, data, package_path,
+                                                  std::move(overlay_roots));
   return package;
 }
 

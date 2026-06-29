@@ -235,14 +235,13 @@ X_STATUS VirtualFileSystem::OpenFile(Entry* root_entry, const std::string_view p
     }
 
     // If the cached entry does not exist on host anymore, invalidate it.
-    if (parent_entry) {
-      const auto* host_path_entry = dynamic_cast<const HostPathEntry*>(parent_entry);
-      if (host_path_entry) {
-        const auto file_path = host_path_entry->host_path() / rex::to_path(entry->name());
-        if (!std::filesystem::exists(file_path)) {
-          entry->Delete();
-          entry = nullptr;
-        }
+    // Use the entry's own host_path (not parent + name) because in a merged
+    // overlay tree, parent and child may point to different host directories.
+    const auto* host_entry = dynamic_cast<const HostPathEntry*>(entry);
+    if (host_entry) {
+      if (!std::filesystem::exists(host_entry->host_path())) {
+        entry->Delete();
+        entry = nullptr;
       }
     }
   }
