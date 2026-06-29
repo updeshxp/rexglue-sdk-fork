@@ -18,6 +18,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <vector>
 
 #include <rex/cvar.h>
 #include <rex/embedded_metadata.h>
@@ -40,6 +41,9 @@ REXCVAR_DECLARE(std::string, user_data_root);
 REXCVAR_DECLARE(std::string, update_data_root);
 REXCVAR_DECLARE(std::string, cache_root);
 REXCVAR_DECLARE(std::string, metadata_root);
+REXCVAR_DECLARE(std::string, mods_data_root);
+REXCVAR_DECLARE(std::string, enabled_mods);
+REXCVAR_DECLARE(std::string, mods_dump_root);
 
 namespace rex {
 
@@ -178,15 +182,34 @@ class Runtime {
   // Access the memory base pointer for recompiled code
   uint8_t* virtual_membase() const;
 
+  // Host overlay roots from enabled mods for a given partition subpath
+  // (e.g. "game", "update", "dlc/<file_name>"). Returns <mod_root>/<subpath>
+  // for each enabled mod that has that subfolder, in enabled_mods order
+  // (first = highest priority, matches HostPathDevice::set_overlay_roots).
+  std::vector<std::filesystem::path> ModOverlayRoots(std::string_view subpath) const;
+
+  // Host directory GPU asset replacement (textures/shaders) should dump to.
+  // Resolved from mods_dump_root; falls back to <exe folder>/dumps when
+  // unset.
+  std::filesystem::path ModDumpRoot() const;
+
  private:
   // Set up VFS: mounts game_data_root as game:/d:, update_data_root as update:
   bool SetupVfs();
+
+  // Resolves mods_data_root/enabled_mods cvars into enabled_mod_roots_.
+  // Validates each mod folder exists, warning once per missing mod.
+  void ResolveEnabledMods();
 
   std::filesystem::path game_data_root_;
   std::filesystem::path user_data_root_;
   std::filesystem::path update_data_root_;
   std::filesystem::path cache_root_;
   std::filesystem::path metadata_root_;
+
+  // Enabled mod folder roots, in enabled_mods order (first = highest
+  // priority). Populated once by ResolveEnabledMods() during SetupVfs().
+  std::vector<std::filesystem::path> enabled_mod_roots_;
 
   ui::WindowedAppContext* app_context_ = nullptr;
   ui::Window* display_window_ = nullptr;

@@ -119,7 +119,8 @@ static_assert_size(XCONTENT_AGGREGATE_DATA, 0x148);
 class ContentPackage {
  public:
   ContentPackage(KernelState* kernel_state, const std::string_view root_name,
-                 const XCONTENT_AGGREGATE_DATA& data, const std::filesystem::path& package_path);
+                 const XCONTENT_AGGREGATE_DATA& data, const std::filesystem::path& package_path,
+                 std::vector<std::filesystem::path> overlay_roots = {});
   ~ContentPackage();
 
   void LoadPackageLicenseMask(const std::filesystem::path header_path);
