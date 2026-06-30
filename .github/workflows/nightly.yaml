@@ -72,6 +72,7 @@ jobs:
       ref: ${{ needs.check.outputs.dev_sha }}
       publish_mode: artifact
       artifact_name: nightly-win-amd64
+      extra_cmake_args: -DREXGLUE_USE_VULKAN=ON
     secrets: inherit
 
   build-linux-amd64:

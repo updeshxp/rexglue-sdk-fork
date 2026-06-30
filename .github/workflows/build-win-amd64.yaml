@@ -16,4 +16,5 @@ jobs:
       platform: win-amd64
       ref: ${{ github.ref }}
       publish_mode: release
+      extra_cmake_args: -DREXGLUE_USE_VULKAN=ON
     secrets: inherit
