@@ -173,6 +173,12 @@ target_compile_options(spdlog PRIVATE -w)
 set(SNAPPY_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(SNAPPY_BUILD_BENCHMARKS OFF CACHE BOOL "" FORCE)
 set(SNAPPY_INSTALL ON CACHE BOOL "" FORCE)
+# Our baseline target (x86-64-v2) does not include BMI2. snappy's own
+# check_cxx_source_compiles probe for SNAPPY_HAVE_BMI2 can pass on hosts where
+# the intrinsic header compiles even though -march doesn't enable bmi2,
+# caching a stale "1" that later fails at actual TU compile time. Force it
+# off so generated config.h matches the flags this build actually uses.
+set(SNAPPY_HAVE_BMI2 0 CACHE INTERNAL "" FORCE)
 add_subdirectory(snappy)
 target_compile_options(snappy PRIVATE -w)
 
