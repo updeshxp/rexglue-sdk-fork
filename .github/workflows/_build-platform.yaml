@@ -20,6 +20,11 @@ on:
         required: false
         type: string
         default: ""
+      extra_cmake_args:
+        description: "Additional CMake arguments for the configure step"
+        required: false
+        type: string
+        default: ""
     outputs:
       version:
         description: "Derived build version string (REXGLUE_VERSION_STRING)"
@@ -82,7 +87,7 @@ jobs:
         env:
           CC: ${{ inputs.platform == 'win-amd64' && '' || 'clang-20' }}
           CXX: ${{ inputs.platform == 'win-amd64' && '' || 'clang++-20' }}
-        run: cmake --preset ${{ inputs.platform }} -DCMAKE_C_COMPILER_LAUNCHER=sccache -DCMAKE_CXX_COMPILER_LAUNCHER=sccache
+        run: cmake --preset ${{ inputs.platform }} -DCMAKE_C_COMPILER_LAUNCHER=sccache -DCMAKE_CXX_COMPILER_LAUNCHER=sccache ${{ inputs.extra_cmake_args }}
 
       - name: Build and install
         run: cmake --build out/build/${{ inputs.platform }} --target install --parallel
