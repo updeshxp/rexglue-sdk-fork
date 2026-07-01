@@ -56,6 +56,11 @@ class AppManager {
   X_HRESULT DispatchMessageAsync(uint32_t app_id, uint32_t message, uint32_t buffer_ptr,
                                  uint32_t buffer_length);
 
+  App* FindApp(uint32_t app_id) const {
+    auto it = app_lookup_.find(app_id);
+    return it != app_lookup_.end() ? it->second : nullptr;
+  }
+
  private:
   std::vector<std::unique_ptr<App>> apps_;
   std::unordered_map<uint32_t, App*> app_lookup_;
