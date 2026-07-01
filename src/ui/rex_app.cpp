@@ -108,6 +108,11 @@ bool ReXApp::OnInitialize() {
 
 bool ReXApp::SetupEnvironment() {
   auto exe_dir = rex::filesystem::GetExecutableFolder();
+  config_path_ = exe_dir / (std::string(GetName()) + ".toml");
+
+  // Load config FIRST so path and log cvars have final values
+  if (std::filesystem::exists(config_path_))
+    rex::cvar::LoadConfig(config_path_);
 
   std::filesystem::path game_dir;
   std::string game_data_cvar = REXCVAR_GET(game_data_root);
@@ -146,8 +151,7 @@ bool ReXApp::SetupEnvironment() {
     metadata_dir = metadata_root_cvar;
   }
 
-  PathConfig path_config{game_dir,  user_dir,     update_dir,
-                         cache_dir, metadata_dir, exe_dir / (std::string(GetName()) + ".toml")};
+  PathConfig path_config{game_dir, user_dir, update_dir, cache_dir, metadata_dir, config_path_};
   OnConfigurePaths(path_config);
   game_data_root_ = path_config.game_data_root;
   user_data_root_ = path_config.user_data_root;
@@ -156,10 +160,6 @@ bool ReXApp::SetupEnvironment() {
   metadata_root_ = path_config.metadata_root;
   config_path_ = path_config.config_path;
   resolved_defaults_ = std::move(path_config);
-
-  // Load config FIRST so log cvars have final values
-  if (std::filesystem::exists(config_path_))
-    rex::cvar::LoadConfig(config_path_);
 
   // Late-phase logging
   std::string log_file_cvar = REXCVAR_GET(log_file);
