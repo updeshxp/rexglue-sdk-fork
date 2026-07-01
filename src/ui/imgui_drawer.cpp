@@ -34,8 +34,12 @@ const char kProggyTinyCompressedDataBase85[10950 + 1] =
 
 static_assert(sizeof(ImmediateVertex) == sizeof(ImDrawVert), "Vertex types must match");
 
-ImGuiDrawer::ImGuiDrawer(rex::ui::Window* window, size_t z_order, FontSetupCallback font_setup)
-    : window_(window), z_order_(z_order), font_setup_(std::move(font_setup)) {
+ImGuiDrawer::ImGuiDrawer(rex::ui::Window* window, size_t z_order, FontSetupCallback font_setup,
+                         StyleSetupCallback style_setup)
+    : window_(window),
+      z_order_(z_order),
+      font_setup_(std::move(font_setup)),
+      style_setup_(std::move(style_setup)) {
   Initialize();
 }
 
@@ -134,8 +138,15 @@ void ImGuiDrawer::Initialize() {
   }
 #endif
 
+  // If the project's font_setup_ adds a full (non-merge) font on top of the
+  // built-in ProggyTiny/JP fonts above, treat it as the project's preferred
+  // UI font and make it the default rather than leaving ProggyTiny active.
+  const int font_count_before = io.Fonts->Fonts.Size;
   if (font_setup_) {
     font_setup_(io.Fonts);
+  }
+  if (io.Fonts->Fonts.Size > font_count_before) {
+    io.FontDefault = io.Fonts->Fonts.back();
   }
 
   auto& style = ImGui::GetStyle();
@@ -186,6 +197,10 @@ void ImGuiDrawer::Initialize() {
   style.Colors[ImGuiCol_PlotHistogramHovered] = ImVec4(1.00f, 0.60f, 0.00f, 1.00f);
   style.Colors[ImGuiCol_TextSelectedBg] = ImVec4(0.00f, 1.00f, 0.00f, 0.21f);
   style.Colors[ImGuiCol_ModalWindowDimBg] = ImVec4(0.20f, 0.20f, 0.20f, 0.35f);
+
+  if (style_setup_) {
+    style_setup_(style);
+  }
 
   frame_time_tick_frequency_ = double(rex::chrono::Clock::QueryHostTickFrequency());
   last_frame_time_ticks_ = rex::chrono::Clock::QueryHostTickCount();

@@ -31,6 +31,7 @@
 #include <rex/ui/windowed_app.h>
 
 struct ImFontAtlas;
+struct ImGuiStyle;
 
 namespace rex {
 
@@ -137,6 +138,11 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
   /// registered and before the atlas is built. Override to add additional
   /// fonts via AddFontFromMemoryTTF() or similar.
   virtual void OnConfigureFonts(ImFontAtlas* atlas) { (void)atlas; }
+
+  /// Called from the ImGui drawer's Initialize() after the default style
+  /// colors are applied. Override to recolor the overlay UI (dialogs,
+  /// console, debug/settings overlays) to fit the game being recompiled.
+  virtual void OnConfigureStyle(ImGuiStyle& style) { (void)style; }
 
   /// Called after logging is initialized. Add log sinks here.
   virtual void OnPostInitLogging() {}

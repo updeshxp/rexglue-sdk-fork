@@ -28,6 +28,7 @@ struct ImDrawData;
 struct ImFontAtlas;
 struct ImGuiContext;
 struct ImGuiIO;
+struct ImGuiStyle;
 enum ImGuiKey : int;
 
 namespace rex {
@@ -39,7 +40,9 @@ class Window;
 class ImGuiDrawer : public WindowInputListener, public UIDrawer {
  public:
   using FontSetupCallback = std::function<void(ImFontAtlas*)>;
-  ImGuiDrawer(Window* window, size_t z_order, FontSetupCallback font_setup = nullptr);
+  using StyleSetupCallback = std::function<void(ImGuiStyle&)>;
+  ImGuiDrawer(Window* window, size_t z_order, FontSetupCallback font_setup = nullptr,
+              StyleSetupCallback style_setup = nullptr);
   ~ImGuiDrawer();
 
   ImGuiIO& GetIO();
@@ -89,6 +92,7 @@ class ImGuiDrawer : public WindowInputListener, public UIDrawer {
   Window* window_;
   size_t z_order_;
   FontSetupCallback font_setup_;
+  StyleSetupCallback style_setup_;
 
   ImGuiContext* internal_state_ = nullptr;
 
