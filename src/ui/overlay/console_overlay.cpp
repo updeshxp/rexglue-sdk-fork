@@ -11,6 +11,7 @@
  */
 #include <rex/ui/overlay/console_overlay.h>
 #include <rex/cvar.h>
+#include <rex/ui/imgui_widgets.h>
 #include <imgui.h>
 #include <algorithm>
 #include <iterator>
@@ -279,7 +280,7 @@ void ConsoleDialog::OnDraw(ImGuiIO& io) {
   ImGui::SameLine();
   int cat_idx = 0;
   for (auto& [cat_name, enabled] : category_filter_) {
-    ImGui::Checkbox(cat_name.c_str(), &enabled);
+    rex::ui::ToggleSwitch(cat_name.c_str(), &enabled);
     if (++cat_idx < static_cast<int>(category_filter_.size()))
       ImGui::SameLine();
   }

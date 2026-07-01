@@ -391,9 +391,7 @@ bool ReXApp::SetupPresentation() {
 void ReXApp::SetupOverlays(rex::ui::Presenter* presenter, rex::ui::ImmediateDrawer* drawer) {
   imgui_drawer_ = std::make_unique<rex::ui::ImGuiDrawer>(
       window_.get(), 64, [this](ImFontAtlas* atlas) { OnConfigureFonts(atlas); },
-      [this](ImGuiStyle& imgui_style, rex::ui::Style& ui_style) {
-        OnConfigureStyle(imgui_style, ui_style);
-      });
+      [this](ImGuiStyle& style) { OnConfigureStyle(style); });
   // presenter is nullptr in detached mode; ImGuiDrawer tolerates that and the
   // gated eager font upload in SetImmediateDrawer is skipped (font uploads
   // lazily on the first Draw instead).

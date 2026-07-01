@@ -27,6 +27,35 @@ AchievementsOverlayDialog::AchievementsOverlayDialog(ImGuiDrawer* imgui_drawer,
 
 AchievementsOverlayDialog::~AchievementsOverlayDialog() {}
 
+namespace {
+// Palette — kept ASCII-only; the bundled overlay font has no em dash / check glyphs.
+constexpr ImVec4 kLockedTitle{0.78f, 0.80f, 0.84f, 1.00f};  // light grey
+constexpr ImVec4 kLockedDesc{0.50f, 0.52f, 0.56f, 1.00f};   // dim grey
+constexpr ImVec4 kBadgeGS{1.00f, 0.82f, 0.30f, 1.00f};      // gamerscore gold
+constexpr ImVec4 kHeaderText{0.60f, 0.85f, 1.00f, 1.00f};   // accent blue
+constexpr float kIconSize = 44.0f;
+
+// "Unlocked" accent (title text, description tint, row band, progress bar)
+// derives from the active theme's CheckMark color rather than a hardcoded
+// green, so a project's OnConfigureStyle recolor (see rex::ReXApp) applies
+// here too instead of clashing with it.
+ImVec4 UnlockedTitleColor() {
+  ImVec4 c = ImGui::GetStyle().Colors[ImGuiCol_CheckMark];
+  c.w = 1.0f;
+  return c;
+}
+
+ImVec4 UnlockedDescColor() {
+  const ImVec4 accent = UnlockedTitleColor();
+  return ImVec4(accent.x * 0.6f + 0.35f, accent.y * 0.6f + 0.35f, accent.z * 0.6f + 0.35f, 1.0f);
+}
+
+ImVec4 RowUnlockedBgColor() {
+  const ImVec4 accent = UnlockedTitleColor();
+  return ImVec4(accent.x * 0.5f, accent.y * 0.5f, accent.z * 0.5f, 0.35f);
+}
+}  // namespace
+
 ImmediateTexture* AchievementsOverlayDialog::GetIcon(
     const rex::system::AchievementInfo& achievement) {
   return icon_cache_.GetIcon(achievement);
@@ -66,7 +95,7 @@ void AchievementsOverlayDialog::OnDraw(ImGuiIO& io) {
     ImGui::TextColored(style.badge_gamerscore, "%dG / %dG", earned_gs, total_gs);
 
     float frac = total_count > 0 ? static_cast<float>(unlocked_count) / total_count : 0.0f;
-    ImGui::PushStyleColor(ImGuiCol_PlotHistogram, style.progress_bar);
+    ImGui::PushStyleColor(ImGuiCol_PlotHistogram, UnlockedTitleColor());
     ImGui::ProgressBar(frac, ImVec2(-1.0f, 6.0f), "");
     ImGui::PopStyleColor();
 
@@ -106,16 +135,16 @@ void AchievementsOverlayDialog::OnDraw(ImGuiIO& io) {
       ImGui::SameLine();
 
       // Text block to the right of the icon.
+      const ImVec4 unlocked_title = UnlockedTitleColor();
       ImGui::BeginGroup();
       const char* marker = is_unlocked ? "[*]" : "[ ]";
-      const ImVec4& title_color = is_unlocked ? style.unlocked_title : style.locked_title;
-      ImGui::TextColored(title_color, "%s", marker);
+      ImGui::TextColored(is_unlocked ? unlocked_title : kLockedTitle, "%s", marker);
       ImGui::SameLine();
       ImGui::TextColored(style.badge_gamerscore, "%dG", static_cast<int>(a.gamerscore));
       ImGui::SameLine();
-      ImGui::TextColored(title_color, "%s", a.label.c_str());
+      ImGui::TextColored(is_unlocked ? unlocked_title : kLockedTitle, "%s", a.label.c_str());
 
-      ImGui::PushStyleColor(ImGuiCol_Text, is_unlocked ? style.unlocked_desc : style.locked_desc);
+      ImGui::PushStyleColor(ImGuiCol_Text, is_unlocked ? UnlockedDescColor() : kLockedDesc);
       ImGui::TextWrapped("%s", desc.c_str());
       ImGui::PopStyleColor();
       ImGui::EndGroup();
@@ -129,7 +158,7 @@ void AchievementsOverlayDialog::OnDraw(ImGuiIO& io) {
         const float x0 = ImGui::GetWindowPos().x + 2.0f;
         const float x1 = x0 + ImGui::GetWindowSize().x - 4.0f;
         draw_list->AddRectFilled(ImVec2(x0, row_start_y), ImVec2(x1, row_end_y),
-                                 ImGui::GetColorU32(style.row_unlocked_bg), style.row_rounding);
+                                 ImGui::GetColorU32(RowUnlockedBgColor()), 3.0f);
       }
       draw_list->ChannelsMerge();
 
