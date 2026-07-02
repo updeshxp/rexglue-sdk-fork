@@ -85,6 +85,18 @@ class GraphicsSystem : public system::IGraphicsSystem {
 
   void InitializeAssetReplacement(const system::AssetReplacementConfig& config) override;
 
+  void SetHostSwapCallback(std::function<void()> callback) override {
+    host_swap_callback_ = std::move(callback);
+  }
+  // Called by the command processor once per guest frame, right after
+  // IssueSwap (see CommandProcessor::ExecutePacketType3_XE_SWAP). Runs on the
+  // command-processor thread.
+  void OnGuestSwap() {
+    if (host_swap_callback_) {
+      host_swap_callback_();
+    }
+  }
+
   void RequestFrameTrace();
   void BeginTracing();
   void EndTracing();
@@ -123,6 +135,8 @@ class GraphicsSystem : public system::IGraphicsSystem {
 
   uint32_t interrupt_callback_ = 0;
   uint32_t interrupt_callback_data_ = 0;
+
+  std::function<void()> host_swap_callback_;
 
   std::atomic<bool> vsync_worker_running_;
   system::object_ref<system::XHostThread> vsync_worker_thread_;

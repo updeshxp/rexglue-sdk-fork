@@ -59,6 +59,13 @@ class UserModule : public XModule {
   bool is_executable() const { return processor_module_->is_executable(); }
   bool is_dll_module() const { return is_dll_module_; }
 
+  // True if this module had a delta patch (e.g. a title update) applied to it
+  // at load time. False (never patched) for non-XEX modules. See
+  // rex::runtime::XexModule::is_patched().
+  bool is_patched() const {
+    return module_format_ == kModuleFormatXex && xex_module()->is_patched();
+  }
+
   uint32_t entry_point() const { return entry_point_; }
   uint32_t stack_size() const { return stack_size_; }
 

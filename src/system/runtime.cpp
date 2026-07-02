@@ -10,6 +10,7 @@
  */
 
 #include <sstream>
+#include <unordered_map>
 
 #include <rex/chrono/clock.h>
 #include <rex/cvar.h>
@@ -30,6 +31,8 @@
 #include <rex/system/xmemory.h>
 #include <rex/system/xthread.h>
 #include <rex/thread.h>
+
+#include <toml++/toml.hpp>
 
 REXCVAR_DEFINE_STRING(game_data_root, "", "Runtime", "Override game data path");
 REXCVAR_DEFINE_STRING(user_data_root, "", "Runtime", "Override user data path");
@@ -140,6 +143,14 @@ X_STATUS Runtime::Setup(RuntimeConfig config) {
   // Create kernel state - this sets the global singleton
   kernel_state_ = std::make_unique<system::KernelState>(this);
 
+  // Shared address/event registry mods publish into and consume from. The
+  // is_patched provider is injected (rather than reached statically) so the
+  // registry itself stays testable without a live KernelState.
+  mod_registry_ = std::make_unique<system::ModRegistry>([this] {
+    auto module = kernel_state_->GetExecutableModule();
+    return module && module->is_patched();
+  });
+
   // Initialize input from injected config
   if (config.input_factory) {
     input_system_ = config.input_factory(tool_mode_);
@@ -180,6 +191,13 @@ X_STATUS Runtime::Setup(RuntimeConfig config) {
     return fail(X_STATUS_UNSUCCESSFUL, "VFS setup failed");
   }
 
+  // ResolveEnabledMods() (called from SetupVfs()) has already parsed and
+  // cached every enabled mod's mod.toml; validate requires/load_after/
+  // conflicts now that the full enabled-mods list and order are known.
+  if (!ValidateModDependencies()) {
+    return fail(X_STATUS_UNSUCCESSFUL, "mod dependency validation failed");
+  }
+
   // Skip GPU initialization in tool mode (for analysis tools like codegen)
   if (tool_mode_) {
     REXSYS_DEBUG("Runtime initialized in tool mode (no GPU)");
@@ -196,7 +214,11 @@ X_STATUS Runtime::Setup(RuntimeConfig config) {
     if (XFAILED(gpu_status)) {
       return fail(gpu_status, "GPU setup failed");
     }
-    REXSYS_DEBUG("GPU system initialized (presentation={})", with_presentation);
+    // Tick the mod registry once per guest frame (on GPU swap). Graphics
+    // systems without a swap concept (SetHostSwapCallback default no-op)
+    // simply never tick.
+    graphics_system_->SetHostSwapCallback([this] { mod_registry_->DispatchTick(); });
+    REXSYS_INFO("GPU system initialized (presentation={})", with_presentation);
   } else {
     REXSYS_DEBUG("Runtime initialized without graphics system (native rendering mode)");
   }
@@ -300,34 +322,94 @@ uint8_t* Runtime::virtual_membase() const {
   return memory_ ? memory_->virtual_membase() : nullptr;
 }
 
+namespace {
+
+// Splits a comma-separated list, trims whitespace around each entry, and
+// drops empty entries. Shared by ResolveEnabledMods() (enabled_mods cvar) and
+// ParseModInfo() (mod.toml's requires/load_after/conflicts keys); both use
+// the same "comma list of folder names" convention.
+std::vector<std::string> SplitCommaList(std::string_view csv) {
+  std::vector<std::string> result;
+  std::istringstream ss{std::string(csv)};
+  std::string token;
+  while (std::getline(ss, token, ',')) {
+    auto start = token.find_first_not_of(" \t");
+    auto end = token.find_last_not_of(" \t");
+    if (start == std::string::npos) {
+      continue;
+    }
+    token = token.substr(start, end - start + 1);
+    if (!token.empty()) {
+      result.push_back(std::move(token));
+    }
+  }
+  return result;
+}
+
+// mod.toml is optional and purely descriptive except for `code`, which names
+// the DLL stem the mod loader should load from <mod_root>/code/, and
+// requires/load_after/conflicts, which ValidateModDependencies() enforces.
+// Missing fields (or a missing file entirely) just leave ModInfo's members
+// empty; this must never hard-fail, since asset-only mods commonly omit it.
+system::ModInfo ParseModInfo(const std::filesystem::path& mod_root) {
+  system::ModInfo info;
+  info.mod_root = mod_root;
+  info.folder_name = mod_root.filename().string();
+  info.display_name = info.folder_name;
+
+  auto icon_path = mod_root / "icon.png";
+  if (std::filesystem::is_regular_file(icon_path)) {
+    info.icon_path = icon_path;
+  }
+
+  auto manifest_path = mod_root / "mod.toml";
+  if (!std::filesystem::is_regular_file(manifest_path)) {
+    return info;
+  }
+
+  try {
+    auto table = toml::parse_file(manifest_path.string());
+    info.display_name = table["name"].value_or<std::string>(std::string(info.folder_name));
+    info.version = table["version"].value_or<std::string>("");
+    info.author = table["author"].value_or<std::string>("");
+    info.description = table["description"].value_or<std::string>("");
+    info.code = table["code"].value_or<std::string>("");
+    info.requires_mods = SplitCommaList(table["requires"].value_or<std::string>(""));
+    info.load_after_mods = SplitCommaList(table["load_after"].value_or<std::string>(""));
+    info.conflicts_mods = SplitCommaList(table["conflicts"].value_or<std::string>(""));
+  } catch (const toml::parse_error& error) {
+    REXSYS_WARN("Failed to parse {}: {}", manifest_path.string(), error.what());
+  }
+  return info;
+}
+
+}  // namespace
+
 void Runtime::ResolveEnabledMods() {
   enabled_mod_roots_.clear();
+  enabled_mods_info_.clear();
 
   std::string mods_root_cvar = REXCVAR_GET(mods_data_root);
   std::string enabled_cvar = REXCVAR_GET(enabled_mods);
-  if (mods_root_cvar.empty() || enabled_cvar.empty()) {
+  if (enabled_cvar.empty()) {
     return;
   }
 
-  auto mods_root = std::filesystem::absolute(std::filesystem::path(mods_root_cvar));
+  // Default to <exe folder>/mods when unset, so a packaged build with mods
+  // enabled in its config works without a launcher passing --mods_data_root
+  // explicitly (relative values are otherwise resolved against CWD, not the
+  // exe directory).
+  auto mods_root = mods_root_cvar.empty()
+                       ? rex::filesystem::GetExecutableFolder() / "mods"
+                       : std::filesystem::absolute(std::filesystem::path(mods_root_cvar));
   if (!std::filesystem::is_directory(mods_root)) {
     REXSYS_WARN("  mods_data_root does not exist: {}", mods_root.string());
     return;
   }
 
-  // Split comma-separated mod names, trim whitespace. Order is preserved:
-  // earlier entries are higher priority (see ModOverlayRoots).
-  std::istringstream ss(enabled_cvar);
-  std::string name;
-  while (std::getline(ss, name, ',')) {
-    auto start = name.find_first_not_of(" \t");
-    auto end = name.find_last_not_of(" \t");
-    if (start == std::string::npos)
-      continue;
-    name = name.substr(start, end - start + 1);
-    if (name.empty())
-      continue;
-
+  // Order is preserved: earlier entries are higher priority (see
+  // ModOverlayRoots).
+  for (auto& name : SplitCommaList(enabled_cvar)) {
     auto mod_dir = mods_root / name;
     if (std::filesystem::is_directory(mod_dir)) {
       enabled_mod_roots_.push_back(mod_dir);
@@ -335,6 +417,14 @@ void Runtime::ResolveEnabledMods() {
     } else {
       REXSYS_WARN("  Mod '{}' not found at {}, skipping", name, mod_dir.string());
     }
+  }
+
+  // Parse mod.toml once per enabled mod, in priority order, and cache it --
+  // both EnabledModsInfo() and ValidateModDependencies() read this cache
+  // rather than re-parsing.
+  enabled_mods_info_.reserve(enabled_mod_roots_.size());
+  for (auto& mod_root : enabled_mod_roots_) {
+    enabled_mods_info_.push_back(ParseModInfo(mod_root));
   }
 }
 
@@ -356,6 +446,70 @@ std::filesystem::path Runtime::ModDumpRoot() const {
     return rex::filesystem::GetExecutableFolder() / "dumps";
   }
   return std::filesystem::absolute(std::filesystem::path(dump_root_cvar));
+}
+
+std::vector<system::ModInfo> Runtime::EnabledModsInfo() const {
+  return enabled_mods_info_;
+}
+
+bool Runtime::ValidateModDependencies() const {
+  // name -> load-order index (0 = highest priority, matches
+  // enabled_mod_roots_/ModOverlayRoots).
+  std::unordered_map<std::string, size_t> index_of;
+  index_of.reserve(enabled_mods_info_.size());
+  for (size_t i = 0; i < enabled_mods_info_.size(); ++i) {
+    index_of.emplace(enabled_mods_info_[i].folder_name, i);
+  }
+
+  bool ok = true;
+  for (size_t i = 0; i < enabled_mods_info_.size(); ++i) {
+    const auto& mod = enabled_mods_info_[i];
+
+    for (auto& other : mod.requires_mods) {
+      if (other == mod.folder_name) {
+        REXSYS_ERROR("Mod '{}' lists itself in 'requires'", mod.folder_name);
+        ok = false;
+        continue;
+      }
+      auto it = index_of.find(other);
+      if (it == index_of.end()) {
+        REXSYS_ERROR(
+            "Mod '{}' requires '{}', which is not enabled. Add '{}' to enabled_mods before '{}'.",
+            mod.folder_name, other, other, mod.folder_name);
+        ok = false;
+      } else if (it->second > i) {
+        REXSYS_ERROR(
+            "Mod '{}' requires '{}', but '{}' is listed after '{}' in enabled_mods. Move '{}' "
+            "earlier.",
+            mod.folder_name, other, other, mod.folder_name, other);
+        ok = false;
+      }
+    }
+
+    for (auto& other : mod.load_after_mods) {
+      auto it = index_of.find(other);
+      if (it == index_of.end()) {
+        REXSYS_WARN("Mod '{}' should load after '{}', which is not enabled", mod.folder_name,
+                    other);
+      } else if (it->second > i) {
+        REXSYS_WARN("Mod '{}' should load after '{}', but is listed before it in enabled_mods",
+                    mod.folder_name, other);
+      }
+    }
+
+    for (auto& other : mod.conflicts_mods) {
+      if (other == mod.folder_name) {
+        REXSYS_ERROR("Mod '{}' lists itself in 'conflicts'", mod.folder_name);
+        ok = false;
+        continue;
+      }
+      if (index_of.contains(other)) {
+        REXSYS_ERROR("Mod '{}' conflicts with '{}', but both are enabled", mod.folder_name, other);
+        ok = false;
+      }
+    }
+  }
+  return ok;
 }
 
 bool Runtime::SetupVfs() {

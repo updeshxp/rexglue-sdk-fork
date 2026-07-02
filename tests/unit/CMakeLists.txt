@@ -15,10 +15,11 @@ add_executable(unit_tests
     system/guest_path_test.cpp
     system/achievement_manager_test.cpp
     system/function_dispatcher_test.cpp
-    input/input_assignment_test.cpp
-    codegen/codegen_writer_test.cpp
-    codegen/output_partition_test.cpp
-    codegen/output_stamp_test.cpp
+    system/mod_registry_test.cpp
+    system/mod_dependency_test.cpp
+    codegen/manifest_test.cpp
+    rexglue/migration_scan_test.cpp
+    rexglue/ui_test.cpp
 )
 
 target_sources(unit_tests PRIVATE

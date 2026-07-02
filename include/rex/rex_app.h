@@ -17,11 +17,14 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <string>
 #include <string_view>
 #include <thread>
+#include <vector>
 
 #include <rex/image_info.h>
 #include <rex/runtime.h>
+#include <rex/system/mod_plugin.h>
 #include <rex/ui/imgui_dialog.h>
 #include <rex/ui/imgui_drawer.h>
 #include <rex/ui/immediate_drawer.h>
@@ -324,6 +327,24 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
   ui::DebugOverlayDialog::FrameStatsProvider frame_stats_provider_;
   ShaderDebuggerOverride shader_debugger_override_;
   std::filesystem::path config_path_;
+
+  // Mod code plugins declared by enabled mods (mod.toml `code = "..."`).
+  // Loaded once ImGui/keybinds exist (see SetupOverlays), notified again once
+  // KernelState is live (see LaunchModule), and shut down before the rest of
+  // ReXApp tears down. Never unloaded, mirroring GPU plugin lifetime.
+  //
+  // mod_infos_ backs the ModHostContext.mod_root/mod_name string pointers
+  // handed to each plugin at creation: those pointers are documented to
+  // remain valid for the mod's lifetime, so their backing strings must live
+  // at least as long as ReXApp itself, not just the SetupOverlays call that
+  // builds them.
+  std::unique_ptr<ui::ImGuiDialog> mod_manager_overlay_;
+  std::vector<system::ModInfo> mod_infos_;
+  // Parallel to mod_infos_: narrow (UTF-8) form of each mod_root, since
+  // ModHostContext.mod_root is a const char* but ModInfo::mod_root is a
+  // std::filesystem::path (native-encoded, wchar_t on Windows).
+  std::vector<std::string> mod_root_strs_;
+  std::vector<std::unique_ptr<system::IModPlugin>> mod_plugins_;
 };
 
 }  // namespace rex

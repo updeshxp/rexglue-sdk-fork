@@ -13,6 +13,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <vector>
 
 #include <rex/system/xtypes.h>
@@ -96,6 +97,13 @@ class IGraphicsSystem {
   // this to enable content-hash-keyed asset substitution; custom renderers
   // are free to leave it a no-op.
   virtual void InitializeAssetReplacement(const AssetReplacementConfig& config) { (void)config; }
+
+  // Registers a callback fired once per guest frame (on GPU swap). Runtime
+  // wires this to ModRegistry::DispatchTick(). Graphics systems that emulate
+  // a GPU (e.g. rexgpu-xenos) fire it from the swap packet; a custom
+  // renderer with no swap concept leaves this a no-op, so mods relying on
+  // per-frame ticks simply never fire under it.
+  virtual void SetHostSwapCallback(std::function<void()> callback) { (void)callback; }
 
   // One-shot convenience for callers that don't care about the split.
   X_STATUS Setup(runtime::FunctionDispatcher* function_dispatcher, KernelState* kernel_state,

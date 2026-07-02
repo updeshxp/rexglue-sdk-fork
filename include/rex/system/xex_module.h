@@ -104,6 +104,12 @@ class XexModule : public Module {
   uint32_t base_address() const override { return base_address_; }
   bool is_dev_kit() const { return is_dev_kit_; }
 
+  // True if a delta patch (sibling .xexp, e.g. a title update) was applied to
+  // this image at load time -- see ApplyPatch(). Lets build-agnostic code
+  // (mods, etc.) detect at runtime whether the running image is patched,
+  // without hardcoding per-build guest addresses.
+  bool is_patched() const { return patched_; }
+
   // PE FileHeader TimeDateStamp (Unix epoch seconds) recorded by the linker.
   uint32_t pe_time_date_stamp() const { return pe_time_date_stamp_; }
 
@@ -219,6 +225,7 @@ class XexModule : public Module {
 
   bool loaded_ = false;         // Loaded into memory?
   bool finished_load_ = false;  // PE/imports/symbols/etc all loaded?
+  bool patched_ = false;        // Had a delta patch (.xexp) applied? See ApplyPatch().
 
   uint32_t base_address_ = 0;
   uint32_t low_address_ = 0;
