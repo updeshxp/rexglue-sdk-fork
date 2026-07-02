@@ -29,7 +29,9 @@
 #include <rex/system/interfaces/graphics.h>
 #include <rex/system/interfaces/input.h>
 #include <rex/system/kernel_state.h>
-#include <rex/system/xobject.h>  // object_ref
+#include <rex/system/mod_plugin.h>    // ModInfo
+#include <rex/system/mod_registry.h>  // ModRegistry
+#include <rex/system/xobject.h>       // object_ref
 
 // Forward declaration for function mapping (defined in rex/ppc/context.h)
 struct PPCFuncMapping;
@@ -124,6 +126,7 @@ class Runtime {
   system::IGraphicsSystem* graphics_system() const { return graphics_system_.get(); }
   system::IAudioSystem* audio_system() const { return audio_system_.get(); }
   system::IInputSystem* input_system() const { return input_system_.get(); }
+  system::ModRegistry* mod_registry() const { return mod_registry_.get(); }
 
   // FunctionDispatcher for guest function dispatch and interrupt execution
   runtime::FunctionDispatcher* function_dispatcher() const { return function_dispatcher_.get(); }
@@ -193,13 +196,26 @@ class Runtime {
   // unset.
   std::filesystem::path ModDumpRoot() const;
 
+  // Descriptive info for every enabled mod (asset-only and code mods alike),
+  // in enabled_mods order (index 0 = highest priority). Parsed from each
+  // mod's <mod_root>/mod.toml; used by the mod manager overlay. Missing
+  // fields are left empty rather than erroring -- mod.toml is optional.
+  std::vector<system::ModInfo> EnabledModsInfo() const;
+
  private:
   // Set up VFS: mounts game_data_root as game:/d:, update_data_root as update:
   bool SetupVfs();
 
-  // Resolves mods_data_root/enabled_mods cvars into enabled_mod_roots_.
-  // Validates each mod folder exists, warning once per missing mod.
+  // Resolves mods_data_root/enabled_mods cvars into enabled_mod_roots_, and
+  // parses each enabled mod's mod.toml into enabled_mods_info_. Validates
+  // each mod folder exists, warning once per missing mod.
   void ResolveEnabledMods();
+
+  // Validates requires/load_after/conflicts across enabled_mods_info_.
+  // requires/conflicts violations are hard errors (returns false); load_after
+  // violations only warn. Called from Setup() after ResolveEnabledMods() (via
+  // SetupVfs()) has populated enabled_mods_info_.
+  bool ValidateModDependencies() const;
 
   std::filesystem::path game_data_root_;
   std::filesystem::path user_data_root_;
@@ -210,6 +226,11 @@ class Runtime {
   // Enabled mod folder roots, in enabled_mods order (first = highest
   // priority). Populated once by ResolveEnabledMods() during SetupVfs().
   std::vector<std::filesystem::path> enabled_mod_roots_;
+
+  // Parsed mod.toml for each entry in enabled_mod_roots_, same order.
+  // Populated alongside enabled_mod_roots_ so it's only parsed once; read by
+  // EnabledModsInfo() and ValidateModDependencies().
+  std::vector<system::ModInfo> enabled_mods_info_;
 
   ui::WindowedAppContext* app_context_ = nullptr;
   ui::Window* display_window_ = nullptr;
@@ -226,6 +247,7 @@ class Runtime {
   std::unique_ptr<system::IAudioSystem> audio_system_;
   std::unique_ptr<system::IInputSystem> input_system_;
   std::unique_ptr<runtime::ExportResolver> export_resolver_;
+  std::unique_ptr<system::ModRegistry> mod_registry_;
 
   static Runtime* instance_;
 };

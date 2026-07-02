@@ -82,10 +82,6 @@ REXCVAR_DEFINE_INT32(resolution_scale, 1, "GPU",
 REXCVAR_DEFINE_BOOL(pre_mask_resolve_l2_block, true, "GPU",
                     "Pre-mask scaled resolve L2 blocks to the write range before iterating");
 
-REXCVAR_DEFINE_BOOL(texture_replace_enabled, false, "GPU/Texture Replacement",
-                    "Inject replacement textures from disk when available")
-    .lifecycle(rex::cvar::Lifecycle::kHotReload);
-
 REXCVAR_DEFINE_BOOL(shader_dump_enabled, false, "GPU/Shader Storage",
                     "Dump translated shader binaries to disk for mod authoring")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
@@ -933,8 +929,7 @@ TextureCache::Texture* TextureCache::FindOrCreateTexture(TextureKey key) {
   texture_util::TextureGuestLayout original_guest_layout{};
   bool has_replacement = false;
   uint64_t replacement_content_hash = 0;
-  if (replacement_ && REXCVAR_GET(texture_replace_enabled) && key.base_page != 0 &&
-      !key.scaled_resolve) {
+  if (replacement_ && key.base_page != 0 && !key.scaled_resolve) {
     const uint32_t guest_addr = key.base_page << 12;
     // Capture the original guest layout BEFORE mutating the key.
     original_guest_layout = key.GetGuestLayout();
