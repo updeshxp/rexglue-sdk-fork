@@ -435,6 +435,7 @@ int XexModule::ApplyPatch(XexModule* module) {
         (uint32_t)source_ver.major, (uint32_t)source_ver.minor, (uint32_t)source_ver.build,
         (uint32_t)source_ver.qfe, (uint32_t)target_ver.major, (uint32_t)target_ver.minor,
         (uint32_t)target_ver.build, (uint32_t)target_ver.qfe);
+    module->patched_ = true;
   } else {
     REXLOG_ERROR("XEX patch application failed, error code {}", result_code);
   }

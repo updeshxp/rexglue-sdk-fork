@@ -25,6 +25,7 @@
 #include <rex/ui/overlay/console_overlay.h>
 #include <rex/ui/overlay/debug_overlay.h>
 #include <rex/ui/overlay/settings_overlay.h>
+#include <rex/ui/overlay/mod_manager_overlay.h>
 #include <rex/ui/overlay/shader_debugger_overlay.h>
 #include <rex/graphics/command_processor.h>
 #include <rex/graphics/graphics_system.h>
@@ -35,6 +36,7 @@
 #include <rex/system.h>
 #include <rex/system/achievement_manager.h>
 #include <rex/system/gpu_plugin.h>
+#include <rex/system/mod_plugin.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/xthread.h>
 #include <rex/ui/graphics_provider.h>
@@ -307,6 +309,45 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
     }
   }
 
+  // Load code plugins declared by enabled mods (mod.toml `code = "..."`) now
+  // that Runtime exists (EnabledModsInfo needs it) and the ImGui drawer/
+  // keybind registry are already live from SetupPresentation. KernelState is
+  // not fully live yet here -- mods needing it should do so from
+  // OnModuleLaunched() instead.
+  {
+    // Stored on `this` (not a local) because ctx.mod_root/mod_name below
+    // point into these strings, and that pointer must stay valid for the
+    // plugin's lifetime (see ModHostContext's contract), not just this call.
+    mod_infos_ = runtime_->EnabledModsInfo();
+    mod_root_strs_.clear();
+    mod_root_strs_.reserve(mod_infos_.size());
+    for (const auto& mod : mod_infos_) {
+      mod_root_strs_.push_back(mod.mod_root.string());
+    }
+
+    rex::system::ModHostContext ctx{};
+    ctx.runtime = runtime_.get();
+    ctx.app_context = &app_context();
+    ctx.window = window_.get();
+    ctx.input_system = static_cast<rex::input::InputSystem*>(runtime_->input_system());
+    for (size_t i = 0; i < mod_infos_.size(); ++i) {
+      const auto& mod = mod_infos_[i];
+      if (mod.code.empty()) {
+        continue;  // asset-only mod
+      }
+      ctx.mod_root = mod_root_strs_[i].c_str();
+      ctx.mod_name = mod.folder_name.c_str();
+      if (auto plugin = rex::system::LoadModPlugin(mod.mod_root, mod.folder_name, mod.code, ctx)) {
+        mod_plugins_.push_back(std::move(plugin));
+      }
+    }
+  }
+  if (imgui_drawer_) {
+    for (auto& plugin : mod_plugins_) {
+      plugin->OnCreateDialogs(imgui_drawer_.get());
+    }
+  }
+
   OnPostSetup();
 
   return true;
@@ -414,6 +455,14 @@ void ReXApp::SetupOverlays(rex::ui::Presenter* presenter, rex::ui::ImmediateDraw
       settings_overlay_.reset();
     } else {
       settings_overlay_ = std::make_unique<ui::SettingsDialog>(imgui_drawer_.get(), config_path_);
+    }
+  });
+  rex::ui::RegisterBind("bind_mod_manager", "F1", "Toggle mod manager overlay", [this, drawer] {
+    if (mod_manager_overlay_) {
+      mod_manager_overlay_.reset();
+    } else {
+      mod_manager_overlay_ =
+          std::make_unique<ui::ModManagerDialog>(imgui_drawer_.get(), drawer, runtime_.get());
     }
   });
   rex::ui::RegisterBind("bind_achievements", "F7", "Toggle achievements overlay", [this] {
@@ -546,6 +595,13 @@ void ReXApp::SetupOverlays(rex::ui::Presenter* presenter, rex::ui::ImmediateDraw
     }
   });
 
+  // Mod code plugins are loaded from ConstructRuntime (not here): Runtime --
+  // and therefore EnabledModsInfo()/mod resolution -- doesn't exist until
+  // ConstructRuntime runs, which happens *after* SetupPresentation (see the
+  // phase order documented on ReXApp). SetupOverlays only registers binds
+  // that don't need Runtime (F1/F3/F4/F7/etc.); mod plugin loading mirrors
+  // that same constraint by waiting until Runtime is live.
+
   OnCreateDialogs(imgui_drawer_.get());
 }
 
@@ -607,6 +663,13 @@ void ReXApp::LaunchModule() {
           cp->AddShaderBlacklist(hash);
         }
       }
+    }
+
+    // KernelState/apps are fully live now; notify mod plugins before the
+    // project's own OnPostLaunchModule so a mod's own memory/app scans (e.g.
+    // ScanFilesystem) are ready by the time the guest starts running.
+    for (auto& plugin : mod_plugins_) {
+      plugin->OnModuleLaunched();
     }
 
     OnPostLaunchModule(main_thread.get());
@@ -701,10 +764,19 @@ void ReXApp::OnDestroy() {
   // Notify subclass before cleanup
   OnShutdown();
 
+  // Notify mod plugins before their overlays/dialogs are torn down. Library
+  // handles are intentionally kept loaded (see LoadModPlugin) -- guest
+  // threads may still be executing plugin code pages at this point.
+  for (auto& plugin : mod_plugins_) {
+    plugin->OnShutdown();
+  }
+  mod_plugins_.clear();
+
   // Unregister overlay keybinds before destroying dialogs
   rex::ui::UnregisterBind("bind_debug_overlay");
   rex::ui::UnregisterBind("bind_console");
   rex::ui::UnregisterBind("bind_settings");
+  rex::ui::UnregisterBind("bind_mod_manager");
   rex::ui::UnregisterBind("bind_achievements");
   rex::ui::UnregisterBind("bind_shader_debugger");
 
@@ -717,6 +789,7 @@ void ReXApp::OnDestroy() {
   }
   achievement_notification_.reset();
   achievements_overlay_.reset();
+  mod_manager_overlay_.reset();
   settings_overlay_.reset();
   console_overlay_.reset();
   shader_debugger_overlay_.reset();

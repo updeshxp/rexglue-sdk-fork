@@ -48,7 +48,6 @@
 
 // CVARs controlling the dump/replace pipeline (defined in cache.cpp).
 REXCVAR_DECLARE(bool, texture_dump_enabled);
-REXCVAR_DECLARE(bool, texture_replace_enabled);
 REXCVAR_DECLARE(std::string, texture_dump_format);
 REXCVAR_DECLARE(std::string, texture_dump_skip_sizes);
 
