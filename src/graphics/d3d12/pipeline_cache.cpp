@@ -16,6 +16,7 @@
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
+#include <string>
 #include <deque>
 #include <mutex>
 #include <set>
@@ -48,6 +49,16 @@
 #include <rex/thread.h>
 #include <rex/types.h>
 #include <rex/ui/d3d12/d3d12_util.h>
+
+// d3dcompiler.h transitively includes <windows.h>; rex headers above already
+// handle NOMINMAX, but include this one last so any local re-#define of
+// min/max from windows.h cannot poison preceding standard library template
+// uses (e.g. std::numeric_limits<T>::max()).
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <d3dcompiler.h>
+#include <wrl/client.h>
 
 REXCVAR_DEFINE_BOOL(d3d12_dxbc_disasm, false, "GPU/D3D12", "Dump DXBC disassembly");
 
@@ -206,10 +217,13 @@ void PipelineCache::Shutdown() {
   }
   texture_binding_layout_map_.clear();
   texture_binding_layouts_.clear();
-  for (auto it : shaders_) {
-    delete it.second;
+  {
+    std::lock_guard<std::mutex> lock(shaders_mutex_);
+    for (auto it : shaders_) {
+      delete it.second;
+    }
+    shaders_.clear();
   }
-  shaders_.clear();
   shader_storage_index_ = 0;
 
   // Shut down shader translation.
@@ -221,14 +235,13 @@ void PipelineCache::Shutdown() {
 void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_root,
                                             uint32_t title_id, bool blocking) {
   ShutdownShaderStorage();
+  const bool shader_storage_dump_enabled = REXCVAR_GET(shader_dump_enabled);
+  const bool shader_storage_load_enabled = REXCVAR_GET(shader_load_enabled);
+  if (!shader_storage_dump_enabled && !shader_storage_load_enabled) {
+    return;
+  }
+  const std::filesystem::path shader_storage_root = cache_root / "shaders";
 
-  auto shader_storage_root = cache_root / "shaders";
-  // For files that can be moved between different hosts.
-  // Host PSO blobs - if ever added - should be stored in shaders/local/ (they
-  // currently aren't used because because they may be not very practical -
-  // would need to invalidate them every commit likely, and additional I/O
-  // cost - though D3D's internal validation would possibly be enough to ensure
-  // they are up to date).
   auto shader_storage_shareable_root = shader_storage_root / "shareable";
   if (!std::filesystem::exists(shader_storage_shareable_root)) {
     if (!std::filesystem::create_directories(shader_storage_shareable_root)) {
@@ -328,10 +341,12 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
   uint64_t shader_storage_initialization_start = rex::chrono::Clock::QueryHostTickCount();
   auto shader_storage_file_path =
       shader_storage_shareable_root / fmt::format("{:08X}.xsh", title_id);
-  shader_storage_file_ = rex::filesystem::OpenFile(shader_storage_file_path, "a+b");
+  if (shader_storage_dump_enabled || shader_storage_load_enabled) {
+    shader_storage_file_ = rex::filesystem::OpenFile(shader_storage_file_path, "a+b");
+  }
   if (!shader_storage_file_) {
     REXGPU_ERROR(
-        "Failed to open the guest shader storage file for writing, persistent "
+        "Failed to open the guest shader storage file, persistent "
         "shader storage will be disabled: {}",
         rex::path_to_utf8(shader_storage_file_path));
     fclose(pipeline_storage_file_);
@@ -346,7 +361,8 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
   } shader_storage_file_header;
   // 'XESH'.
   const uint32_t shader_storage_magic = 0x48534558;
-  if (fread(&shader_storage_file_header, sizeof(shader_storage_file_header), 1,
+  if (shader_storage_load_enabled && shader_storage_file_ &&
+      fread(&shader_storage_file_header, sizeof(shader_storage_file_header), 1,
             shader_storage_file_) &&
       shader_storage_file_header.magic == shader_storage_magic &&
       rex::byte_swap(shader_storage_file_header.version_swapped) == ShaderStoredHeader::kVersion) {
@@ -505,7 +521,10 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
         D3D12Shader* shader = static_cast<D3D12Shader*>(&translation->shader());
         shader->DestroyTranslation(translation->modification());
         if (shader->translations().empty()) {
-          shaders_.erase(shader->ucode_data_hash());
+          {
+            std::lock_guard<std::mutex> lock(shaders_mutex_);
+            shaders_.erase(shader->ucode_data_hash());
+          }
           delete shader;
         }
       }
@@ -513,13 +532,32 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
     REXGPU_INFO("Translated {} shaders from the storage in {} milliseconds", shaders_translated,
                 (rex::chrono::Clock::QueryHostTickCount() - shader_storage_initialization_start) *
                     1000 / rex::chrono::Clock::QueryHostTickFrequency());
-    rex::filesystem::TruncateStdioFile(shader_storage_file_, shader_storage_valid_bytes);
-  } else {
+    if (shader_storage_dump_enabled) {
+      rex::filesystem::TruncateStdioFile(shader_storage_file_, shader_storage_valid_bytes);
+    }
+  } else if (shader_storage_dump_enabled && shader_storage_file_) {
     rex::filesystem::TruncateStdioFile(shader_storage_file_, 0);
     shader_storage_file_header.magic = shader_storage_magic;
     shader_storage_file_header.version_swapped = rex::byte_swap(ShaderStoredHeader::kVersion);
     fwrite(&shader_storage_file_header, sizeof(shader_storage_file_header), 1,
            shader_storage_file_);
+  }
+
+  // Apply DXBC replacements from shader_mod_roots_ to all pre-translated
+  // shaders before PSO creation.
+  if (REXCVAR_GET(shader_load_enabled) && !shader_mod_roots_.empty()) {
+    std::lock_guard<std::mutex> lock(shaders_mutex_);
+    for (const auto& [hash, shader_ptr] : shaders_) {
+      if (!shader_ptr) {
+        continue;
+      }
+      for (const auto& [mod, translation_ptr] : shader_ptr->translations()) {
+        if (!translation_ptr || !translation_ptr->is_translated()) {
+          continue;
+        }
+        ApplyDxbcReplacement(hash, *static_cast<D3D12Shader::D3D12Translation*>(translation_ptr));
+      }
+    }
   }
 
   // Create the pipelines.
@@ -563,11 +601,15 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
       }
 
       PipelineRuntimeDescription pipeline_runtime_description;
-      auto vertex_shader_it = shaders_.find(pipeline_description.vertex_shader_hash);
-      if (vertex_shader_it == shaders_.end()) {
-        continue;
+      D3D12Shader* vertex_shader;
+      {
+        std::lock_guard<std::mutex> lock(shaders_mutex_);
+        auto vertex_shader_it = shaders_.find(pipeline_description.vertex_shader_hash);
+        if (vertex_shader_it == shaders_.end()) {
+          continue;
+        }
+        vertex_shader = vertex_shader_it->second;
       }
-      D3D12Shader* vertex_shader = vertex_shader_it->second;
       pipeline_runtime_description.vertex_shader = static_cast<D3D12Shader::D3D12Translation*>(
           vertex_shader->GetTranslation(pipeline_description.vertex_shader_modification));
       if (!pipeline_runtime_description.vertex_shader ||
@@ -577,11 +619,14 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
       }
       D3D12Shader* pixel_shader;
       if (pipeline_description.pixel_shader_hash) {
-        auto pixel_shader_it = shaders_.find(pipeline_description.pixel_shader_hash);
-        if (pixel_shader_it == shaders_.end()) {
-          continue;
+        {
+          std::lock_guard<std::mutex> lock(shaders_mutex_);
+          auto pixel_shader_it = shaders_.find(pipeline_description.pixel_shader_hash);
+          if (pixel_shader_it == shaders_.end()) {
+            continue;
+          }
+          pixel_shader = pixel_shader_it->second;
         }
-        pixel_shader = pixel_shader_it->second;
         pipeline_runtime_description.pixel_shader = static_cast<D3D12Shader::D3D12Translation*>(
             pixel_shader->GetTranslation(pipeline_description.pixel_shader_modification));
         if (!pipeline_runtime_description.pixel_shader ||
@@ -801,6 +846,7 @@ D3D12Shader* PipelineCache::LoadShader(xenos::ShaderType shader_type, const uint
 
 D3D12Shader* PipelineCache::LoadShader(xenos::ShaderType shader_type, const uint32_t* host_address,
                                        uint32_t dword_count, uint64_t data_hash) {
+  std::lock_guard<std::mutex> lock(shaders_mutex_);
   auto it = shaders_.find(data_hash);
   if (it != shaders_.end()) {
     // Shader has been previously loaded.
@@ -810,8 +856,214 @@ D3D12Shader* PipelineCache::LoadShader(xenos::ShaderType shader_type, const uint
   // We need to track it even if it fails translation so we know not to try
   // again.
   D3D12Shader* shader = new D3D12Shader(shader_type, data_hash, host_address, dword_count);
+  if (command_processor_.IsShaderBlacklisted(data_hash)) {
+    shader->set_disabled(true);
+  }
   shaders_.emplace(data_hash, shader);
   return shader;
+}
+
+std::vector<CommandProcessor::ShaderInfo> PipelineCache::GetShaderSnapshot(
+    uint64_t active_vertex_hash, uint64_t active_pixel_hash) const {
+  std::vector<CommandProcessor::ShaderInfo> result;
+  std::lock_guard<std::mutex> lock(shaders_mutex_);
+  result.reserve(shaders_.size());
+  for (const auto& kv : shaders_) {
+    const D3D12Shader* shader = kv.second;
+    if (!shader) {
+      continue;
+    }
+    CommandProcessor::ShaderInfo info;
+    info.ucode_hash = kv.first;
+    info.type = shader->type();
+    info.dword_count = static_cast<uint32_t>(shader->ucode_dword_count());
+    info.disabled = shader->disabled();
+    info.active = (kv.first == active_vertex_hash) || (kv.first == active_pixel_hash);
+    info.profile_total_ns = shader->profile_total_ns();
+    info.profile_draw_count = shader->profile_draw_count();
+    result.push_back(info);
+  }
+  return result;
+}
+
+void PipelineCache::ResetShaderProfiling() {
+  std::lock_guard<std::mutex> lock(shaders_mutex_);
+  for (const auto& kv : shaders_) {
+    if (kv.second) {
+      kv.second->profile_reset();
+    }
+  }
+}
+
+void PipelineCache::SetShaderDisabledByHash(uint64_t ucode_hash, bool disabled) {
+  std::lock_guard<std::mutex> lock(shaders_mutex_);
+  auto it = shaders_.find(ucode_hash);
+  if (it != shaders_.end() && it->second) {
+    it->second->set_disabled(disabled);
+  }
+}
+
+CommandProcessor::ShaderDetails PipelineCache::GetShaderDetails(uint64_t ucode_hash) const {
+  CommandProcessor::ShaderDetails details;
+  D3D12Shader* shader = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(shaders_mutex_);
+    auto it = shaders_.find(ucode_hash);
+    if (it == shaders_.end() || !it->second) {
+      return details;
+    }
+    shader = it->second;
+  }
+  // Force ucode analysis on demand so the user always sees disassembly.
+  // ucode_disasm_buffer_ is owned by this cache and only used on the CP
+  // thread for normal translation; for an interactive debugger fetch a
+  // separate buffer is fine.
+  if (!shader->is_ucode_analyzed()) {
+    string::StringBuffer scratch;
+    shader->AnalyzeUcode(scratch);
+  }
+  details.found = true;
+  details.info.ucode_hash = ucode_hash;
+  details.info.type = shader->type();
+  details.info.dword_count = static_cast<uint32_t>(shader->ucode_dword_count());
+  details.info.disabled = shader->disabled();
+  details.ucode_disassembly = shader->ucode_disassembly();
+  details.ucode_dwords = shader->ucode_data();
+  for (const auto& tr_kv : shader->translations()) {
+    const auto* translation = tr_kv.second;
+    if (!translation)
+      continue;
+    CommandProcessor::ShaderTranslationInfo ti;
+    ti.modification = translation->modification();
+    ti.is_translated = translation->is_translated();
+    ti.is_valid = translation->is_valid();
+    ti.host_disassembly = translation->host_disassembly();
+    ti.translated_binary = translation->translated_binary();
+    details.translations.push_back(std::move(ti));
+  }
+  return details;
+}
+
+bool PipelineCache::ReplaceShaderTranslationBinary(uint64_t ucode_hash, uint64_t modification,
+                                                   std::vector<uint8_t> binary) {
+  // Verify the shader / translation exists before scheduling any work.
+  D3D12Shader::D3D12Translation* translation = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(shaders_mutex_);
+    auto it = shaders_.find(ucode_hash);
+    if (it == shaders_.end() || !it->second) {
+      return false;
+    }
+    translation =
+        static_cast<D3D12Shader::D3D12Translation*>(it->second->GetTranslation(modification));
+  }
+  if (!translation) {
+    return false;
+  }
+  // Defer the actual mutation onto the command processor thread so we don't
+  // race with an in-flight draw that's reading the binary or building a PSO.
+  command_processor_.CallInThread([this, ucode_hash, modification, binary = std::move(binary)]() {
+    D3D12Shader::D3D12Translation* tr = nullptr;
+    {
+      std::lock_guard<std::mutex> lock(shaders_mutex_);
+      auto it = shaders_.find(ucode_hash);
+      if (it == shaders_.end() || !it->second) {
+        return;
+      }
+      tr = static_cast<D3D12Shader::D3D12Translation*>(it->second->GetTranslation(modification));
+    }
+    if (!tr) {
+      return;
+    }
+    tr->set_translated_binary(std::move(const_cast<std::vector<uint8_t>&>(binary)));
+
+    // Drop every cached PSO that referenced this shader so it gets rebuilt
+    // from the new binary on next use.
+    current_pipeline_ = nullptr;
+    for (auto it = pipelines_.begin(); it != pipelines_.end();) {
+      const auto& desc = it->second->description.description;
+      if (desc.vertex_shader_hash == ucode_hash || desc.pixel_shader_hash == ucode_hash) {
+        ID3D12PipelineState* state = it->second->state.load(std::memory_order_acquire);
+        if (state) {
+          state->Release();
+        }
+        delete it->second;
+        it = pipelines_.erase(it);
+      } else {
+        ++it;
+      }
+    }
+    COUNT_profile_set("gpu/pipeline_cache/pipelines", pipelines_.size());
+  });
+  return true;
+}
+
+bool PipelineCache::ReplaceShaderTranslationHLSL(uint64_t ucode_hash, uint64_t modification,
+                                                 std::string_view source,
+                                                 std::string_view entry_point,
+                                                 std::string_view target_profile,
+                                                 std::string* out_error) {
+  // Look up the shader to verify the hash exists and pick a default target
+  // profile from the shader stage if the caller didn't supply one.
+  xenos::ShaderType stage = xenos::ShaderType::kVertex;
+  {
+    std::lock_guard<std::mutex> lock(shaders_mutex_);
+    auto it = shaders_.find(ucode_hash);
+    if (it == shaders_.end() || !it->second) {
+      if (out_error) {
+        *out_error = "Shader hash not loaded by the GPU yet.";
+      }
+      return false;
+    }
+    stage = it->second->type();
+  }
+
+  std::string entry_storage(entry_point);
+  if (entry_storage.empty()) {
+    entry_storage = "main";
+  }
+  std::string profile_storage(target_profile);
+  if (profile_storage.empty()) {
+    profile_storage = (stage == xenos::ShaderType::kPixel) ? "ps_5_1" : "vs_5_1";
+  }
+
+  // Compile HLSL -> DXBC. The translator's PSO build will run a separate
+  // DXBC->DXIL conversion later (see d3d12/shader.cpp), so SM 5.1 is fine.
+  Microsoft::WRL::ComPtr<ID3DBlob> code_blob;
+  Microsoft::WRL::ComPtr<ID3DBlob> error_blob;
+  UINT flags = D3DCOMPILE_ENABLE_STRICTNESS;
+#if !defined(NDEBUG)
+  flags |= D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION;
+#else
+  flags |= D3DCOMPILE_OPTIMIZATION_LEVEL3;
+#endif
+  HRESULT hr = D3DCompile(source.data(), source.size(),
+                          /*pSourceName*/ nullptr,
+                          /*pDefines*/ nullptr,
+                          /*pInclude*/ D3D_COMPILE_STANDARD_FILE_INCLUDE, entry_storage.c_str(),
+                          profile_storage.c_str(), flags, 0, &code_blob, &error_blob);
+  if (FAILED(hr) || !code_blob) {
+    if (out_error) {
+      if (error_blob && error_blob->GetBufferSize() > 0) {
+        *out_error = std::string(static_cast<const char*>(error_blob->GetBufferPointer()),
+                                 error_blob->GetBufferSize());
+      } else {
+        *out_error =
+            fmt::format("D3DCompile failed (HRESULT 0x{:08X}).", static_cast<uint32_t>(hr));
+      }
+    }
+    REXGPU_ERROR("HLSL replacement for shader {:016X} mod {:016X} failed: {}", ucode_hash,
+                 modification,
+                 (error_blob && error_blob->GetBufferSize() > 0)
+                     ? static_cast<const char*>(error_blob->GetBufferPointer())
+                     : "(no diagnostic)");
+    return false;
+  }
+
+  std::vector<uint8_t> binary(
+      static_cast<const uint8_t*>(code_blob->GetBufferPointer()),
+      static_cast<const uint8_t*>(code_blob->GetBufferPointer()) + code_blob->GetBufferSize());
+  return ReplaceShaderTranslationBinary(ucode_hash, modification, std::move(binary));
 }
 
 DxbcShaderTranslator::Modification PipelineCache::GetCurrentVertexShaderModification(
@@ -933,7 +1185,7 @@ bool PipelineCache::ConfigurePipeline(
         REXGPU_ERROR("Failed to translate the vertex shader!");
         return false;
       }
-      if (shader_storage_file_ &&
+      if (REXCVAR_GET(shader_dump_enabled) && shader_storage_file_ &&
           vertex_shader->shader().ucode_storage_index() != shader_storage_index_) {
         vertex_shader->shader().set_ucode_storage_index(shader_storage_index_);
         assert_not_null(storage_write_thread_);
@@ -960,7 +1212,7 @@ bool PipelineCache::ConfigurePipeline(
           REXGPU_ERROR("Failed to translate the pixel shader!");
           return false;
         }
-        if (shader_storage_file_ &&
+        if (REXCVAR_GET(shader_dump_enabled) && shader_storage_file_ &&
             pixel_shader->shader().ucode_storage_index() != shader_storage_index_) {
           pixel_shader->shader().set_ucode_storage_index(shader_storage_index_);
           assert_not_null(storage_write_thread_);
@@ -1221,15 +1473,79 @@ bool PipelineCache::TranslateAnalyzedShader(DxbcShaderTranslator& translator,
   }
 
   // Dump shader files if desired.
-  if (!REXCVAR_GET(dump_shaders).empty()) {
+  if (REXCVAR_GET(shader_dump_enabled)) {
     bool edram_rov_used =
         render_target_cache_.GetPath() == RenderTargetCache::Path::kPixelShaderInterlock;
-    translation.Dump(REXCVAR_GET(dump_shaders), (shader.type() == xenos::ShaderType::kPixel)
-                                                    ? (edram_rov_used ? "d3d12_rov" : "d3d12_rtv")
-                                                    : "d3d12");
+    const auto dump_path =
+        (shader_dump_root_.empty() ? rex::filesystem::GetExecutableFolder() / "dumps"
+                                   : shader_dump_root_) /
+        "shaders";
+    translation.Dump(dump_path, (shader.type() == xenos::ShaderType::kPixel)
+                                    ? (edram_rov_used ? "d3d12_rov" : "d3d12_rtv")
+                                    : "d3d12");
+  }
+
+  // Load a replacement DXBC from shader_mod_roots_ if present.
+  if (REXCVAR_GET(shader_load_enabled)) {
+    ApplyDxbcReplacement(shader.ucode_data_hash(), translation);
   }
 
   return translation.is_valid();
+}
+
+bool PipelineCache::ApplyDxbcReplacement(uint64_t ucode_hash,
+                                         D3D12Shader::D3D12Translation& translation) {
+  for (const auto& mod_root : shader_mod_roots_) {
+    const auto mod_path =
+        mod_root / fmt::format("{:016X}_{:016X}.dxbc", ucode_hash, translation.modification());
+    if (!std::filesystem::exists(mod_path)) {
+      continue;
+    }
+    FILE* f = rex::filesystem::OpenFile(mod_path, "rb");
+    if (!f) {
+      continue;
+    }
+    rex::filesystem::Seek(f, 0, SEEK_END);
+    const int64_t size = rex::filesystem::Tell(f);
+    rex::filesystem::Seek(f, 0, SEEK_SET);
+    bool applied = false;
+    if (size > 0) {
+      std::vector<uint8_t> replacement(static_cast<size_t>(size));
+      if (fread(replacement.data(), 1, replacement.size(), f) == replacement.size()) {
+        translation.set_translated_binary(std::move(replacement));
+        REXGPU_INFO("Loaded replacement DXBC {:016X} mod {:016X} from {}", ucode_hash,
+                    translation.modification(), mod_path.string());
+        applied = true;
+      }
+    }
+    fclose(f);
+    if (applied) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void PipelineCache::InitializeAssetReplacement(std::vector<std::filesystem::path> mod_roots,
+                                               std::filesystem::path dump_root) {
+  shader_mod_roots_ = std::move(mod_roots);
+  shader_dump_root_ = std::move(dump_root);
+
+  if (!REXCVAR_GET(shader_load_enabled) || shader_mod_roots_.empty()) {
+    return;
+  }
+  std::lock_guard<std::mutex> lock(shaders_mutex_);
+  for (const auto& [hash, shader_ptr] : shaders_) {
+    if (!shader_ptr) {
+      continue;
+    }
+    for (const auto& [mod, translation_ptr] : shader_ptr->translations()) {
+      if (!translation_ptr || !translation_ptr->is_translated()) {
+        continue;
+      }
+      ApplyDxbcReplacement(hash, *static_cast<D3D12Shader::D3D12Translation*>(translation_ptr));
+    }
+  }
 }
 
 bool PipelineCache::GetCurrentStateDescription(
@@ -3067,8 +3383,9 @@ void PipelineCache::StorageWriteThread() {
   while (true) {
     if (flush_shaders) {
       flush_shaders = false;
-      assert_not_null(shader_storage_file_);
-      fflush(shader_storage_file_);
+      if (REXCVAR_GET(shader_dump_enabled) && shader_storage_file_) {
+        fflush(shader_storage_file_);
+      }
     }
     if (flush_pipelines) {
       flush_pipelines = false;
@@ -3110,16 +3427,19 @@ void PipelineCache::StorageWriteThread() {
       shader_header.ucode_data_hash = shader->ucode_data_hash();
       shader_header.ucode_dword_count = shader->ucode_dword_count();
       shader_header.type = shader->type();
-      assert_not_null(shader_storage_file_);
-      fwrite(&shader_header, sizeof(shader_header), 1, shader_storage_file_);
+      if (REXCVAR_GET(shader_dump_enabled) && shader_storage_file_) {
+        fwrite(&shader_header, sizeof(shader_header), 1, shader_storage_file_);
+      }
       if (shader_header.ucode_dword_count) {
         ucode_guest_endian.resize(shader_header.ucode_dword_count);
         // Need to swap because the hash is calculated for the shader with guest
         // endianness.
         memory::copy_and_swap(ucode_guest_endian.data(), shader->ucode_dwords(),
                               shader_header.ucode_dword_count);
-        fwrite(ucode_guest_endian.data(), shader_header.ucode_dword_count * sizeof(uint32_t), 1,
-               shader_storage_file_);
+        if (REXCVAR_GET(shader_dump_enabled) && shader_storage_file_) {
+          fwrite(ucode_guest_endian.data(), shader_header.ucode_dword_count * sizeof(uint32_t), 1,
+                 shader_storage_file_);
+        }
       }
     }
 

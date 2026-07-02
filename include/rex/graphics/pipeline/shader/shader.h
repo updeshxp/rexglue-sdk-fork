@@ -11,6 +11,7 @@
  */
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <filesystem>
 #include <set>
@@ -793,6 +794,14 @@ class Shader {
       host_disassembly_ = std::move(disassembly);
     }
 
+    // For runtime shader replacement (e.g. from the in-game shader debugger):
+    // overwrites the translated binary in-place. The caller is responsible for
+    // invalidating any pipeline state objects that referenced the previous
+    // binary -- backends typically do this through their pipeline cache.
+    void set_translated_binary(std::vector<uint8_t> binary) {
+      translated_binary_ = std::move(binary);
+    }
+
     // For dumping after translation. Dumps the shader's translated code, and,
     // if available, translated disassembly, to files in the given directory
     // based on ucode hash. Returns {binary path, disassembly path if written}.
@@ -969,6 +978,29 @@ class Shader {
   uint32_t ucode_storage_index() const { return ucode_storage_index_; }
   void set_ucode_storage_index(uint32_t storage_index) { ucode_storage_index_ = storage_index; }
 
+  // When true, the command processor will skip any draw call that would use
+  // this shader as either its vertex or pixel program. Used by the in-game
+  // shader debugger overlay to disable individual shaders at runtime.
+  bool disabled() const { return disabled_.load(std::memory_order_relaxed); }
+  void set_disabled(bool value) { disabled_.store(value, std::memory_order_relaxed); }
+
+  // Per-shader profiling accessors. The accumulator is in nanoseconds of CPU
+  // time spent inside IssueDraw while this shader was bound, summed across
+  // every draw since the last reset. Cheap to read; only updated when shader
+  // profiling is enabled on the command processor.
+  uint64_t profile_total_ns() const { return profile_total_ns_.load(std::memory_order_relaxed); }
+  uint64_t profile_draw_count() const {
+    return profile_draw_count_.load(std::memory_order_relaxed);
+  }
+  void profile_add_sample(uint64_t ns) {
+    profile_total_ns_.fetch_add(ns, std::memory_order_relaxed);
+    profile_draw_count_.fetch_add(1, std::memory_order_relaxed);
+  }
+  void profile_reset() {
+    profile_total_ns_.store(0, std::memory_order_relaxed);
+    profile_draw_count_.store(0, std::memory_order_relaxed);
+  }
+
   // Dumps the shader's microcode binary and, if analyzed, disassembly, to files
   // in the given directory based on ucode hash. Returns the name of the written
   // file. Can be called at any time, doesn't require the shader to be
@@ -1032,6 +1064,16 @@ class Shader {
   std::unordered_map<uint64_t, Translation*> translations_;
 
   uint32_t ucode_storage_index_ = UINT32_MAX;
+
+  // Runtime debug toggle -- when true, draws using this shader are skipped.
+  std::atomic<bool> disabled_{false};
+
+  // Lightweight per-shader profiling counters. Only updated by the command
+  // processor while CommandProcessor::IsShaderProfilingEnabled() is true (the
+  // shader debugger toggles this when its window is open) so the cost is
+  // zero in the common case.
+  std::atomic<uint64_t> profile_total_ns_{0};
+  std::atomic<uint64_t> profile_draw_count_{0};
 
  private:
   void GatherExecInformation(const ParsedExecInstruction& instr,

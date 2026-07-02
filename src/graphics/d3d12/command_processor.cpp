@@ -10,6 +10,7 @@
  */
 
 #include <algorithm>
+#include <chrono>
 #include <cstdarg>
 #include <cstring>
 #include <sstream>
@@ -114,6 +115,61 @@ void D3D12CommandProcessor::InvalidateGpuMemory() {
   }
 }
 
+std::vector<CommandProcessor::ShaderInfo> D3D12CommandProcessor::GetShaderSnapshot() const {
+  if (!pipeline_cache_) {
+    return {};
+  }
+  uint64_t active_vs_hash = active_vertex_shader_ ? active_vertex_shader_->ucode_data_hash() : 0;
+  uint64_t active_ps_hash = active_pixel_shader_ ? active_pixel_shader_->ucode_data_hash() : 0;
+  return pipeline_cache_->GetShaderSnapshot(active_vs_hash, active_ps_hash);
+}
+
+void D3D12CommandProcessor::SetShaderDisabledByHash(uint64_t ucode_hash, bool disabled) {
+  if (!pipeline_cache_) {
+    return;
+  }
+  pipeline_cache_->SetShaderDisabledByHash(ucode_hash, disabled);
+}
+
+CommandProcessor::ShaderDetails D3D12CommandProcessor::GetShaderDetails(uint64_t ucode_hash) const {
+  if (!pipeline_cache_) {
+    return {};
+  }
+  return pipeline_cache_->GetShaderDetails(ucode_hash);
+}
+
+bool D3D12CommandProcessor::ReplaceShaderTranslationBinary(uint64_t ucode_hash,
+                                                           uint64_t modification,
+                                                           std::vector<uint8_t> binary) {
+  if (!pipeline_cache_) {
+    return false;
+  }
+  return pipeline_cache_->ReplaceShaderTranslationBinary(ucode_hash, modification,
+                                                         std::move(binary));
+}
+
+bool D3D12CommandProcessor::ReplaceShaderTranslationHLSL(uint64_t ucode_hash, uint64_t modification,
+                                                         std::string_view source,
+                                                         std::string_view entry_point,
+                                                         std::string_view target_profile,
+                                                         std::string* out_error) {
+  if (!pipeline_cache_) {
+    if (out_error) {
+      *out_error = "Pipeline cache not initialized.";
+    }
+    return false;
+  }
+  return pipeline_cache_->ReplaceShaderTranslationHLSL(ucode_hash, modification, source,
+                                                       entry_point, target_profile, out_error);
+}
+
+void D3D12CommandProcessor::ResetShaderProfiling() {
+  if (!pipeline_cache_) {
+    return;
+  }
+  pipeline_cache_->ResetShaderProfiling();
+}
+
 void D3D12CommandProcessor::InvalidateAllVertexBufferResidency() {
   vertex_buffers_in_sync_[0] = 0;
   vertex_buffers_in_sync_[1] = 0;
@@ -148,6 +204,16 @@ void D3D12CommandProcessor::InitializeShaderStorage(const std::filesystem::path&
                                                     uint32_t title_id, bool blocking) {
   CommandProcessor::InitializeShaderStorage(cache_root, title_id, blocking);
   pipeline_cache_->InitializeShaderStorage(cache_root, title_id, blocking);
+}
+
+void D3D12CommandProcessor::InitializeAssetReplacement(
+    const system::AssetReplacementConfig& config) {
+  if (texture_cache_) {
+    texture_cache_->InitTextureReplacement(config.texture_mod_roots, config.dump_root);
+  }
+  if (pipeline_cache_) {
+    pipeline_cache_->InitializeAssetReplacement(config.shader_mod_roots, config.dump_root);
+  }
 }
 
 void D3D12CommandProcessor::RequestFrameTrace(const std::filesystem::path& root_path) {
@@ -2316,6 +2382,10 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     // Always need a vertex shader.
     return false;
   }
+  if (vertex_shader->disabled()) {
+    // Shader debugger has muted this vertex program -- skip the draw entirely.
+    return true;
+  }
   pipeline_cache_->AnalyzeShaderUcode(*vertex_shader);
   bool memexport_used_vertex = vertex_shader->memexport_eM_written() != 0;
 
@@ -2334,6 +2404,10 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     if (edram_mode == xenos::EdramMode::kColorDepth) {
       pixel_shader = static_cast<D3D12Shader*>(active_pixel_shader());
       if (pixel_shader) {
+        if (pixel_shader->disabled()) {
+          // Shader debugger has muted this pixel program -- skip the draw.
+          return true;
+        }
         pipeline_cache_->AnalyzeShaderUcode(*pixel_shader);
         if (!draw_util::IsPixelShaderNeededWithRasterization(*pixel_shader, regs)) {
           pixel_shader = nullptr;
@@ -2350,6 +2424,30 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   }
   bool memexport_used_pixel = pixel_shader && (pixel_shader->memexport_eM_written() != 0);
   bool memexport_used = memexport_used_vertex || memexport_used_pixel;
+
+  // Per-shader CPU profiling: only sampled when the shader debugger is open.
+  // We measure CPU time inside the rest of IssueDraw and attribute it to both
+  // the bound vertex and pixel shader. Cheap when disabled (one relaxed load).
+  struct ShaderDrawTimer {
+    D3D12Shader* vs;
+    D3D12Shader* ps;
+    bool enabled;
+    std::chrono::steady_clock::time_point start;
+    ~ShaderDrawTimer() {
+      if (!enabled) {
+        return;
+      }
+      const uint64_t ns =
+          static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                    std::chrono::steady_clock::now() - start)
+                                    .count());
+      if (vs)
+        vs->profile_add_sample(ns);
+      if (ps)
+        ps->profile_add_sample(ns);
+    }
+  } shader_draw_timer{vertex_shader, pixel_shader, IsShaderProfilingEnabled(),
+                      std::chrono::steady_clock::now()};
 
   if (!BeginSubmission(true)) {
     return false;

@@ -35,6 +35,14 @@ class SharedMemory {
   void SetSystemPageBlocksValidWithGpuDataWritten();
   void InvalidateAllPages();
 
+  // Translates a guest physical address to a host pointer so callers outside
+  // the SharedMemory class hierarchy (e.g. TextureCache) can read guest data.
+  // The contents are big-endian Xbox bytes.
+  template <typename T = const uint8_t*>
+  T TranslatePhysical(uint32_t guest_address) const {
+    return memory().TranslatePhysical<T>(guest_address);
+  }
+
   typedef void (*GlobalWatchCallback)(const std::unique_lock<std::recursive_mutex>& global_lock,
                                       void* context, uint32_t address_first, uint32_t address_last,
                                       bool invalidated_by_gpu);

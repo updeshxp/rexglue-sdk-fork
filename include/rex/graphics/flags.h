@@ -54,6 +54,7 @@ REXCVAR_DECLARE(int32_t, texture_cache_memory_limit_hard);
 REXCVAR_DECLARE(int32_t, texture_cache_memory_limit_soft_lifetime);
 REXCVAR_DECLARE(bool, non_seamless_cube_map);
 
+// GPU Shader Storage
 // GPU Primitive Processing
 REXCVAR_DECLARE(bool, execute_unclipped_draw_vs_on_cpu);
 REXCVAR_DECLARE(bool, execute_unclipped_draw_vs_on_cpu_for_psi_render_backend);
@@ -72,6 +73,8 @@ REXCVAR_DECLARE(bool, use_fuzzy_alpha_epsilon);
 
 // GPU Shader Translation / Tracing
 REXCVAR_DECLARE(std::string, dump_shaders);
+REXCVAR_DECLARE(bool, shader_dump_enabled);
+REXCVAR_DECLARE(bool, shader_load_enabled);
 REXCVAR_DECLARE(std::string, trace_gpu_prefix);
 REXCVAR_DECLARE(bool, trace_gpu_stream);
 REXCVAR_DECLARE(std::string, swap_post_effect);

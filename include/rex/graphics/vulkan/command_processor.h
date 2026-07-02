@@ -135,9 +135,19 @@ class VulkanCommandProcessor : public CommandProcessor {
   void InitializeShaderStorage(const std::filesystem::path& cache_root, uint32_t title_id,
                                bool blocking) override;
 
+  void InitializeAssetReplacement(const system::AssetReplacementConfig& config) override;
+
   void TracePlaybackWroteMemory(uint32_t base_ptr, uint32_t length) override;
 
   void RestoreEdramSnapshot(const void* snapshot) override;
+
+  // Shader debugger UI hooks.
+  std::vector<ShaderInfo> GetShaderSnapshot() const override;
+  void SetShaderDisabledByHash(uint64_t ucode_hash, bool disabled) override;
+  ShaderDetails GetShaderDetails(uint64_t ucode_hash) const override;
+  bool ReplaceShaderTranslationBinary(uint64_t ucode_hash, uint64_t modification,
+                                      std::vector<uint8_t> binary) override;
+  void ResetShaderProfiling() override;
 
   ui::vulkan::VulkanDevice* GetVulkanDevice() const {
     return static_cast<const ui::vulkan::VulkanProvider*>(graphics_system_->provider())

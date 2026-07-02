@@ -20,12 +20,14 @@
 #include <mutex>
 #include <queue>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
 
 #include <rex/assert.h>
+#include <rex/graphics/command_processor.h>
 #include <rex/graphics/d3d12/render_target_cache.h>
 #include <rex/graphics/d3d12/shader.h>
 #include <rex/graphics/flags.h>
@@ -63,6 +65,14 @@ class PipelineCache {
                                bool blocking);
   void ShutdownShaderStorage();
 
+  // Configures the DXBC replacement/dump roots. mod_roots is ordered by mod
+  // priority (first = highest); the first root with a matching
+  // <HASH>_<MOD>.dxbc file wins. dump_root is the directory shader dumps are
+  // written under (as dump_root/shaders). Immediately applies any matching
+  // replacements to shaders already translated at the time of the call.
+  void InitializeAssetReplacement(std::vector<std::filesystem::path> mod_roots,
+                                  std::filesystem::path dump_root);
+
   void EndSubmission();
   bool IsCreatingPipelines();
 
@@ -70,6 +80,30 @@ class PipelineCache {
                           uint32_t dword_count);
   // Analyze shader microcode on the translator thread.
   void AnalyzeShaderUcode(Shader& shader) { shader.AnalyzeUcode(ucode_disasm_buffer_); }
+
+  // Returns a snapshot of every shader currently tracked, for the in-game
+  // shader debugger UI. Thread-safe.
+  std::vector<CommandProcessor::ShaderInfo> GetShaderSnapshot(uint64_t active_vertex_hash,
+                                                              uint64_t active_pixel_hash) const;
+  // Toggle the disabled flag on a shader by ucode hash. Thread-safe.
+  void SetShaderDisabledByHash(uint64_t ucode_hash, bool disabled);
+  // Returns full details for one shader (used by the debugger viewer pane).
+  // Forces ucode analysis if it has not been performed yet.
+  CommandProcessor::ShaderDetails GetShaderDetails(uint64_t ucode_hash) const;
+  // Replaces the translated host binary for a (shader, modification) pair and
+  // drops any cached pipelines that referenced the previous binary.
+  bool ReplaceShaderTranslationBinary(uint64_t ucode_hash, uint64_t modification,
+                                      std::vector<uint8_t> binary);
+  // Compiles HLSL source to DXBC via D3DCompile and forwards to
+  // ReplaceShaderTranslationBinary. Empty `entry_point` defaults to "main";
+  // empty `target_profile` is inferred from the shader type (vs_5_1 / ps_5_1).
+  // Returns true on success; on failure, *out_error (if non-null) gets the
+  // compiler diagnostic.
+  bool ReplaceShaderTranslationHLSL(uint64_t ucode_hash, uint64_t modification,
+                                    std::string_view source, std::string_view entry_point,
+                                    std::string_view target_profile, std::string* out_error);
+  // Resets per-shader profiling counters across every tracked shader.
+  void ResetShaderProfiling();
 
   // Retrieves the shader modification for the current state. The shader must
   // have microcode analyzed.
@@ -265,6 +299,11 @@ class PipelineCache {
   D3D12Shader* LoadShader(xenos::ShaderType shader_type, const uint32_t* host_address,
                           uint32_t dword_count, uint64_t data_hash);
 
+  // Applies a DXBC replacement to one translation if a matching
+  // <HASH>_<MOD>.dxbc file exists in shader_mod_roots_ (first root wins).
+  // Returns true if a replacement was applied.
+  bool ApplyDxbcReplacement(uint64_t ucode_hash, D3D12Shader::D3D12Translation& translation);
+
   // Can be called from multiple threads.
   bool TranslateAnalyzedShader(DxbcShaderTranslator& translator,
                                D3D12Shader::D3D12Translation& translation,
@@ -313,6 +352,8 @@ class PipelineCache {
 
   // Ucode hash -> shader.
   std::unordered_map<uint64_t, D3D12Shader*, rex::IdentityHasher<uint64_t>> shaders_;
+  // Protects shaders_ for cross-thread access (debugger UI on the UI thread).
+  mutable std::mutex shaders_mutex_;
 
   struct LayoutUID {
     size_t uid;
@@ -369,6 +410,11 @@ class PipelineCache {
   // Currently open shader storage path.
   std::filesystem::path shader_storage_cache_root_;
   uint32_t shader_storage_title_id_ = 0;
+
+  // DXBC replacement/dump roots configured via InitializeAssetReplacement.
+  // Ordered by mod priority (first = highest).
+  std::vector<std::filesystem::path> shader_mod_roots_;
+  std::filesystem::path shader_dump_root_;
 
   // Shader storage output stream, for preload in the next emulator runs.
   FILE* shader_storage_file_ = nullptr;

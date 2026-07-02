@@ -25,6 +25,9 @@
 #include <rex/ui/overlay/console_overlay.h>
 #include <rex/ui/overlay/debug_overlay.h>
 #include <rex/ui/overlay/settings_overlay.h>
+#include <rex/ui/overlay/shader_debugger_overlay.h>
+#include <rex/graphics/command_processor.h>
+#include <rex/graphics/graphics_system.h>
 #include <rex/audio/audio_system.h>
 #include <rex/audio/sdl/sdl_audio_system.h>
 #include <rex/input/input_system.h>
@@ -255,7 +258,8 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
     auto* input_sys = static_cast<rex::input::InputSystem*>(runtime_->input_system());
     if (input_sys) {
       input_sys->SetActiveCallback([this]() {
-        if (!debug_overlay_ && !console_overlay_ && !settings_overlay_ && !achievements_overlay_)
+        if (!debug_overlay_ && !console_overlay_ && !settings_overlay_ && !achievements_overlay_ &&
+            !shader_debugger_overlay_)
           return true;
         return !imgui_drawer_->GetIO().WantCaptureMouse;
       });
@@ -419,6 +423,128 @@ void ReXApp::SetupOverlays(rex::ui::Presenter* presenter, rex::ui::ImmediateDraw
       achievements_overlay_ = CreateAchievementsOverlay();
     }
   });
+  rex::ui::RegisterBind("bind_shader_debugger", "F2", "Toggle shader debugger overlay", [this] {
+    if (shader_debugger_overlay_) {
+      shader_debugger_overlay_.reset();
+    } else {
+      auto snapshot_provider = [this]() {
+        std::vector<ui::ShaderDebuggerEntry> out;
+        if (!runtime_)
+          return out;
+        auto* gs = static_cast<rex::graphics::GraphicsSystem*>(runtime_->graphics_system());
+        if (!gs)
+          return out;
+        auto* cp = gs->command_processor();
+        if (!cp)
+          return out;
+        auto snapshot = cp->GetShaderSnapshot();
+        out.reserve(snapshot.size());
+        for (const auto& s : snapshot) {
+          ui::ShaderDebuggerEntry e;
+          e.ucode_hash = s.ucode_hash;
+          e.type = static_cast<uint32_t>(s.type);
+          e.dword_count = s.dword_count;
+          e.disabled = s.disabled;
+          e.active = s.active;
+          e.profile_total_ns = s.profile_total_ns;
+          e.profile_draw_count = s.profile_draw_count;
+          out.push_back(e);
+        }
+        return out;
+      };
+      auto disable_setter = [this](uint64_t hash, bool disabled) {
+        if (!runtime_)
+          return;
+        auto* gs = static_cast<rex::graphics::GraphicsSystem*>(runtime_->graphics_system());
+        if (!gs)
+          return;
+        auto* cp = gs->command_processor();
+        if (!cp)
+          return;
+        // Route through the persistent blacklist so the toggle also applies
+        // to future loads of the same shader, not just the one currently
+        // resident in the cache. Both AddShaderBlacklist and
+        // RemoveShaderBlacklist update already-loaded shaders too.
+        if (disabled) {
+          cp->AddShaderBlacklist(hash);
+        } else {
+          cp->RemoveShaderBlacklist(hash);
+        }
+      };
+      auto details_provider = [this](uint64_t hash) {
+        ui::ShaderDebuggerDetails out;
+        if (!runtime_)
+          return out;
+        auto* gs = static_cast<rex::graphics::GraphicsSystem*>(runtime_->graphics_system());
+        if (!gs)
+          return out;
+        auto* cp = gs->command_processor();
+        if (!cp)
+          return out;
+        auto details = cp->GetShaderDetails(hash);
+        out.found = details.found;
+        out.info.ucode_hash = details.info.ucode_hash;
+        out.info.type = static_cast<uint32_t>(details.info.type);
+        out.info.dword_count = details.info.dword_count;
+        out.info.disabled = details.info.disabled;
+        out.info.active = details.info.active;
+        out.ucode_disassembly = std::move(details.ucode_disassembly);
+        out.ucode_dwords = std::move(details.ucode_dwords);
+        out.translations.reserve(details.translations.size());
+        for (auto& t : details.translations) {
+          ui::ShaderDebuggerTranslation tt;
+          tt.modification = t.modification;
+          tt.is_translated = t.is_translated;
+          tt.is_valid = t.is_valid;
+          tt.host_disassembly = std::move(t.host_disassembly);
+          tt.translated_binary = std::move(t.translated_binary);
+          out.translations.push_back(std::move(tt));
+        }
+        return out;
+      };
+      auto binary_replacer = [this](uint64_t hash, uint64_t modification,
+                                    std::vector<uint8_t> binary) {
+        if (!runtime_)
+          return false;
+        auto* gs = static_cast<rex::graphics::GraphicsSystem*>(runtime_->graphics_system());
+        if (!gs)
+          return false;
+        auto* cp = gs->command_processor();
+        if (!cp)
+          return false;
+        return cp->ReplaceShaderTranslationBinary(hash, modification, std::move(binary));
+      };
+      auto profiling_toggle = [this](bool enabled) {
+        if (!runtime_)
+          return;
+        auto* gs = static_cast<rex::graphics::GraphicsSystem*>(runtime_->graphics_system());
+        if (!gs)
+          return;
+        auto* cp = gs->command_processor();
+        if (!cp)
+          return;
+        cp->SetShaderProfilingEnabled(enabled);
+      };
+      auto profiling_resetter = [this]() {
+        if (!runtime_)
+          return;
+        auto* gs = static_cast<rex::graphics::GraphicsSystem*>(runtime_->graphics_system());
+        if (!gs)
+          return;
+        auto* cp = gs->command_processor();
+        if (!cp)
+          return;
+        cp->ResetShaderProfiling();
+      };
+      const std::filesystem::path shaders_toml_path = runtime_
+                                                          ? runtime_->ModDumpRoot() / "shaders.toml"
+                                                          : std::filesystem::path("shaders.toml");
+      shader_debugger_overlay_ = std::make_unique<ui::ShaderDebuggerDialog>(
+          imgui_drawer_.get(), std::move(snapshot_provider), std::move(disable_setter),
+          std::move(details_provider), std::move(binary_replacer), std::move(profiling_toggle),
+          std::move(profiling_resetter), shaders_toml_path);
+    }
+  });
 
   OnCreateDialogs(imgui_drawer_.get());
 }
@@ -458,6 +584,28 @@ void ReXApp::LaunchModule() {
       if (title_id != 0) {
         REXLOG_INFO("Initializing shader storage for title {:08X}...", title_id);
         graphics_system->InitializeShaderStorage(runtime_->cache_root(), title_id, true);
+      }
+    }
+
+    const std::filesystem::path dump_root = runtime_->ModDumpRoot();
+    if (graphics_system) {
+      rex::system::AssetReplacementConfig asset_replacement_config;
+      asset_replacement_config.texture_mod_roots = runtime_->ModOverlayRoots("textures");
+      asset_replacement_config.shader_mod_roots = runtime_->ModOverlayRoots("shaders");
+      asset_replacement_config.dump_root = dump_root;
+      graphics_system->InitializeAssetReplacement(asset_replacement_config);
+    }
+
+    // Apply persistent shader blacklist from shaders.toml so disabled shaders
+    // are skipped from the very first draw, without requiring the user to
+    // open the F2 shader debugger overlay first.
+    if (auto* gs = static_cast<rex::graphics::GraphicsSystem*>(graphics_system)) {
+      if (auto* cp = gs->command_processor()) {
+        auto blacklist =
+            ui::ShaderDebuggerDialog::ReadShaderBlacklistFromToml(dump_root / "shaders.toml");
+        for (uint64_t hash : blacklist) {
+          cp->AddShaderBlacklist(hash);
+        }
       }
     }
 
@@ -558,6 +706,7 @@ void ReXApp::OnDestroy() {
   rex::ui::UnregisterBind("bind_console");
   rex::ui::UnregisterBind("bind_settings");
   rex::ui::UnregisterBind("bind_achievements");
+  rex::ui::UnregisterBind("bind_shader_debugger");
 
   // ImGui cleanup (reverse of setup)
   if (achievement_notification_listener_ != 0) {
@@ -570,6 +719,7 @@ void ReXApp::OnDestroy() {
   achievements_overlay_.reset();
   settings_overlay_.reset();
   console_overlay_.reset();
+  shader_debugger_overlay_.reset();
   debug_overlay_.reset();
   if (imgui_drawer_) {
     imgui_drawer_->SetPresenterAndImmediateDrawer(nullptr, nullptr);

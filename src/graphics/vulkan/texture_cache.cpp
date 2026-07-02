@@ -1782,6 +1782,78 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
   return true;
 }
 
+bool VulkanTextureCache::LoadTextureDataFromReplacementImpl(Texture& texture,
+                                                            const TextureReplacementData& data) {
+  if (data.pixels.empty() || data.width == 0 || data.height == 0) {
+    return false;
+  }
+
+  VulkanTexture& vulkan_texture = static_cast<VulkanTexture&>(texture);
+
+  if (!replacement_upload_buffer_pool_) {
+    replacement_upload_buffer_pool_ = std::make_unique<ui::vulkan::VulkanUploadBufferPool>(
+        command_processor_.GetVulkanDevice(), VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+  }
+
+  const size_t row_pitch_bytes = size_t(data.width) * 4;
+  const size_t upload_size = row_pitch_bytes * size_t(data.height);
+
+  VkBuffer staging_buffer = VK_NULL_HANDLE;
+  VkDeviceSize staging_offset = 0;
+  uint8_t* mapping = replacement_upload_buffer_pool_->Request(
+      command_processor_.GetCurrentSubmission(), upload_size, size_t(4), staging_buffer,
+      staging_offset);
+  if (!mapping) {
+    return false;
+  }
+  std::memcpy(mapping, data.pixels.data(), upload_size);
+  replacement_upload_buffer_pool_->FlushWrites();
+
+  vulkan_texture.MarkAsUsed();
+  VulkanTexture::Usage texture_old_usage =
+      vulkan_texture.SetUsage(VulkanTexture::Usage::kTransferDestination);
+  if (texture_old_usage != VulkanTexture::Usage::kTransferDestination) {
+    VkPipelineStageFlags texture_src_stage_mask, texture_dst_stage_mask;
+    VkAccessFlags texture_src_access_mask, texture_dst_access_mask;
+    VkImageLayout texture_old_layout, texture_new_layout;
+    GetTextureUsageMasks(texture_old_usage, texture_src_stage_mask, texture_src_access_mask,
+                         texture_old_layout);
+    GetTextureUsageMasks(VulkanTexture::Usage::kTransferDestination, texture_dst_stage_mask,
+                         texture_dst_access_mask, texture_new_layout);
+    command_processor_.PushImageMemoryBarrier(
+        vulkan_texture.image(), ui::vulkan::util::InitializeSubresourceRange(),
+        texture_src_stage_mask, texture_dst_stage_mask, texture_src_access_mask,
+        texture_dst_access_mask, texture_old_layout, texture_new_layout);
+  }
+  command_processor_.SubmitBarriers(true);
+
+  DeferredCommandBuffer& command_buffer = command_processor_.deferred_command_buffer();
+  VkBufferImageCopy copy_region;
+  copy_region.bufferOffset = staging_offset;
+  copy_region.bufferRowLength = data.width;
+  copy_region.bufferImageHeight = data.height;
+  copy_region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+  copy_region.imageSubresource.mipLevel = 0;
+  copy_region.imageSubresource.baseArrayLayer = 0;
+  copy_region.imageSubresource.layerCount = 1;
+  copy_region.imageOffset.x = 0;
+  copy_region.imageOffset.y = 0;
+  copy_region.imageOffset.z = 0;
+  copy_region.imageExtent.width = data.width;
+  copy_region.imageExtent.height = data.height;
+  copy_region.imageExtent.depth = 1;
+  command_buffer.CmdVkCopyBufferToImage(staging_buffer, vulkan_texture.image(),
+                                        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy_region);
+  return true;
+}
+
+void VulkanTextureCache::CompletedSubmissionUpdated(uint64_t completed_submission_index) {
+  TextureCache::CompletedSubmissionUpdated(completed_submission_index);
+  if (replacement_upload_buffer_pool_) {
+    replacement_upload_buffer_pool_->Reclaim(completed_submission_index);
+  }
+}
+
 void VulkanTextureCache::UpdateTextureBindingsImpl(uint32_t fetch_constant_mask) {
   uint32_t bindings_remaining = fetch_constant_mask;
   uint32_t binding_index;

@@ -82,6 +82,18 @@ target_include_directories(tomlplusplus SYSTEM INTERFACE
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/tomlplusplus/include>
     $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
 
+# stb_image - single-file image loader (header-only, reuse Tracy's vendored copy)
+add_library(stb_image INTERFACE)
+target_include_directories(stb_image INTERFACE
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/tracy/profiler/src>
+    $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
+
+# stb_image_write - single-file image writer (header-only, vendored in thirdparty/stb)
+add_library(stb_image_write INTERFACE)
+target_include_directories(stb_image_write INTERFACE
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/stb>
+    $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
+
 # simde - SIMD Everywhere (header-only, git submodule)
 add_library(simde INTERFACE)
 target_include_directories(simde INTERFACE

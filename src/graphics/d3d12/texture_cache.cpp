@@ -657,6 +657,12 @@ void D3D12TextureCache::ClearCache() {
 void D3D12TextureCache::BeginSubmission(uint64_t new_submission_index) {
   TextureCache::BeginSubmission(new_submission_index);
 
+  // Release upload buffers whose submission has been completed by the GPU.
+  const uint64_t completed = command_processor_.GetCompletedSubmission();
+  while (!retained_upload_buffers_.empty() && retained_upload_buffers_.front().first <= completed) {
+    retained_upload_buffers_.pop_front();
+  }
+
   // ExecuteCommandLists is a full UAV and aliasing barrier.
   if (IsDrawResolutionScaled()) {
     size_t scaled_resolve_buffer_count = GetScaledResolveBufferCount();
@@ -2202,6 +2208,100 @@ xenos::ClampMode D3D12TextureCache::NormalizeClampMode(xenos::ClampMode clamp_mo
     return xenos::ClampMode::kMirrorClampToEdge;
   }
   return clamp_mode;
+}
+
+bool D3D12TextureCache::LoadTextureDataFromReplacementImpl(Texture& texture,
+                                                           const TextureReplacementData& data) {
+  D3D12Texture& d3d12_texture = static_cast<D3D12Texture&>(texture);
+  ID3D12Resource* resource = d3d12_texture.resource();
+  if (!resource) {
+    return false;
+  }
+
+  // Only 2-D textures supported for replacements.
+  const D3D12_RESOURCE_DESC res_desc = resource->GetDesc();
+  if (res_desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) {
+    return false;
+  }
+  // Only upload if the host resource is an R8G8B8A8 family format — which is
+  // guaranteed when we forced key.format = k_8_8_8_8 in FindOrCreateTexture.
+  // k_8_8_8_8 creates the resource as R8G8B8A8_TYPELESS; views are UNORM/SNORM.
+  if (res_desc.Format != DXGI_FORMAT_R8G8B8A8_TYPELESS &&
+      res_desc.Format != DXGI_FORMAT_R8G8B8A8_UNORM &&
+      res_desc.Format != DXGI_FORMAT_R8G8B8A8_UNORM_SRGB) {
+    return false;
+  }
+
+  ID3D12Device* device = command_processor_.GetD3D12Provider().GetDevice();
+
+  // Ask D3D12 for the exact upload footprint (handles row-pitch alignment).
+  // Use a concrete format (not TYPELESS) so GetCopyableFootprints gives correct
+  // row-pitch values — TYPELESS resources are described as R8G8B8A8_UNORM here.
+  D3D12_RESOURCE_DESC footprint_desc = res_desc;
+  if (footprint_desc.Format == DXGI_FORMAT_R8G8B8A8_TYPELESS) {
+    footprint_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+  }
+  D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
+  UINT64 upload_size = 0;
+  device->GetCopyableFootprints(&footprint_desc, 0, 1, 0, &footprint, nullptr, nullptr,
+                                &upload_size);
+
+  // Create a committed upload-heap buffer.
+  D3D12_RESOURCE_DESC buf_desc{};
+  ui::d3d12::util::FillBufferResourceDesc(buf_desc, upload_size, D3D12_RESOURCE_FLAG_NONE);
+  Microsoft::WRL::ComPtr<ID3D12Resource> upload_buf;
+  if (FAILED(device->CreateCommittedResource(
+          &ui::d3d12::util::kHeapPropertiesUpload,
+          command_processor_.GetD3D12Provider().GetHeapFlagCreateNotZeroed(), &buf_desc,
+          D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&upload_buf)))) {
+    REXLOG_WARN("D3D12TextureCache: failed to create upload buffer for replacement texture");
+    return false;
+  }
+
+  // Map and copy rows, respecting D3D12's required row-pitch alignment.
+  void* mapped = nullptr;
+  const D3D12_RANGE no_read{0, 0};
+  if (FAILED(upload_buf->Map(0, &no_read, &mapped))) {
+    REXLOG_WARN("D3D12TextureCache: failed to map upload buffer for replacement texture");
+    return false;
+  }
+  const uint32_t src_row_bytes = data.width * 4;
+  const uint32_t dst_row_bytes = footprint.Footprint.RowPitch;
+  uint8_t* dst = static_cast<uint8_t*>(mapped) + footprint.Offset;
+  const uint8_t* src = data.pixels.data();
+  for (uint32_t y = 0; y < data.height; ++y) {
+    std::memcpy(dst, src, src_row_bytes);
+    src += src_row_bytes;
+    dst += dst_row_bytes;
+  }
+  upload_buf->Unmap(0, nullptr);
+
+  // Texture was created in COPY_DEST — transition only if needed.
+  const D3D12_RESOURCE_STATES old_state =
+      d3d12_texture.SetResourceState(D3D12_RESOURCE_STATE_COPY_DEST);
+  command_processor_.PushTransitionBarrier(resource, old_state, D3D12_RESOURCE_STATE_COPY_DEST);
+  command_processor_.SubmitBarriers();
+
+  DeferredCommandList& cmd = command_processor_.GetDeferredCommandList();
+
+  D3D12_TEXTURE_COPY_LOCATION dst_loc{};
+  dst_loc.pResource = resource;
+  dst_loc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+  dst_loc.SubresourceIndex = 0;
+
+  D3D12_TEXTURE_COPY_LOCATION src_loc{};
+  src_loc.pResource = upload_buf.Get();
+  src_loc.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+  src_loc.PlacedFootprint = footprint;
+
+  cmd.D3DCopyTextureRegion(&dst_loc, 0, 0, 0, &src_loc, nullptr);
+
+  // Keep the upload buffer alive until the GPU submission that recorded the
+  // copy command has been signalled as completed.
+  retained_upload_buffers_.emplace_back(command_processor_.GetCurrentSubmission(),
+                                        std::move(upload_buf));
+
+  return true;
 }
 
 }  // namespace rex::graphics::d3d12

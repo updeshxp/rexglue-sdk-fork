@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <iterator>
@@ -610,6 +611,47 @@ void VulkanCommandProcessor::InvalidateGpuMemory() {
   }
 }
 
+std::vector<CommandProcessor::ShaderInfo> VulkanCommandProcessor::GetShaderSnapshot() const {
+  if (!pipeline_cache_) {
+    return {};
+  }
+  uint64_t active_vs_hash = active_vertex_shader_ ? active_vertex_shader_->ucode_data_hash() : 0;
+  uint64_t active_ps_hash = active_pixel_shader_ ? active_pixel_shader_->ucode_data_hash() : 0;
+  return pipeline_cache_->GetShaderSnapshot(active_vs_hash, active_ps_hash);
+}
+
+void VulkanCommandProcessor::SetShaderDisabledByHash(uint64_t ucode_hash, bool disabled) {
+  if (!pipeline_cache_) {
+    return;
+  }
+  pipeline_cache_->SetShaderDisabledByHash(ucode_hash, disabled);
+}
+
+CommandProcessor::ShaderDetails VulkanCommandProcessor::GetShaderDetails(
+    uint64_t ucode_hash) const {
+  if (!pipeline_cache_) {
+    return {};
+  }
+  return pipeline_cache_->GetShaderDetails(ucode_hash);
+}
+
+bool VulkanCommandProcessor::ReplaceShaderTranslationBinary(uint64_t ucode_hash,
+                                                            uint64_t modification,
+                                                            std::vector<uint8_t> binary) {
+  if (!pipeline_cache_) {
+    return false;
+  }
+  return pipeline_cache_->ReplaceShaderTranslationBinary(ucode_hash, modification,
+                                                         std::move(binary));
+}
+
+void VulkanCommandProcessor::ResetShaderProfiling() {
+  if (!pipeline_cache_) {
+    return;
+  }
+  pipeline_cache_->ResetShaderProfiling();
+}
+
 void VulkanCommandProcessor::InvalidateAllVertexBufferResidency() {
   vertex_buffers_in_sync_[0] = 0;
   vertex_buffers_in_sync_[1] = 0;
@@ -644,6 +686,16 @@ void VulkanCommandProcessor::InitializeShaderStorage(const std::filesystem::path
                                                      uint32_t title_id, bool blocking) {
   CommandProcessor::InitializeShaderStorage(cache_root, title_id, blocking);
   pipeline_cache_->InitializeShaderStorage(cache_root, title_id, blocking);
+}
+
+void VulkanCommandProcessor::InitializeAssetReplacement(
+    const system::AssetReplacementConfig& config) {
+  if (texture_cache_) {
+    texture_cache_->InitTextureReplacement(config.texture_mod_roots, config.dump_root);
+  }
+  if (pipeline_cache_) {
+    pipeline_cache_->InitializeAssetReplacement(config.shader_mod_roots, config.dump_root);
+  }
 }
 
 void VulkanCommandProcessor::TracePlaybackWroteMemory(uint32_t base_ptr, uint32_t length) {
@@ -3641,6 +3693,10 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     // Always need a vertex shader.
     return draw_fail("missing_vertex_shader");
   }
+  if (vertex_shader->disabled()) {
+    // Shader debugger has muted this vertex program -- skip the draw entirely.
+    return true;
+  }
   pipeline_cache_->AnalyzeShaderUcode(*vertex_shader);
   bool memexport_used_vertex = vertex_shader->memexport_eM_written() != 0;
   if (memexport_used_vertex) {
@@ -3668,6 +3724,10 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     if (edram_mode == xenos::EdramMode::kColorDepth) {
       pixel_shader = static_cast<VulkanShader*>(active_pixel_shader());
       if (pixel_shader) {
+        if (pixel_shader->disabled()) {
+          // Shader debugger has muted this pixel program -- skip the draw.
+          return true;
+        }
         pipeline_cache_->AnalyzeShaderUcode(*pixel_shader);
         if (!draw_util::IsPixelShaderNeededWithRasterization(*pixel_shader, regs)) {
           pixel_shader = nullptr;
@@ -3692,6 +3752,30 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     }
     draw_util::AddMemExportRanges(regs, *pixel_shader, memexport_ranges_);
   }
+
+  // Per-shader CPU profiling: only sampled when the shader debugger is open.
+  // RAII timer attributes time spent in the rest of IssueDraw to both the
+  // bound vertex and pixel shader. Cheap when disabled (one relaxed load).
+  struct ShaderDrawTimer {
+    VulkanShader* vs;
+    VulkanShader* ps;
+    bool enabled;
+    std::chrono::steady_clock::time_point start;
+    ~ShaderDrawTimer() {
+      if (!enabled) {
+        return;
+      }
+      const uint64_t ns =
+          static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                    std::chrono::steady_clock::now() - start)
+                                    .count());
+      if (vs)
+        vs->profile_add_sample(ns);
+      if (ps)
+        ps->profile_add_sample(ns);
+    }
+  } shader_draw_timer{vertex_shader, pixel_shader, IsShaderProfilingEnabled(),
+                      std::chrono::steady_clock::now()};
   reg::RB_DEPTHCONTROL normalized_depth_control = draw_util::GetNormalizedDepthControl(regs);
 
   uint32_t ps_param_gen_pos = UINT32_MAX;
