@@ -21,6 +21,7 @@
 #include <rex/graphics/vulkan/shared_memory.h>
 #include <rex/hash.h>
 #include <rex/ui/vulkan/mem_alloc.h>
+#include <rex/ui/vulkan/upload_buffer_pool.h>
 
 namespace rex::graphics::vulkan {
 
@@ -78,6 +79,7 @@ class VulkanTextureCache final : public TextureCache {
   void BeginSubmission(uint64_t new_submission_index) override;
   void BeginFrame() override;
   void EndFrame();
+  void CompletedSubmissionUpdated(uint64_t completed_submission_index) override;
 
   // Must be called within a frame - creates and untiles textures needed by
   // shaders, and enqueues transitioning them into the sampled usage. This may
@@ -148,6 +150,12 @@ class VulkanTextureCache final : public TextureCache {
 
   bool LoadTextureDataFromResidentMemoryImpl(Texture& texture, bool load_base,
                                              bool load_mips) override;
+
+  // Uploads decoded RGBA8 replacement pixels to the host texture via a
+  // dedicated host-visible staging buffer pool. Only R8G8B8A8-family 2D
+  // targets are supported (matches the D3D12 backend's restriction).
+  bool LoadTextureDataFromReplacementImpl(Texture& texture,
+                                          const TextureReplacementData& data) override;
 
   void UpdateTextureBindingsImpl(uint32_t fetch_constant_mask) override;
 
@@ -329,6 +337,10 @@ class VulkanTextureCache final : public TextureCache {
 
   VulkanCommandProcessor& command_processor_;
   VkPipelineStageFlags guest_shader_pipeline_stages_;
+
+  // Host-visible staging buffer pool for texture replacement uploads.
+  // Created lazily on first use; reclaimed each CompletedSubmissionUpdated.
+  std::unique_ptr<ui::vulkan::VulkanUploadBufferPool> replacement_upload_buffer_pool_;
 
   // Using the Vulkan Memory Allocator because texture count in games is
   // naturally pretty much unbounded, while Vulkan implementations, especially

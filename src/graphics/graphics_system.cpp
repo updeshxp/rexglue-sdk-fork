@@ -364,6 +364,23 @@ void GraphicsSystem::InitializeShaderStorage(const std::filesystem::path& cache_
   }
 }
 
+void GraphicsSystem::InitializeAssetReplacement(const system::AssetReplacementConfig& config) {
+  command_processor_->CallInThread(
+      [this, config]() { command_processor_->InitializeAssetReplacement(config); });
+}
+
+void GraphicsSystem::RequestFrameTrace() {
+  command_processor_->RequestFrameTrace(REXCVAR_GET(trace_gpu_prefix));
+}
+
+void GraphicsSystem::BeginTracing() {
+  command_processor_->BeginTracing(REXCVAR_GET(trace_gpu_prefix));
+}
+
+void GraphicsSystem::EndTracing() {
+  command_processor_->EndTracing();
+}
+
 void GraphicsSystem::Pause() {
   paused_ = true;
   command_processor_->Pause();
