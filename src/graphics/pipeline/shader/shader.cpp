@@ -69,7 +69,7 @@ std::pair<std::filesystem::path, std::filesystem::path> Shader::Translation::Dum
   const char* type_extension = shader().type() == xenos::ShaderType::kVertex ? "vert" : "frag";
 
   std::filesystem::path binary_path =
-      target_path / fmt::format("shader_{:016X}_{:016X}.{}.bin.{}", shader().ucode_data_hash(),
+      target_path / fmt::format("{:016X}_{:016X}.{}.bin.{}", shader().ucode_data_hash(),
                                 modification(), path_prefix, type_extension);
   FILE* binary_file = filesystem::OpenFile(binary_path, "wb");
   if (binary_file) {
@@ -80,9 +80,8 @@ std::pair<std::filesystem::path, std::filesystem::path> Shader::Translation::Dum
 
   std::filesystem::path disasm_path;
   if (!host_disassembly_.empty()) {
-    disasm_path =
-        target_path / fmt::format("shader_{:016X}_{:016X}.{}.{}", shader().ucode_data_hash(),
-                                  modification(), path_prefix, type_extension);
+    disasm_path = target_path / fmt::format("{:016X}_{:016X}.{}.{}", shader().ucode_data_hash(),
+                                            modification(), path_prefix, type_extension);
     FILE* disasm_file = filesystem::OpenFile(disasm_path, "w");
     if (disasm_file) {
       fwrite(host_disassembly_.data(), sizeof(*host_disassembly_.data()), host_disassembly_.size(),
@@ -131,7 +130,7 @@ std::pair<std::filesystem::path, std::filesystem::path> Shader::DumpUcode(
   const char* type_extension = type() == xenos::ShaderType::kVertex ? "vert" : "frag";
 
   std::filesystem::path binary_path =
-      target_path / fmt::format("shader_{:016X}.ucode.bin.{}", ucode_data_hash(), type_extension);
+      target_path / fmt::format("{:016x}.ucode.bin.{}", ucode_data_hash(), type_extension);
   FILE* binary_file = filesystem::OpenFile(binary_path, "wb");
   if (binary_file) {
     fwrite(ucode_data().data(), sizeof(*ucode_data().data()), ucode_data().size(), binary_file);
@@ -140,8 +139,7 @@ std::pair<std::filesystem::path, std::filesystem::path> Shader::DumpUcode(
 
   std::filesystem::path disasm_path;
   if (is_ucode_analyzed()) {
-    disasm_path =
-        target_path / fmt::format("shader_{:016X}.ucode.{}", ucode_data_hash(), type_extension);
+    disasm_path = target_path / fmt::format("{:016x}.ucode.{}", ucode_data_hash(), type_extension);
     FILE* disasm_file = filesystem::OpenFile(disasm_path, "w");
     if (disasm_file) {
       fwrite(ucode_disassembly().data(), sizeof(*ucode_disassembly().data()),

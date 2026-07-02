@@ -18,6 +18,10 @@ set(REXGPU_XENOS_SOURCES
     # GPU system
     graphics_system.cpp
     command_processor.cpp
+trace_writer.cpp
+    pipeline/texture/extent.cpp
+    pipeline/texture/util.cpp
+    pipeline/texture/replacement.cpp
     util/draw_extent_estimator.cpp
     util/draw.cpp
     packet_disassembler.cpp
@@ -136,6 +140,8 @@ endif()
 target_link_libraries(rexgpu-xenos PRIVATE
     rexruntime
     xxHash::xxhash
+stb_image
+    stb_image_write
 )
 
 if(REXGLUE_USE_VULKAN)
@@ -156,5 +162,6 @@ if(REXGLUE_USE_D3D12)
         d3d12
         dxgi
         dxguid
+        d3dcompiler
     )
 endif()
