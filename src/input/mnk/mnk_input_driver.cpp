@@ -24,9 +24,9 @@
 #include <string_view>
 
 REXCVAR_DEFINE_BOOL(mnk_mode, false, "Input", "Enable keyboard/mouse controller emulation");
-REXCVAR_DEFINE_BOOL(mnk_mouse, false, "Input",
-                    "Use the mouse for the right stick. Off means the right stick comes "
-                    "from the keybind_rstick_* keys only");
+REXCVAR_DEFINE_BOOL(mnk_capture_mouse, true, "Input",
+                    "Capture and track the mouse cursor for look/aim in MnK mode");
+REXCVAR_DEFINE_INT32(mnk_user_index, 0, "Input", "Controller slot (0-3) for MnK").range(0, 3);
 REXCVAR_DEFINE_DOUBLE(mnk_sensitivity, 1.0, "Input", "Mouse sensitivity for right stick")
     .range(0.01, 10.0);
 
@@ -418,6 +418,21 @@ void MnkInputDriver::ApplyMouseCaptureFromUIThread() {
   rex::ui::Window* window = attached_window_;
   if (!window) {
     return;
+
+  bool should_capture = IsEnabled() && REXCVAR_GET(mnk_capture_mouse) && has_focus_ && is_active();
+
+  if (should_capture && !mouse_captured_) {
+    mouse_captured_ = true;
+    precapture_cursor_visibility_ = attached_window_->GetCursorVisibility();
+    attached_window_->SetCursorVisibility(rex::ui::Window::CursorVisibility::kHidden);
+    attached_window_->CaptureMouse();
+    // Reset deltas to avoid a spike on capture start
+    mouse_dx_ = 0;
+    mouse_dy_ = 0;
+  } else if (!should_capture && mouse_captured_) {
+    mouse_captured_ = false;
+    attached_window_->SetCursorVisibility(precapture_cursor_visibility_);
+    attached_window_->ReleaseMouse();
   }
   bool should_capture = mouse_capture_requested_.load(std::memory_order_relaxed);
   if (should_capture == mouse_captured_) {
@@ -535,7 +550,7 @@ void MnkInputDriver::OnMouseUp(rex::ui::MouseEvent& e) {
 }
 
 void MnkInputDriver::OnMouseMove(rex::ui::MouseEvent& e) {
-  if (!IsEnabled() || !has_focus_)
+  if (!IsEnabled() || !has_focus_ || !REXCVAR_GET(mnk_capture_mouse))
     return;
   int32_t x = e.x();
   int32_t y = e.y();
