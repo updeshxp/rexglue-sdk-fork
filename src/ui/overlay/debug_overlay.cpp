@@ -33,6 +33,8 @@ void DebugOverlayDialog::OnDraw(ImGuiIO& io) {
 #endif
   ImGui::SetNextWindowBgAlpha(0.5f);
   if (ImGui::Begin("Debug##overlay", nullptr, ImGuiWindowFlags_NoCollapse)) {
+    ImGui::Text("Host: %.1f FPS (%.2f ms)", io.Framerate,
+                io.Framerate > 0.0f ? 1000.0f / io.Framerate : 0.0f);
     if (stats_provider_) {
       auto stats = stats_provider_();
       if (stats.frame_count > 0) {
