@@ -26,6 +26,8 @@
 #endif
 
 REXCVAR_DEFINE_BOOL(mnk_mode, false, "Input", "Enable keyboard/mouse controller emulation");
+REXCVAR_DEFINE_BOOL(mnk_capture_mouse, true, "Input",
+                    "Capture and track the mouse cursor for look/aim in MnK mode");
 REXCVAR_DEFINE_INT32(mnk_user_index, 0, "Input", "Controller slot (0-3) for MnK").range(0, 3);
 REXCVAR_DEFINE_DOUBLE(mnk_sensitivity, 1.0, "Input", "Mouse sensitivity for right stick")
     .range(0.01, 10.0);
@@ -279,7 +281,7 @@ void MnkInputDriver::UpdateMouseCapture() {
   if (!attached_window_)
     return;
 
-  bool should_capture = IsEnabled() && has_focus_ && is_active();
+  bool should_capture = IsEnabled() && REXCVAR_GET(mnk_capture_mouse) && has_focus_ && is_active();
 
   if (should_capture && !mouse_captured_) {
     mouse_captured_ = true;
@@ -361,7 +363,7 @@ void MnkInputDriver::OnMouseUp(rex::ui::MouseEvent& e) {
 }
 
 void MnkInputDriver::OnMouseMove(rex::ui::MouseEvent& e) {
-  if (!IsEnabled() || !has_focus_)
+  if (!IsEnabled() || !has_focus_ || !REXCVAR_GET(mnk_capture_mouse))
     return;
   std::lock_guard lock(state_mutex_);
   int32_t x = e.x();
