@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <memory>
 #include <string_view>
+#include <vector>
 
 #include <SDL3/SDL.h>
 
@@ -55,6 +56,9 @@ class WindowSDL final : public Window {
   void ApplyNewCursorVisibility(CursorVisibility old_cursor_visibility) override;
   void FocusImpl() override;
 
+  void LoadAndApplyIcon(const void* buffer, size_t size,
+                        bool can_apply_state_in_current_phase) override;
+
   std::unique_ptr<Surface> CreateSurfaceImpl(Surface::TypeFlags allowed_types) override;
   void RequestPaintImpl() override;
 
@@ -72,11 +76,20 @@ class WindowSDL final : public Window {
   void ApplyCursorVisibilityNow();
   void RearmCursorAutoHideTimer();
 
+  // Decodes icon_data_ (if any) and applies it to sdl_window_ via
+  // SDL_SetWindowIcon. No-op if sdl_window_ doesn't exist yet or icon_data_
+  // is empty.
+  void ApplyIconNow();
+
   SDL_Window* sdl_window_ = nullptr;
   SDL_WindowID sdl_window_id_ = 0;
   std::atomic<bool> paint_pending_{false};
   // Auto-hide cursor bookkeeping (CursorVisibility::kAutoHidden).
   SDL_TimerID cursor_hide_timer_ = 0;
+  // Raw encoded image bytes (e.g. PNG) from the last LoadAndApplyIcon call,
+  // kept so the icon can be (re)applied once the native window exists (see
+  // OpenImpl and the "Icon" contract on Window::OpenImpl).
+  std::vector<uint8_t> icon_data_;
 };
 
 }  // namespace rex::ui
