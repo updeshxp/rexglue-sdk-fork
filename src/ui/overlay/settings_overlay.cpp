@@ -24,6 +24,10 @@
 
 namespace rex::ui {
 
+REXCVAR_DEFINE_BOOL(ui_settings_disable_save, false, "UI",
+                    "Disable the \"Save to config\" button in the settings overlay")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
 SettingsDialog::SettingsDialog(ImGuiDrawer* imgui_drawer, std::filesystem::path config_path)
     : ImGuiDialog(imgui_drawer), config_path_(std::move(config_path)) {}
 
@@ -500,12 +504,14 @@ void SettingsDialog::OnDraw(ImGuiIO& /*io*/) {
   ImGui::EndChild();
 
   // Bottom bar: Save button.
-  ImGui::Separator();
-  if (ImGui::Button("Save to config")) {
-    rex::cvar::SaveConfig(config_path_);
+  if (!REXCVAR_GET(ui_settings_disable_save)) {
+    ImGui::Separator();
+    if (ImGui::Button("Save to config")) {
+      rex::cvar::SaveConfig(config_path_);
+    }
+    ImGui::SameLine();
+    ImGui::TextDisabled("(%s)", config_path_.filename().string().c_str());
   }
-  ImGui::SameLine();
-  ImGui::TextDisabled("(%s)", config_path_.filename().string().c_str());
 
   ImGui::End();
 }
