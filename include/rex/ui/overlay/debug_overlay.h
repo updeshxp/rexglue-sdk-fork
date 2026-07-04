@@ -37,6 +37,16 @@ class DebugOverlayDialog : public ImGuiDialog {
 
  private:
   FrameStatsProvider stats_provider_;
+
+  // Rolling FPS-fluctuation history, unconditional (unlike the perf-counters
+  // frame-time graph below) since it only needs io.Framerate/FrameStats, both
+  // always available.
+  static constexpr size_t kFpsHistorySize = 120;
+  std::array<float, kFpsHistorySize> host_fps_history_{};
+  size_t host_fps_history_idx_ = 0;
+  std::array<float, kFpsHistorySize> guest_fps_history_{};
+  size_t guest_fps_history_idx_ = 0;
+
 #ifdef REXGLUE_ENABLE_PERF_COUNTERS
   static constexpr size_t kFrameHistorySize = 120;
   std::array<float, kFrameHistorySize> frame_time_history_{};
