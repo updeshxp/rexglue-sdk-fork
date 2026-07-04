@@ -26,6 +26,7 @@
 #include <rex/logging.h>
 #include <rex/platform.h>
 #include <rex/ui/flags.h>
+#include <rex/ui/image_decode.h>
 #include <rex/ui/sdl_virtual_key.h>
 
 #if REX_PLATFORM_WIN32
@@ -183,6 +184,7 @@ bool WindowSDL::OpenImpl() {
   // desired state so a reopened window comes back with the state it had.
   ApplyTextInputActiveNow();
   ApplyCursorVisibilityNow();
+  ApplyIconNow();
   SDL_ShowWindow(sdl_window_);
 
   // Actualize state for the common Window code. Listener dispatch is handled
@@ -303,6 +305,44 @@ void WindowSDL::ApplyNewTitle() {
     return;
   }
   SDL_SetWindowTitle(sdl_window_, GetTitle().c_str());
+}
+
+void WindowSDL::LoadAndApplyIcon(const void* buffer, size_t size,
+                                 bool can_apply_state_in_current_phase) {
+  if (buffer && size) {
+    const uint8_t* bytes = static_cast<const uint8_t*>(buffer);
+    icon_data_.assign(bytes, bytes + size);
+  } else {
+    icon_data_.clear();
+  }
+  if (can_apply_state_in_current_phase) {
+    ApplyIconNow();
+  }
+}
+
+void WindowSDL::ApplyIconNow() {
+  if (!sdl_window_) {
+    return;
+  }
+  if (icon_data_.empty()) {
+    SDL_SetWindowIcon(sdl_window_, nullptr);
+    return;
+  }
+  int width = 0;
+  int height = 0;
+  std::vector<uint8_t> rgba = DecodeImageRGBA(icon_data_.data(), icon_data_.size(), width, height);
+  if (rgba.empty()) {
+    REXLOG_WARN("Failed to decode window icon image");
+    return;
+  }
+  SDL_Surface* surface =
+      SDL_CreateSurfaceFrom(width, height, SDL_PIXELFORMAT_RGBA32, rgba.data(), width * 4);
+  if (!surface) {
+    REXLOG_WARN("SDL_CreateSurfaceFrom failed for window icon: {}", SDL_GetError());
+    return;
+  }
+  SDL_SetWindowIcon(sdl_window_, surface);
+  SDL_DestroySurface(surface);
 }
 
 void WindowSDL::ApplyNewMouseCapture() {
