@@ -37,6 +37,21 @@ std::string JoinCommaList(const std::vector<std::string>& names) {
   }
   return joined;
 }
+
+std::string JoinRequirements(const std::vector<rex::system::ModRequirement>& reqs) {
+  std::string joined;
+  for (size_t i = 0; i < reqs.size(); ++i) {
+    if (i > 0) {
+      joined += ", ";
+    }
+    joined += reqs[i].name;
+    if (!reqs[i].min_version.empty()) {
+      joined += " >= ";
+      joined += reqs[i].min_version;
+    }
+  }
+  return joined;
+}
 }  // namespace
 
 ModManagerDialog::ModManagerDialog(ImGuiDrawer* imgui_drawer, ImmediateDrawer* immediate_drawer,
@@ -133,7 +148,10 @@ void ModManagerDialog::OnDraw(ImGuiIO& io) {
       }
       ImGui::TextColored(kMutedText, "%s", mod.folder_name.c_str());
       if (!mod.requires_mods.empty()) {
-        ImGui::TextColored(kMutedText, "requires: %s", JoinCommaList(mod.requires_mods).c_str());
+        ImGui::TextColored(kMutedText, "requires: %s", JoinRequirements(mod.requires_mods).c_str());
+      }
+      if (!mod.min_game_version.empty()) {
+        ImGui::TextColored(kMutedText, "needs game version: >= %s", mod.min_game_version.c_str());
       }
       if (!mod.conflicts_mods.empty()) {
         ImGui::TextColored(kMutedText, "conflicts: %s", JoinCommaList(mod.conflicts_mods).c_str());
