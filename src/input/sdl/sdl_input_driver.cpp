@@ -11,6 +11,7 @@
 
 #include <array>
 #include <filesystem>
+#include <thread>
 
 #include <rex/assert.h>
 #include <rex/chrono/clock.h>
@@ -441,11 +442,41 @@ void SDLInputDriver::ProcessEventLocked(const SDL_Event& event) {
 }
 
 void SDLInputDriver::OnControllerDeviceAddedLocked(const SDL_Event& event) {
-  const auto controller = SDL_OpenGamepad(event.gdevice.which);
+  // SDL_OpenGamepad() can block for a long time for some devices (e.g. a
+  // DualSense over Bluetooth reading calibration/capabilities feature
+  // reports during its handshake). This is called from DrainAndLock(), which
+  // may run on a guest/game thread rather than a dedicated input thread, so
+  // blocking here can freeze the whole game. Do the actual open on a
+  // detached background thread instead, and only touch controllers_ once it
+  // completes.
+  const SDL_JoystickID instance_id = event.cdevice.which;
+  if (pending_opens_.count(instance_id)) {
+    // Already being opened.
+    return;
+  }
+  pending_opens_.insert(instance_id);
+  std::thread([this, instance_id]() {
+    SDL_Gamepad* controller = SDL_OpenGamepad(instance_id);
+    OnControllerOpenedAsync(instance_id, controller);
+  }).detach();
+}
+
+void SDLInputDriver::OnControllerOpenedAsync(SDL_JoystickID instance_id, SDL_Gamepad* controller) {
+  std::lock_guard<std::mutex> guard(controllers_mutex_);
+  pending_opens_.erase(instance_id);
+
   if (!controller) {
     assert_always();
     return;
   }
+
+  // The controller may have been disconnected while we were opening it.
+  if (!SDL_GamepadConnected(controller)) {
+    SDL_CloseGamepad(controller);
+    REXLOG_WARN("SDL OnControllerDeviceAdded: Ignored. Device was removed while opening.");
+    return;
+  }
+
   REXLOG_INFO(
       "SDL OnControllerDeviceAdded: \"{}\", "
       "JoystickType({}), "
