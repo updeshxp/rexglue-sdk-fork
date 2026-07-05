@@ -9,6 +9,8 @@
  *              See LICENSE file in the project root for full license text.
  */
 
+#include <algorithm>
+#include <cctype>
 #include <sstream>
 #include <unordered_map>
 
@@ -128,6 +130,7 @@ X_STATUS Runtime::Setup(RuntimeConfig config) {
   thread::EnableAffinityConfiguration();
 
   tool_mode_ = config.tool_mode;
+  game_version_ = config.game_version;
 
   // Create memory system first
   memory_ = std::make_unique<memory::Memory>();
@@ -340,6 +343,93 @@ std::vector<std::string> SplitCommaList(std::string_view csv) {
   return result;
 }
 
+// Splits one `requires` entry into a mod name and an optional minimum-version
+// constraint: "game_symbols >= 1.0.0" -> {"game_symbols", "1.0.0"}; a bare
+// "game_symbols" -> {"game_symbols", ""} (unconstrained). Whitespace around
+// the name and version is trimmed; SplitCommaList() has already trimmed the
+// entry's outer edges.
+system::ModRequirement ParseRequirement(std::string_view entry) {
+  system::ModRequirement req;
+  auto op_pos = entry.find(">=");
+  if (op_pos == std::string_view::npos) {
+    req.name = std::string(entry);
+    return req;
+  }
+  auto name_part = entry.substr(0, op_pos);
+  auto name_end = name_part.find_last_not_of(" \t");
+  req.name =
+      std::string(name_part.substr(0, name_end == std::string_view::npos ? 0 : name_end + 1));
+
+  auto version_part = entry.substr(op_pos + 2);
+  auto version_start = version_part.find_first_not_of(" \t");
+  if (version_start != std::string_view::npos) {
+    req.min_version = std::string(version_part.substr(version_start));
+  }
+  return req;
+}
+
+// Parses mod.toml's `game_version` key into a minimum-version constraint.
+// Both "1.2.0" and ">= 1.2.0" mean "must be at least 1.2.0" -- no other
+// comparison operators are supported. Returns empty for an absent/blank key.
+std::string ParseGameVersionConstraint(std::string_view value) {
+  auto start = value.find_first_not_of(" \t");
+  if (start == std::string_view::npos) {
+    return "";
+  }
+  value = value.substr(start);
+  if (value.substr(0, 2) == ">=") {
+    value = value.substr(2);
+    auto version_start = value.find_first_not_of(" \t");
+    value =
+        version_start == std::string_view::npos ? std::string_view() : value.substr(version_start);
+  }
+  auto end = value.find_last_not_of(" \t");
+  return end == std::string_view::npos ? "" : std::string(value.substr(0, end + 1));
+}
+
+// Parses a dotted numeric version ("1.0.0", "2.3") into its components.
+// Returns false if any '.'-separated part isn't a non-negative integer or the
+// string is empty -- callers treat that as "not a usable version" rather than
+// trying to compare it.
+bool ParseVersionComponents(std::string_view version, std::vector<int>& out) {
+  out.clear();
+  std::string current;
+  auto flush = [&]() -> bool {
+    if (current.empty() || !std::all_of(current.begin(), current.end(),
+                                        [](unsigned char c) { return std::isdigit(c) != 0; })) {
+      return false;
+    }
+    out.push_back(std::stoi(current));
+    current.clear();
+    return true;
+  };
+  for (char c : version) {
+    if (c == '.') {
+      if (!flush()) {
+        return false;
+      }
+    } else {
+      current += c;
+    }
+  }
+  return flush();
+}
+
+// Compares two parsed versions component-wise; missing trailing components
+// count as 0, so "1.0" == "1.0.0". Returns <0, 0, >0 as `have` compares to
+// `want`.
+int CompareVersions(const std::vector<int>& have, const std::vector<int>& want) {
+  size_t n = std::max(have.size(), want.size());
+  for (size_t i = 0; i < n; ++i) {
+    int hv = i < have.size() ? have[i] : 0;
+    int wv = i < want.size() ? want[i] : 0;
+    if (hv != wv) {
+      return hv - wv;
+    }
+  }
+  return 0;
+}
+
 // mod.toml is optional and purely descriptive except for `code`, which names
 // the DLL stem the mod loader should load from <mod_root>/code/, and
 // requires/load_after/conflicts, which ValidateModDependencies() enforces.
@@ -368,9 +458,13 @@ system::ModInfo ParseModInfo(const std::filesystem::path& mod_root) {
     info.author = table["author"].value_or<std::string>("");
     info.description = table["description"].value_or<std::string>("");
     info.code = table["code"].value_or<std::string>("");
-    info.requires_mods = SplitCommaList(table["requires"].value_or<std::string>(""));
+    for (auto& entry : SplitCommaList(table["requires"].value_or<std::string>(""))) {
+      info.requires_mods.push_back(ParseRequirement(entry));
+    }
     info.load_after_mods = SplitCommaList(table["load_after"].value_or<std::string>(""));
     info.conflicts_mods = SplitCommaList(table["conflicts"].value_or<std::string>(""));
+    info.min_game_version =
+        ParseGameVersionConstraint(table["game_version"].value_or<std::string>(""));
   } catch (const toml::parse_error& error) {
     REXSYS_WARN("Failed to parse {}: {}", manifest_path.string(), error.what());
   }
@@ -459,24 +553,81 @@ bool Runtime::ValidateModDependencies() const {
   for (size_t i = 0; i < enabled_mods_info_.size(); ++i) {
     const auto& mod = enabled_mods_info_[i];
 
-    for (auto& other : mod.requires_mods) {
-      if (other == mod.folder_name) {
+    for (auto& req : mod.requires_mods) {
+      if (req.name == mod.folder_name) {
         REXSYS_ERROR("Mod '{}' lists itself in 'requires'", mod.folder_name);
         ok = false;
         continue;
       }
-      auto it = index_of.find(other);
+      auto it = index_of.find(req.name);
       if (it == index_of.end()) {
         REXSYS_ERROR(
             "Mod '{}' requires '{}', which is not enabled. Add '{}' to enabled_mods before '{}'.",
-            mod.folder_name, other, other, mod.folder_name);
+            mod.folder_name, req.name, req.name, mod.folder_name);
         ok = false;
-      } else if (it->second > i) {
+        continue;
+      }
+      if (it->second > i) {
         REXSYS_ERROR(
             "Mod '{}' requires '{}', but '{}' is listed after '{}' in enabled_mods. Move '{}' "
             "earlier.",
-            mod.folder_name, other, other, mod.folder_name, other);
+            mod.folder_name, req.name, req.name, mod.folder_name, req.name);
         ok = false;
+        continue;
+      }
+      if (req.min_version.empty()) {
+        continue;
+      }
+
+      // A version constraint can only be checked if both sides parse as a
+      // dotted version. Missing/unparsable data is not itself an error --
+      // that would break mods and hosts that predate this feature -- it just
+      // means the constraint can't be verified, so it's accepted with a
+      // warning rather than failing Setup().
+      std::vector<int> want;
+      if (!ParseVersionComponents(req.min_version, want)) {
+        REXSYS_WARN(
+            "Mod '{}' requires '{}' >= '{}', but '{}' isn't a valid dotted version (e.g. "
+            "'1.0.0'); skipping the version check",
+            mod.folder_name, req.name, req.min_version, req.min_version);
+        continue;
+      }
+      const auto& dep = enabled_mods_info_[it->second];
+      std::vector<int> have;
+      if (dep.version.empty() || !ParseVersionComponents(dep.version, have)) {
+        REXSYS_WARN(
+            "Mod '{}' requires '{}' >= {}, but '{}' has no valid 'version' in its mod.toml; "
+            "skipping the version check",
+            mod.folder_name, req.name, req.min_version, req.name);
+        continue;
+      }
+      if (CompareVersions(have, want) < 0) {
+        REXSYS_ERROR("Mod '{}' requires '{}' >= {}, but the enabled '{}' is only version {}",
+                     mod.folder_name, req.name, req.min_version, req.name, dep.version);
+        ok = false;
+      }
+    }
+
+    if (!mod.min_game_version.empty()) {
+      std::vector<int> want;
+      if (!ParseVersionComponents(mod.min_game_version, want)) {
+        REXSYS_WARN(
+            "Mod '{}' has 'game_version = {}', which isn't a valid dotted version (e.g. "
+            "'1.0.0'); skipping the version check",
+            mod.folder_name, mod.min_game_version);
+      } else {
+        std::vector<int> have;
+        if (game_version_.empty() || !ParseVersionComponents(game_version_, have)) {
+          REXSYS_WARN(
+              "Mod '{}' requires game_version >= {}, but this build has no valid version to "
+              "check against (RuntimeConfig::game_version was never set); skipping the version "
+              "check",
+              mod.folder_name, mod.min_game_version);
+        } else if (CompareVersions(have, want) < 0) {
+          REXSYS_ERROR("Mod '{}' requires game_version >= {}, but this build is only version {}",
+                       mod.folder_name, mod.min_game_version, game_version_);
+          ok = false;
+        }
       }
     }
 

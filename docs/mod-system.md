@@ -27,9 +27,10 @@ default `<exe folder>/mods`). A folder may contain any mix of:
   | `author`      | string                   | Display only                                              |
   | `description` | string                   | Display only                                              |
   | `code`        | string                   | DLL/SO stem under `<mod_root>/code/`; absent = asset-only mod |
-  | `requires`    | comma-separated string   | Hard dependency (see below)                                |
-  | `load_after`  | comma-separated string   | Soft ordering hint (see below)                             |
-  | `conflicts`   | comma-separated string   | Hard mutual exclusion (see below)                          |
+  | `requires`      | comma-separated string | Hard dependency, each entry optionally `name >= x.y.z` (see below) |
+  | `load_after`    | comma-separated string | Soft ordering hint (see below)                             |
+  | `conflicts`     | comma-separated string | Hard mutual exclusion (see below)                          |
+  | `game_version`  | string                 | Minimum host application version (see below)               |
 
   `icon.png` in the mod root, if present, is picked up automatically
   (`ModInfo::icon_path`); not a `mod.toml` key.
@@ -76,6 +77,18 @@ init):
   mechanism that turns "I assume the other mod is enabled and loaded first"
   from an unenforced convention into something the SDK guarantees before
   gameplay code ever runs.
+
+  Each entry can optionally pin a minimum version: `requires = "other_mod >=
+  1.0.0"`. The version is compared against `other_mod`'s own `version` key
+  (dotted-numeric, e.g. `1.0.0`; missing trailing components count as `0`, so
+  `1.0` == `1.0.0`) using `>=` semantics only. This is a **hard failure**
+  only when both sides parse and `other_mod`'s enabled version is actually
+  older. If either side can't be checked -- `other_mod` has no `version` key,
+  or the constraint itself isn't a valid dotted version -- that's **not** a
+  failure: the mod predates this feature (or the dependency does), so the
+  constraint is accepted with a `REXSYS_WARN` rather than blocking startup. A
+  bare `requires = "other_mod"` (no `>=`) stays unconstrained, same as before
+  this existed.
 - **`load_after = "other_mod"`**: same order check as `requires`, but only
   **warns** (`REXSYS_WARN`) if violated or if `other_mod` isn't enabled at
   all. `Setup()` still succeeds. Use this for "works better in this order"
@@ -89,6 +102,38 @@ also a hard failure (self-reference guard). Note a `requires` cycle (`A`
 requires `B`, `B` requires `A`) is already structurally impossible under the
 "must sit at a lower index" rule, since both mods can't be ordered before
 each other in one list; no separate cycle detector is needed.
+
+## Minimum host version (`game_version`)
+
+`requires` pins a mod to another *mod's* version; `game_version` pins it to
+the host application's own version instead -- for a mod that relies on a
+project's newer API, engine fix, or asset layout, independent of any other
+mod:
+
+```toml
+game_version = "1.2.0"     # or, equivalently: game_version = ">= 1.2.0"
+```
+
+Both forms mean the same thing (minimum version; no other comparison
+operator is supported). The host project sets its own current version once,
+in `RuntimeConfig::game_version` (e.g. from `OnPreSetup()`):
+
+```cpp
+void OnPreSetup(rex::RuntimeConfig& config) override {
+  config.game_version = "1.2.0";
+}
+```
+
+`ValidateModDependencies()` checks every enabled mod's `game_version` against
+this at `Setup()` time, alongside `requires`/`conflicts`. It's a **hard
+failure** only when both sides parse and the host's version is actually
+older than `game_version`. If the host never set `RuntimeConfig::game_version`
+at all (or the constraint itself isn't a valid dotted version), the
+constraint can't be checked, so it's accepted with a `REXSYS_WARN` rather
+than failing -- the same can't-verify-so-don't-block behavior as an
+unversioned `requires` dependency with no `version` key. Version comparison
+uses the same dotted-numeric scheme as `requires`' `>=` constraints (`1.0` ==
+`1.0.0`; missing trailing components count as `0`).
 
 ## The shared registry (`rex::system::ModRegistry`)
 

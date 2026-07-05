@@ -78,6 +78,13 @@ struct RuntimeConfig {
   std::function<std::unique_ptr<system::IInputSystem>(bool tool_mode)> input_factory;
   std::function<void(Runtime*, system::KernelState*)> kernel_init;
   bool tool_mode = false;
+  // Dotted numeric version of this host application/project (e.g. "1.2.0"),
+  // set by the downstream project in OnPreSetup(). Empty means "not
+  // declared". Compared against mod.toml's `game_version` key by
+  // Runtime::ValidateModDependencies(); a mod that sets `game_version` while
+  // this is empty fails Setup() (the constraint can't be verified), same as
+  // requiring another mod that has no `version` key.
+  std::string game_version;
 };
 
 /// Helper macros for populating RuntimeConfig with concrete backends.
@@ -167,6 +174,10 @@ class Runtime {
   // Check if running in tool mode (no GPU)
   bool is_tool_mode() const { return tool_mode_; }
 
+  // This host application's version, as set via RuntimeConfig::game_version;
+  // empty if the project never set one.
+  const std::string& game_version() const { return game_version_; }
+
   void Shutdown();
 
   // Load XEX image into guest memory
@@ -209,11 +220,16 @@ class Runtime {
   // each mod folder exists, warning once per missing mod.
   void ResolveEnabledMods();
 
-  // Validates requires/load_after/conflicts across enabled_mods_info_.
-  // requires/conflicts violations are hard errors (returns false); load_after
-  // violations only warn. Called from Setup() after ResolveEnabledMods() (via
-  // SetupVfs()) has populated enabled_mods_info_.
+  // Validates requires/load_after/conflicts/game_version across
+  // enabled_mods_info_. requires/conflicts/game_version violations are hard
+  // errors (returns false); load_after violations only warn. Called from
+  // Setup() after ResolveEnabledMods() (via SetupVfs()) has populated
+  // enabled_mods_info_.
   bool ValidateModDependencies() const;
+
+  // This host application's own version, from RuntimeConfig::game_version.
+  // Set in Setup() before ValidateModDependencies() runs.
+  std::string game_version_;
 
   std::filesystem::path game_data_root_;
   std::filesystem::path user_data_root_;

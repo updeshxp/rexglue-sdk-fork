@@ -94,9 +94,20 @@ class IModPlugin {
 using ModAbiVersionFn = uint32_t (*)();
 using ModCreateFn = IModPlugin* (*)(uint32_t abi_version, const ModHostContext* ctx);
 
+// One entry of a `requires` list: a dependency's folder name plus an
+// optional "must be at least this version" constraint. `min_version` is
+// empty when the requires entry named no constraint (e.g. plain
+// "game_symbols" rather than "game_symbols >= 1.0.0"), meaning any enabled,
+// correctly-ordered version satisfies it.
+struct ModRequirement {
+  std::string name;
+  std::string min_version;  // dotted numeric version, e.g. "1.0.0"; empty = unconstrained
+};
+
 // Describes one enabled mod for display purposes (mod manager overlay etc.),
 // parsed from <mod_root>/mod.toml. Purely descriptive -- the SDK does not
-// interpret any field besides `code` (the DLL stem to load, if any).
+// interpret any field besides `code` (the DLL stem to load, if any) and
+// `requires` (validated by Runtime::ValidateModDependencies(), see below).
 struct ModInfo {
   std::filesystem::path mod_root;
   std::string folder_name;
@@ -108,15 +119,23 @@ struct ModInfo {
   std::string code;                 // DLL stem under <mod_root>/code/, or empty
 
   // Dependency/conflict metadata, parsed from mod.toml's `requires`,
-  // `load_after` and `conflicts` keys (comma-separated folder-name lists, all
-  // optional). Validated by Runtime::ValidateModDependencies() at Setup()
-  // time; purely descriptive here, same as every other ModInfo field.
-  std::vector<std::string> requires_mods;    // must be enabled and ordered
-                                             // before this mod, or Setup()
-                                             // fails
-  std::vector<std::string> load_after_mods;  // soft ordering hint, warns only
-  std::vector<std::string> conflicts_mods;   // hard error if also enabled,
-                                             // regardless of order
+  // `load_after` and `conflicts` keys (comma-separated lists, all optional).
+  // Validated by Runtime::ValidateModDependencies() at Setup() time.
+  std::vector<ModRequirement> requires_mods;  // each must be enabled, ordered
+                                              // before this mod, and (if
+                                              // min_version is set) at least
+                                              // that version, or Setup() fails
+  std::vector<std::string> load_after_mods;   // soft ordering hint, warns only
+  std::vector<std::string> conflicts_mods;    // hard error if also enabled,
+                                              // regardless of order
+
+  // Minimum host application version, parsed from mod.toml's `game_version`
+  // key ("1.2.0" or ">= 1.2.0" -- both mean the same thing; no other
+  // comparison operators are supported). Empty means unconstrained.
+  // Validated against Runtime::game_version() by
+  // Runtime::ValidateModDependencies(); a hard error if the host's version is
+  // older, or if the host never set RuntimeConfig::game_version at all.
+  std::string min_game_version;
 };
 
 // Loads <mod_root>/code/<code_stem>[<config-postfix>].dll (falling back to
