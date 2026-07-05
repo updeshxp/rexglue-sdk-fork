@@ -3728,6 +3728,11 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     // pipeline cache.
     Shader::HostVertexShaderType host_vertex_shader_type =
         primitive_processing_result.host_vertex_shader_type;
+    if (Shader::IsHostVertexShaderTypeDomain(host_vertex_shader_type)) {
+      // Tessellated (domain-shader) draws hang the GPU on RADV regardless of
+      // driver flags (ACO/LLVM, nongg, zerovram, etc.); skip them.
+      return true;
+    }
     if (host_vertex_shader_type != Shader::HostVertexShaderType::kVertex &&
         host_vertex_shader_type != Shader::HostVertexShaderType::kPointListAsTriangleStrip &&
         host_vertex_shader_type != Shader::HostVertexShaderType::kRectangleListAsTriangleStrip &&
