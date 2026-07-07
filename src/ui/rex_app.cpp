@@ -394,7 +394,9 @@ bool ReXApp::SetupPresentation() {
   window_->SetTitle(title);
 
   window_->AddListener(this);
-  window_->AddInputListener(this, 0);
+  // z_order 1: run before input drivers (z_order 0) so system keybinds are
+  // consumed before they reach the game as raw key input.
+  window_->AddInputListener(this, 1);
 
   if (REXCVAR_GET(fullscreen)) {
     window_->SetFullscreen(true);
@@ -728,6 +730,12 @@ std::function<void(PathConfig)> ReXApp::MakeResumeCallback() {
 }
 
 void ReXApp::OnKeyDown(ui::KeyEvent& e) {
+  // Alt+Enter is a hardcoded OS convention, not a user-rebindable keybind.
+  if (e.virtual_key() == ui::VirtualKey::kReturn && e.is_alt_pressed()) {
+    rex::cvar::SetFlagByName("fullscreen", REXCVAR_GET(fullscreen) ? "false" : "true");
+    e.set_handled(true);
+    return;
+  }
   rex::ui::ProcessKeyEvent(e);
 }
 
