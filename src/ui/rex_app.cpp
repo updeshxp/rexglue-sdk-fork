@@ -401,7 +401,7 @@ bool ReXApp::SetupPresentation() {
   }
   rex::cvar::RegisterChangeCallback("fullscreen", [this](std::string_view, std::string_view value) {
     if (window_) {
-      window_->SetFullscreen(rex::string::from_string<bool>(value, false));
+      window_->SetFullscreen(value == "true");
     }
   });
   window_->Open();
