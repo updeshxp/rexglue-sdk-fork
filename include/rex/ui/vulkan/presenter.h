@@ -15,6 +15,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -230,6 +231,9 @@ class VulkanPresenter final : public Presenter {
 
   enum GuestOutputPaintPipelineLayoutIndex : size_t {
     kGuestOutputPaintPipelineLayoutIndexBilinear,
+    // Uses CustomShaderConstants rather than BilinearConstants (larger, so it
+    // needs its own pipeline layout - see presenter.h).
+    kGuestOutputPaintPipelineLayoutIndexCustomShader,
 #if defined(REX_HAS_FIDELITYFX_SDK)
     kGuestOutputPaintPipelineLayoutIndexCasSharpen,
     kGuestOutputPaintPipelineLayoutIndexCasResample,
@@ -246,6 +250,8 @@ class VulkanPresenter final : public Presenter {
       case GuestOutputPaintEffect::kBilinear:
       case GuestOutputPaintEffect::kBilinearDither:
         return kGuestOutputPaintPipelineLayoutIndexBilinear;
+      case GuestOutputPaintEffect::kCustomShader:
+        return kGuestOutputPaintPipelineLayoutIndexCustomShader;
 #if defined(REX_HAS_FIDELITYFX_SDK)
       case GuestOutputPaintEffect::kCasSharpen:
       case GuestOutputPaintEffect::kCasSharpenDither:
@@ -435,6 +441,13 @@ class VulkanPresenter final : public Presenter {
   [[nodiscard]] VkPipeline CreateGuestOutputPaintPipeline(GuestOutputPaintEffect effect,
                                                           VkRenderPass render_pass);
 
+  // Loads post_process_shader_path, wraps it with the fixed guest-output-sampling
+  // preamble and (re)compiles it via glslang, caching the result. Returns
+  // false (logging an error) if the cvar is empty or compilation/shader
+  // module creation fails, in which case the caller should fall back to
+  // GuestOutputPaintEffect::kBilinear.
+  bool EnsureCustomShaderPipeline();
+
 #if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
   bool EnsureTemporalUpscalerContext(uint32_t render_width, uint32_t render_height,
                                      uint32_t output_width, uint32_t output_height);
@@ -460,6 +473,11 @@ class VulkanPresenter final : public Presenter {
   // same due to different dependencies (this is shader read > color
   // attachment > shader read).
   VkRenderPass guest_output_intermediate_render_pass_ = VK_NULL_HANDLE;
+
+  // Tracks the post_process_shader_path value last (attempted to be) compiled into
+  // guest_output_paint_fs_[kCustomShader], to avoid recompiling every frame.
+  std::string custom_shader_compiled_path_;
+  bool custom_shader_compile_failed_ = false;
 
   // Value monotonically increased every time a new guest output image is
   // initialized, for recreation of dependent objects such as framebuffers in

@@ -326,9 +326,10 @@ if(REXGLUE_USE_D3D12)
 endif()
 
 #=============================================================================
-# SPIR-V toolchain (only when Vulkan backend is enabled)
+# SPIR-V toolchain (Vulkan backend, and D3D12 for runtime GLSL/.slang custom
+# post-process shader compilation via glslang -> SPIR-V -> SPIRV-Cross -> HLSL)
 #=============================================================================
-if(REXGLUE_USE_VULKAN)
+if(REXGLUE_USE_VULKAN OR REXGLUE_USE_D3D12)
     # SPIRV-Headers
     set(SPIRV_HEADERS_ENABLE_TESTS OFF CACHE BOOL "" FORCE)
     set(SPIRV_HEADERS_ENABLE_INSTALL OFF CACHE BOOL "" FORCE)
@@ -356,6 +357,24 @@ if(REXGLUE_USE_VULKAN)
     if(NOT TARGET glslang::SPIRV)
         add_library(glslang::SPIRV ALIAS SPIRV)
     endif()
+
+    # SPIRV-Cross - SPIR-V reflection and cross-compilation to HLSL, used to
+    # turn the glslang-compiled custom post-process shader into HLSL for the
+    # D3D12 backend (Vulkan consumes the SPIR-V directly).
+    set(SPIRV_CROSS_CLI OFF CACHE BOOL "" FORCE)
+    set(SPIRV_CROSS_ENABLE_TESTS OFF CACHE BOOL "" FORCE)
+    set(SPIRV_CROSS_ENABLE_C_API OFF CACHE BOOL "" FORCE)
+    set(SPIRV_CROSS_ENABLE_HLSL ON CACHE BOOL "" FORCE)
+    set(SPIRV_CROSS_ENABLE_GLSL ON CACHE BOOL "" FORCE)
+    set(SPIRV_CROSS_ENABLE_MSL OFF CACHE BOOL "" FORCE)
+    set(SPIRV_CROSS_ENABLE_CPP OFF CACHE BOOL "" FORCE)
+    set(SPIRV_CROSS_ENABLE_REFLECT OFF CACHE BOOL "" FORCE)
+    set(SPIRV_CROSS_ENABLE_UTIL OFF CACHE BOOL "" FORCE)
+    set(SPIRV_CROSS_SKIP_INSTALL ON CACHE BOOL "" FORCE)
+    set(SPIRV_CROSS_STATIC ON CACHE BOOL "" FORCE)
+    set(SPIRV_CROSS_SHARED OFF CACHE BOOL "" FORCE)
+    set(SPIRV_CROSS_FORCE_PIC ON CACHE BOOL "" FORCE)
+    add_subdirectory(spirv-cross)
 endif()
 
 #=============================================================================

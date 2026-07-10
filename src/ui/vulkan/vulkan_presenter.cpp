@@ -1,4 +1,4 @@
-/**
+﻿/**
  ******************************************************************************
  * Xenia : Xbox 360 Emulator Research Project                                 *
  ******************************************************************************
@@ -16,6 +16,7 @@
 #include <cmath>
 #include <cstring>
 #include <memory>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -24,8 +25,11 @@
 #include <rex/logging.h>
 #include <rex/math.h>
 #include <rex/platform.h>
+#include <rex/ui/custom_shader.h>
 #include <rex/ui/vulkan/presenter.h>
 #include <rex/ui/vulkan/util.h>
+
+REXCVAR_DECLARE(std::string, post_process_shader_path);
 
 #if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
 #include <ffx_api/ffx_api.h>
@@ -1645,6 +1649,11 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
     // multiple threads can't paint the main target at the same time).
   }
 
+  if (guest_output_paint_config.GetEffect() == GuestOutputPaintConfig::Effect::kCustomShader &&
+      !EnsureCustomShaderPipeline()) {
+    guest_output_paint_config.SetEffect(GuestOutputPaintConfig::Effect::kBilinear);
+  }
+
   if (guest_output_image) {
     VkExtent2D max_framebuffer_extent =
         util::GetMax2DFramebufferExtent(vulkan_device_->properties());
@@ -2027,6 +2036,7 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
           uint32_t effect_constants_size = 0;
           union {
             BilinearConstants bilinear;
+            CustomShaderConstants custom_shader;
 #if defined(REX_HAS_FIDELITYFX_SDK)
             CasSharpenConstants cas_sharpen;
             CasResampleConstants cas_resample;
@@ -2038,6 +2048,10 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
             case kGuestOutputPaintPipelineLayoutIndexBilinear: {
               effect_constants_size = sizeof(effect_constants.bilinear);
               effect_constants.bilinear.Initialize(guest_output_flow, i);
+            } break;
+            case kGuestOutputPaintPipelineLayoutIndexCustomShader: {
+              effect_constants_size = sizeof(effect_constants.custom_shader);
+              effect_constants.custom_shader.Initialize(guest_output_flow, i);
             } break;
 #if defined(REX_HAS_FIDELITYFX_SDK)
             case kGuestOutputPaintPipelineLayoutIndexCasSharpen: {
@@ -2334,6 +2348,9 @@ bool VulkanPresenter::InitializeSurfaceIndependent() {
       case kGuestOutputPaintPipelineLayoutIndexBilinear:
         guest_output_paint_push_constant_range_ffx.size = sizeof(BilinearConstants);
         break;
+      case kGuestOutputPaintPipelineLayoutIndexCustomShader:
+        guest_output_paint_push_constant_range_ffx.size = sizeof(CustomShaderConstants);
+        break;
 #if defined(REX_HAS_FIDELITYFX_SDK)
       case kGuestOutputPaintPipelineLayoutIndexCasSharpen:
         guest_output_paint_push_constant_range_ffx.size = sizeof(CasSharpenConstants);
@@ -2568,6 +2585,62 @@ bool VulkanPresenter::InitializeSurfaceIndependent() {
   }
 
   return InitializeCommonSurfaceIndependent();
+}
+
+bool VulkanPresenter::EnsureCustomShaderPipeline() {
+  const std::string& glsl_path = REXCVAR_GET(post_process_shader_path);
+  if (glsl_path.empty()) {
+    return false;
+  }
+
+  size_t effect_index = size_t(GuestOutputPaintEffect::kCustomShader);
+  if (glsl_path == custom_shader_compiled_path_) {
+    return !custom_shader_compile_failed_ && guest_output_paint_fs_[effect_index] != VK_NULL_HANDLE;
+  }
+
+  rex::ui::CustomShader::CompileResult compile_result =
+      rex::ui::CustomShader::Compile(glsl_path, /*compile_hlsl=*/false);
+  if (!compile_result.success) {
+    REXLOG_ERROR("VulkanPresenter: Failed to compile custom shader '{}': {}", glsl_path,
+                 compile_result.error);
+    custom_shader_compiled_path_ = glsl_path;
+    custom_shader_compile_failed_ = true;
+    return false;
+  }
+  std::vector<uint32_t>& spirv = compile_result.spirv;
+
+  const VulkanDevice::Functions& dfn = vulkan_device_->functions();
+  const VkDevice device = vulkan_device_->device();
+
+  PaintContext::GuestOutputPaintPipeline& custom_shader_pipeline =
+      paint_context_.guest_output_paint_pipelines[effect_index];
+  if (guest_output_paint_fs_[effect_index] != VK_NULL_HANDLE) {
+    paint_context_.submission_tracker.AwaitSubmissionCompletion(
+        paint_context_.guest_output_image_paint_last_submission);
+    util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device,
+                               custom_shader_pipeline.swapchain_pipeline);
+    custom_shader_pipeline.swapchain_format = VK_FORMAT_UNDEFINED;
+    util::DestroyAndNullHandle(dfn.vkDestroyShaderModule, device,
+                               guest_output_paint_fs_[effect_index]);
+  }
+
+  VkShaderModuleCreateInfo shader_module_create_info;
+  shader_module_create_info.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+  shader_module_create_info.pNext = nullptr;
+  shader_module_create_info.flags = 0;
+  shader_module_create_info.codeSize = spirv.size() * sizeof(uint32_t);
+  shader_module_create_info.pCode = spirv.data();
+  if (dfn.vkCreateShaderModule(device, &shader_module_create_info, nullptr,
+                               &guest_output_paint_fs_[effect_index]) != VK_SUCCESS) {
+    REXLOG_ERROR("VulkanPresenter: Failed to create the custom shader module for '{}'", glsl_path);
+    custom_shader_compiled_path_ = glsl_path;
+    custom_shader_compile_failed_ = true;
+    return false;
+  }
+
+  custom_shader_compiled_path_ = glsl_path;
+  custom_shader_compile_failed_ = false;
+  return true;
 }
 
 VkPipeline VulkanPresenter::CreateGuestOutputPaintPipeline(GuestOutputPaintEffect effect,

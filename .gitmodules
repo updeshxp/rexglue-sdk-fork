@@ -66,3 +66,6 @@
 [submodule "thirdparty/tracy"]
 	path = thirdparty/tracy
 	url = https://github.com/wolfpld/tracy.git
+[submodule "thirdparty/spirv-cross"]
+	path = thirdparty/spirv-cross
+	url = https://github.com/KhronosGroup/SPIRV-Cross.git

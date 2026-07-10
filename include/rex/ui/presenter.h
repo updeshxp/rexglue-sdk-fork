@@ -188,6 +188,15 @@ class Presenter {
       std::function<void(bool is_responsible, bool statically_from_ui_thread)>;
   static void FatalErrorHostGpuLossCallback(bool is_responsible, bool statically_from_ui_thread);
 
+  // Apps that present through their own Presenter outside of GraphicsSystem
+  // (i.e. not the xenos gpu_plugin's whole-screen output) may apply the
+  // post_process_shader_enabled/post_process_shader_path cvars to a specific
+  // sub-texture themselves instead of the full guest output. Call this
+  // before such a presenter is initialized to stop those cvars from also
+  // selecting Effect::kCustomShader here. Defaults to true (applies to the
+  // whole guest output), matching the GraphicsSystem/xenos behavior.
+  static void SetCustomPostProcessShaderAppliesToGuestOutput(bool applies);
+
   class GuestOutputRefreshContext {
    public:
     GuestOutputRefreshContext(const GuestOutputRefreshContext& context) = delete;
@@ -212,6 +221,10 @@ class Presenter {
    public:
     enum class Effect {
       kBilinear,
+      // Single-pass custom GLSL/RetroArch-style `.slang` fragment shader
+      // post-processing (Vulkan and D3D12; falls back to kBilinear if
+      // compilation fails).
+      kCustomShader,
 #if defined(REX_HAS_FIDELITYFX_SDK)
       kCas,
       // AMD FidelityFX Super Resolution upsampling, Contrast Adaptive
@@ -427,6 +440,7 @@ class Presenter {
   enum class GuestOutputPaintEffect {
     kBilinear,
     kBilinearDither,
+    kCustomShader,
 #if defined(REX_HAS_FIDELITYFX_SDK)
     kCasSharpen,
     kCasSharpenDither,
@@ -479,7 +493,7 @@ class Presenter {
   static constexpr size_t kMaxGuestOutputPaintEffects =
       GuestOutputPaintConfig::kFsrMaxUpscalingPassesMax + 2;
 #else
-  // Bilinear-only path: at most 1 effect.
+  // Bilinear or custom shader path: at most 1 effect.
   static constexpr size_t kMaxGuestOutputPaintEffects = 1;
 #endif
 
@@ -545,6 +559,34 @@ class Presenter {
       const std::pair<uint32_t, uint32_t>& output_size = flow.effect_output_sizes[effect_index];
       output_size_inv[0] = 1.0f / float(output_size.first);
       output_size_inv[1] = 1.0f / float(output_size.second);
+    }
+  };
+
+  // Constants for the post_process_shader_path custom post-process effect
+  // (GuestOutputPaintEffect::kCustomShader), shared between the Vulkan and
+  // D3D12 backends. Exposed to the shader (see
+  // ui::CustomShader::kGlslPreamble) as SourceSize/OutputSize-style
+  // RetroArch-compatible aliases. Note there is currently no per-frame
+  // counter threaded through the paint flow, so FrameCount is always 0 in the
+  // shader (animated shaders using it will not animate) - a known
+  // limitation.
+  struct CustomShaderConstants {
+    int32_t output_offset[2];
+    float output_size_inv[2];
+    float source_size[2];
+    float source_size_inv[2];
+
+    void Initialize(const GuestOutputPaintFlow& flow, size_t effect_index) {
+      flow.GetEffectOutputOffset(effect_index, output_offset[0], output_offset[1]);
+      const std::pair<uint32_t, uint32_t>& output_size = flow.effect_output_sizes[effect_index];
+      output_size_inv[0] = 1.0f / float(output_size.first);
+      output_size_inv[1] = 1.0f / float(output_size.second);
+      uint32_t input_width, input_height;
+      flow.GetEffectInputSize(effect_index, input_width, input_height);
+      source_size[0] = float(input_width);
+      source_size[1] = float(input_height);
+      source_size_inv[0] = 1.0f / source_size[0];
+      source_size_inv[1] = 1.0f / source_size[1];
     }
   };
 

@@ -13,12 +13,19 @@
 #include <climits>
 #include <cmath>
 #include <memory>
+#include <string>
 #include <utility>
+#include <vector>
+
+#include <d3dcompiler.h>
+
+#include <fmt/format.h>
 
 #include <rex/assert.h>
 #include <rex/cvar.h>
 #include <rex/logging.h>
 #include <rex/math.h>
+#include <rex/ui/custom_shader.h>
 #include <rex/ui/d3d12/d3d12_presenter.h>
 #include <rex/ui/d3d12/d3d12_provider.h>
 #include <rex/ui/d3d12/d3d12_util.h>
@@ -32,6 +39,7 @@
 
 REXCVAR_DEFINE_BOOL(d3d12_allow_variable_refresh_rate_and_tearing, true, "UI/D3D12",
                     "Allow variable refresh rate and tearing");
+REXCVAR_DECLARE(std::string, post_process_shader_path);
 
 namespace rex::ui::d3d12 {
 
@@ -601,6 +609,11 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
     // (and multiple threads can't paint the main target at the same time).
   }
 
+  if (guest_output_paint_config.GetEffect() == GuestOutputPaintConfig::Effect::kCustomShader &&
+      !EnsureCustomShaderPipeline()) {
+    guest_output_paint_config.SetEffect(GuestOutputPaintConfig::Effect::kBilinear);
+  }
+
   if (guest_output_resource) {
     GuestOutputPaintFlow guest_output_flow = GetGuestOutputPaintFlow(
         guest_output_properties, paint_context_.swap_chain_width, paint_context_.swap_chain_height,
@@ -948,6 +961,7 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
           UINT effect_constants_size = 0;
           union {
             BilinearConstants bilinear;
+            CustomShaderConstants custom_shader;
 #if defined(REX_HAS_FIDELITYFX_SDK)
             CasSharpenConstants cas_sharpen;
             CasResampleConstants cas_resample;
@@ -959,6 +973,10 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
             case kGuestOutputPaintRootSignatureIndexBilinear: {
               effect_constants_size = sizeof(effect_constants.bilinear);
               effect_constants.bilinear.Initialize(guest_output_flow, i);
+            } break;
+            case kGuestOutputPaintRootSignatureIndexCustomShader: {
+              effect_constants_size = sizeof(effect_constants.custom_shader);
+              effect_constants.custom_shader.Initialize(guest_output_flow, i);
             } break;
 #if defined(REX_HAS_FIDELITYFX_SDK)
             case kGuestOutputPaintRootSignatureIndexCasSharpen: {
@@ -1269,6 +1287,22 @@ bool D3D12Presenter::InitializeSurfaceIndependent() {
     *(guest_output_paint_root_signatures_[kGuestOutputPaintRootSignatureIndexBilinear]
           .ReleaseAndGetAddressOf()) = guest_output_paint_root_signature;
   }
+  // Custom shader (needs the sampler) - same shape as bilinear, but a larger
+  // effect-constants block (CustomShaderConstants).
+  guest_output_paint_root_parameter_effect_constants.Constants.Num32BitValues =
+      sizeof(CustomShaderConstants) / sizeof(uint32_t);
+  {
+    ID3D12RootSignature* guest_output_paint_root_signature =
+        util::CreateRootSignature(provider_, guest_output_paint_root_signature_desc);
+    if (!guest_output_paint_root_signature) {
+      REXLOG_ERROR(
+          "D3D12Presenter: Failed to create the guest output custom shader "
+          "presentation root signature");
+      return false;
+    }
+    *(guest_output_paint_root_signatures_[kGuestOutputPaintRootSignatureIndexCustomShader]
+          .ReleaseAndGetAddressOf()) = guest_output_paint_root_signature;
+  }
 #if defined(REX_HAS_FIDELITYFX_SDK)
   // EASU (needs the sampler).
   guest_output_paint_root_parameter_effect_constants.Constants.Num32BitValues =
@@ -1357,6 +1391,11 @@ bool D3D12Presenter::InitializeSurfaceIndependent() {
         guest_output_paint_pipeline_desc.PS.BytecodeLength =
             sizeof(shaders::guest_output_bilinear_ps);
         break;
+      // The custom shader PSO is compiled at runtime from post_process_shader_path
+      // (see EnsureCustomShaderPipeline) since its pixel shader isn't known
+      // ahead of time; skip it here.
+      case GuestOutputPaintEffect::kCustomShader:
+        continue;
       case GuestOutputPaintEffect::kBilinearDither:
         guest_output_paint_pipeline_desc.PS.pShaderBytecode =
             shaders::guest_output_bilinear_dither_ps;
@@ -1510,6 +1549,99 @@ bool D3D12Presenter::InitializeSurfaceIndependent() {
   }
 
   return InitializeCommonSurfaceIndependent();
+}
+
+bool D3D12Presenter::EnsureCustomShaderPipeline() {
+  const std::string& glsl_path = REXCVAR_GET(post_process_shader_path);
+  if (glsl_path.empty()) {
+    return false;
+  }
+
+  size_t effect_index = size_t(GuestOutputPaintEffect::kCustomShader);
+  if (glsl_path == custom_shader_compiled_path_) {
+    return !custom_shader_compile_failed_ &&
+           guest_output_paint_final_pipelines_[effect_index] != nullptr;
+  }
+
+  rex::ui::CustomShader::CompileResult compile_result =
+      rex::ui::CustomShader::Compile(glsl_path, /*compile_hlsl=*/true);
+  if (!compile_result.success) {
+    REXLOG_ERROR("D3D12Presenter: Failed to compile custom shader '{}': {}", glsl_path,
+                 compile_result.error);
+    custom_shader_compiled_path_ = glsl_path;
+    custom_shader_compile_failed_ = true;
+    return false;
+  }
+
+  Microsoft::WRL::ComPtr<ID3DBlob> code_blob;
+  Microsoft::WRL::ComPtr<ID3DBlob> error_blob;
+  UINT compile_flags = D3DCOMPILE_ENABLE_STRICTNESS;
+#if !defined(NDEBUG)
+  compile_flags |= D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION;
+#else
+  compile_flags |= D3DCOMPILE_OPTIMIZATION_LEVEL3;
+#endif
+  HRESULT hr = D3DCompile(compile_result.hlsl_ps.data(), compile_result.hlsl_ps.size(),
+                          /*pSourceName=*/nullptr,
+                          /*pDefines=*/nullptr,
+                          /*pInclude=*/D3D_COMPILE_STANDARD_FILE_INCLUDE,
+                          /*pEntrypoint=*/"main",
+                          /*pTarget=*/"ps_5_1", compile_flags, 0, &code_blob, &error_blob);
+  if (FAILED(hr) || !code_blob) {
+    std::string compile_error =
+        (error_blob && error_blob->GetBufferSize() > 0)
+            ? std::string(static_cast<const char*>(error_blob->GetBufferPointer()),
+                          error_blob->GetBufferSize())
+            : fmt::format("D3DCompile failed (HRESULT 0x{:08X}).", static_cast<uint32_t>(hr));
+    REXLOG_ERROR("D3D12Presenter: Failed to compile custom shader '{}' HLSL to DXBC: {}", glsl_path,
+                 compile_error);
+    custom_shader_compiled_path_ = glsl_path;
+    custom_shader_compile_failed_ = true;
+    return false;
+  }
+
+  ID3D12Device* device = provider_.GetDevice();
+
+  D3D12_GRAPHICS_PIPELINE_STATE_DESC pipeline_desc = {};
+  pipeline_desc.pRootSignature =
+      guest_output_paint_root_signatures_[kGuestOutputPaintRootSignatureIndexCustomShader].Get();
+  pipeline_desc.VS.pShaderBytecode = shaders::guest_output_triangle_strip_rect_vs;
+  pipeline_desc.VS.BytecodeLength = sizeof(shaders::guest_output_triangle_strip_rect_vs);
+  pipeline_desc.PS.pShaderBytecode = code_blob->GetBufferPointer();
+  pipeline_desc.PS.BytecodeLength = code_blob->GetBufferSize();
+  pipeline_desc.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+  pipeline_desc.SampleMask = UINT_MAX;
+  pipeline_desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+  pipeline_desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+  pipeline_desc.RasterizerState.DepthClipEnable = TRUE;
+  pipeline_desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+  pipeline_desc.NumRenderTargets = 1;
+  pipeline_desc.SampleDesc.Count = 1;
+
+  // Only the final-effect PSO is created - GuestOutputPaintEffect::kCustomShader
+  // is only ever used as a single, final effect (kMaxGuestOutputPaintEffects
+  // is 1 on the non-FidelityFX path this effect is part of), so an
+  // intermediate-target variant is unreachable.
+  pipeline_desc.RTVFormats[0] = kSwapChainFormat;
+  Microsoft::WRL::ComPtr<ID3D12PipelineState> final_pipeline;
+  if (FAILED(device->CreateGraphicsPipelineState(&pipeline_desc, IID_PPV_ARGS(&final_pipeline)))) {
+    REXLOG_ERROR(
+        "D3D12Presenter: Failed to create the guest output custom shader painting "
+        "pipeline for '{}'",
+        glsl_path);
+    custom_shader_compiled_path_ = glsl_path;
+    custom_shader_compile_failed_ = true;
+    return false;
+  }
+
+  if (guest_output_paint_final_pipelines_[effect_index] != nullptr) {
+    paint_context_.paint_submission_tracker.AwaitAllSubmissionsCompletion();
+  }
+  guest_output_paint_final_pipelines_[effect_index] = final_pipeline;
+
+  custom_shader_compiled_path_ = glsl_path;
+  custom_shader_compile_failed_ = false;
+  return true;
 }
 
 }  // namespace rex::ui::d3d12
