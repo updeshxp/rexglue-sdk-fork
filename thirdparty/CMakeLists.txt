@@ -702,6 +702,19 @@ target_include_directories(libavcodec
 )
 target_compile_definitions(libavcodec PRIVATE ${FFMPEG_COMMON_DEFINES})
 target_compile_options(libavcodec PRIVATE -w)  # Suppress warnings in third-party code
+
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND IS_ARM64)
+    # Workaround: the vendored FFmpeg submodule's config_linux_aarch64.h
+    # wrongly disables CONFIG_WMAV2_DECODER on this platform only (all other
+    # platform configs enable it), leaving BGM using WMA v1/v2 audio silent.
+    # Force-include a corrected shadow copy ahead of the real header; its
+    # FFMPEG_CONFIG_H include guard then suppresses the broken one when
+    # config.h dispatches to it. Remove this once the submodule is fixed
+    # upstream.
+    target_compile_options(libavcodec PRIVATE
+        -include "${CMAKE_CURRENT_SOURCE_DIR}/ffmpeg_config_overrides/config_linux_aarch64_wmav2_fix.h")
+endif()
+
 target_link_libraries(libavcodec PUBLIC libavutil)
 if(WIN32)
     target_link_libraries(libavcodec PRIVATE bcrypt)
