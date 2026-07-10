@@ -85,8 +85,24 @@ REXCVAR_DEFINE_BOOL(present_allow_overscan_cutoff, false, "UI/Presenter",
                     "Allow overscan cutoff based on safe area settings")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
+REXCVAR_DEFINE_STRING(post_process_shader_path, "", "GPU",
+                      "Path to a custom post-process fragment shader (.glsl), or a single-pass "
+                      "RetroArch-style shader (.slang, using #pragma stage), applied on the "
+                      "emulator output. Empty disables custom post-process shading. Supported on "
+                      "both the Vulkan and D3D12 backends.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(post_process_shader_enabled, false, "GPU",
+                    "Enable the custom post-process shader configured via "
+                    "post_process_shader_path. Lets the shader be toggled off without clearing "
+                    "the path.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 namespace {
 using GuestOutputPaintConfig = rex::ui::Presenter::GuestOutputPaintConfig;
+
+// See Presenter::SetCustomPostProcessShaderAppliesToGuestOutput.
+std::atomic<bool> custom_post_process_shader_applies_to_guest_output{true};
 
 GuestOutputPaintConfig::Effect ParsePresentEffect(const std::string& effect_name) {
   std::string lowered = effect_name;
@@ -260,6 +276,10 @@ GuestOutputPaintConfig BuildGuestOutputPaintConfigFromCVar() {
   }
 #endif
   config.SetAllowOverscanCutoff(REXCVAR_GET(present_allow_overscan_cutoff));
+  if (custom_post_process_shader_applies_to_guest_output.load(std::memory_order_relaxed) &&
+      REXCVAR_GET(post_process_shader_enabled) && !REXCVAR_GET(post_process_shader_path).empty()) {
+    parsed_effect = GuestOutputPaintConfig::Effect::kCustomShader;
+  }
   config.SetEffect(parsed_effect);
 #if defined(REX_HAS_FIDELITYFX_SDK)
   config.SetCasAdditionalSharpness(float(REXCVAR_GET(present_cas_additional_sharpness)));
@@ -280,6 +300,10 @@ namespace ui {
 void Presenter::FatalErrorHostGpuLossCallback([[maybe_unused]] bool is_responsible,
                                               [[maybe_unused]] bool statically_from_ui_thread) {
   rex::FatalError("Graphics device lost (probably due to an internal error)");
+}
+
+void Presenter::SetCustomPostProcessShaderAppliesToGuestOutput(bool applies) {
+  custom_post_process_shader_applies_to_guest_output.store(applies, std::memory_order_relaxed);
 }
 
 Presenter::~Presenter() {
@@ -791,6 +815,17 @@ bool Presenter::InitializeCommonSurfaceIndependent() {
     guest_output_paint_config_ = BuildGuestOutputPaintConfigFromCVar();
   }
 
+  // post_process_shader_path/post_process_shader_enabled are kHotReload, but
+  // guest_output_paint_config_ is otherwise only built from cvars once above
+  // - without this, toggling/changing them at runtime would have no effect
+  // until the presenter is recreated.
+  auto rebuild_guest_output_paint_config = [this](std::string_view, std::string_view) {
+    SetGuestOutputPaintConfigFromUIThread(BuildGuestOutputPaintConfigFromCVar());
+  };
+  rex::cvar::RegisterChangeCallback("post_process_shader_path", rebuild_guest_output_paint_config);
+  rex::cvar::RegisterChangeCallback("post_process_shader_enabled",
+                                    rebuild_guest_output_paint_config);
+
   // Initialize UI frame rate limiting.
 #if REX_PLATFORM_WIN32
   dxgi_ui_tick_thread_ = std::thread(&Presenter::DXGIUITickThread, this);
@@ -1167,9 +1202,12 @@ Presenter::GuestOutputPaintFlow Presenter::GetGuestOutputPaintFlow(
       last_pre_bilinear_effect_size->second =
           std::min(last_pre_bilinear_effect_size->second, max_rt_height);
     }
+    bool use_custom_shader =
+        !flow.effect_count && config.GetEffect() == GuestOutputPaintConfig::Effect::kCustomShader;
     assert_true(flow.effect_count < flow.effects.size());
     flow.effect_output_sizes[flow.effect_count] = std::make_pair(output_width, output_height);
-    flow.effects[flow.effect_count++] = GuestOutputPaintEffect::kBilinear;
+    flow.effects[flow.effect_count++] = use_custom_shader ? GuestOutputPaintEffect::kCustomShader
+                                                          : GuestOutputPaintEffect::kBilinear;
   }
 
   assert_not_zero(flow.effect_count);

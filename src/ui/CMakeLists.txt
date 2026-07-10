@@ -2,6 +2,7 @@
 
 # Core UI sources
 set(REXUI_CORE_SOURCES
+    custom_shader.cpp
     graphics_upload_buffer_pool.cpp
     graphics_util.cpp
     image_decode.cpp
@@ -147,6 +148,24 @@ if(REXGLUE_USE_VULKAN)
     )
 endif()
 
+# glslang (GLSL/.slang -> SPIR-V) and SPIRV-Cross (SPIR-V -> HLSL) power the
+# shared custom post-process shader front-end (custom_shader.cpp), used by
+# both the Vulkan backend (consumes SPIR-V directly) and the D3D12 backend
+# (further cross-compiles to HLSL).
+if(REXGLUE_USE_VULKAN OR REXGLUE_USE_D3D12)
+    target_link_libraries(rexui PRIVATE
+        glslang::SPIRV
+        glslang
+        MachineIndependent
+        GenericCodeGen
+        OSDependent
+        OGLCompiler
+        spirv-cross-core
+        spirv-cross-hlsl
+        spirv-cross-glsl
+    )
+endif()
+
 # Platform-specific dependencies
 if(UNIX AND NOT APPLE)
     find_package(PkgConfig REQUIRED)
@@ -177,6 +196,11 @@ endif()
 
 # D3D12 backend dependencies
 if(REXGLUE_USE_D3D12)
-    target_link_libraries(rexui PUBLIC dxc-headers)
+    target_link_libraries(rexui PUBLIC
+        dxgi
+        dxguid
+        dxc-headers
+        d3dcompiler
+    )
 endif()
 

@@ -13,6 +13,7 @@
 
 #include <array>
 #include <memory>
+#include <string>
 #include <utility>
 
 #include <rex/math.h>
@@ -132,6 +133,9 @@ class D3D12Presenter final : public Presenter {
 
   enum GuestOutputPaintRootSignatureIndex : size_t {
     kGuestOutputPaintRootSignatureIndexBilinear,
+    // Uses CustomShaderConstants rather than BilinearConstants (larger, so it
+    // needs its own root signature - see presenter.h).
+    kGuestOutputPaintRootSignatureIndexCustomShader,
 #if defined(REX_HAS_FIDELITYFX_SDK)
     kGuestOutputPaintRootSignatureIndexCasSharpen,
     kGuestOutputPaintRootSignatureIndexCasResample,
@@ -148,6 +152,8 @@ class D3D12Presenter final : public Presenter {
       case GuestOutputPaintEffect::kBilinear:
       case GuestOutputPaintEffect::kBilinearDither:
         return kGuestOutputPaintRootSignatureIndexBilinear;
+      case GuestOutputPaintEffect::kCustomShader:
+        return kGuestOutputPaintRootSignatureIndexCustomShader;
 #if defined(REX_HAS_FIDELITYFX_SDK)
       case GuestOutputPaintEffect::kCasSharpen:
       case GuestOutputPaintEffect::kCasSharpenDither:
@@ -262,6 +268,13 @@ class D3D12Presenter final : public Presenter {
 
   bool InitializeSurfaceIndependent();
 
+  // Loads post_process_shader_path, cross-compiles it to HLSL via CustomShader
+  // (glslang -> SPIR-V -> SPIRV-Cross -> HLSL) and compiles that with
+  // D3DCompile, caching the resulting PSOs. Returns false (logging an error)
+  // if the cvar is empty or compilation/PSO creation fails, in which case the
+  // caller should fall back to GuestOutputPaintEffect::kBilinear.
+  bool EnsureCustomShaderPipeline();
+
 #if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
   bool EnsureTemporalUpscalerContext(uint32_t render_width, uint32_t render_height,
                                      uint32_t output_width, uint32_t output_height);
@@ -289,6 +302,12 @@ class D3D12Presenter final : public Presenter {
       guest_output_paint_intermediate_pipelines_;
   std::array<Microsoft::WRL::ComPtr<ID3D12PipelineState>, size_t(GuestOutputPaintEffect::kCount)>
       guest_output_paint_final_pipelines_;
+
+  // Tracks the post_process_shader_path value last (attempted to be) compiled into
+  // guest_output_paint_intermediate_pipelines_/_final_pipelines_[kCustomShader],
+  // to avoid recompiling every frame.
+  std::string custom_shader_compiled_path_;
+  bool custom_shader_compile_failed_ = false;
 
   // The first is the refresher submission tracker fence value at which the
   // guest output texture was last refreshed, the second is the reference to the
