@@ -251,6 +251,15 @@ std::optional<size_t> RegisterFlag(FlagEntry entry) {
   auto it = index.find(entry.name);
   if (it != index.end()) {
     REXLOG_ERROR("cvar: duplicate registration of '{}'; second registration ignored", entry.name);
+    // The rejected entry still owns its own storage -- the same cvar linked
+    // into two modules (e.g. a headless-mode static copy and a GPU plugin
+    // DLL both pulling in the same flags.cpp) means two independent
+    // FLAGS_*_storage_() statics behind one registry name. Only the entry
+    // that won the registry slot ever receives config/CLI/env values, so
+    // sync the loser's own storage to the winner's *current* value now --
+    // otherwise code compiled into the losing module reads its storage's
+    // untouched default forever, silently ignoring any config the user set.
+    entry.setter(storage[it->second].getter());
     return std::nullopt;
   }
   size_t pos = storage.size();
