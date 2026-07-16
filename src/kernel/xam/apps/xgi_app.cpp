@@ -10,6 +10,7 @@
  */
 
 #include <rex/kernel/xam/apps/xgi_app.h>
+#include <rex/kernel/xam/apps/leaderboard_stats.h>
 #include <rex/logging.h>
 #include <rex/thread.h>
 
@@ -20,6 +21,9 @@ using namespace rex::system;
 using namespace rex::system::xam;
 namespace apps {
 using namespace rex::system;
+using rex::system::LeaderboardColumnType;
+using rex::system::LeaderboardColumnValue;
+using rex::system::LeaderboardRow;
 
 XgiApp::XgiApp(KernelState* kernel_state) : App(kernel_state, 0xFB) {}
 
@@ -330,28 +334,133 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       REXKRNL_DEBUG("XUserReadStats({}, {}, {:08X}, {}, {:08X}, {}, {:08X})", title_id, xuids_count,
                     xuids_ptr, specs_count, specs_ptr, results_size, results_ptr);
 
+      if (!results_ptr || !specs_ptr || !specs_count) {
+        return X_E_SUCCESS;
+      }
+
+      auto specs = ReadStatsSpecs(memory_, specs_ptr, specs_count);
+
+      // XUSER_STATS_RESULTS { be<u32> dwNumViews; be<u32> pViews; } followed
+      // by one XUSER_STATS_VIEW blob per requested view.
+      uint32_t cursor = results_ptr + kStatsResultsHeaderStride;
+      uint32_t remaining =
+          results_size > kStatsResultsHeaderStride ? results_size - kStatsResultsHeaderStride : 0;
+      uint32_t views_written = 0;
+
+      for (const auto& spec : specs) {
+        uint32_t rank_column_id = spec.column_ids.empty() ? 0 : spec.column_ids.front();
+        auto rows =
+            kernel_state_->leaderboards().GetRows(title_id, spec.view_id, rank_column_id, 100);
+        uint32_t written = WriteStatsView(memory_, cursor, remaining, title_id, spec, rows);
+        if (!written) {
+          break;
+        }
+        cursor += written;
+        remaining -= written;
+        views_written++;
+      }
+
+      auto results_header = memory_->TranslateVirtual(results_ptr);
+      memory::store_and_swap<uint32_t>(results_header + 0, views_written);
+      memory::store_and_swap<uint32_t>(results_header + 4,
+                                       views_written ? results_ptr + kStatsResultsHeaderStride : 0);
+
       return X_E_SUCCESS;
     }
     case 0x000B0025: {
-      assert_true(!buffer_length || buffer_length == 20);
+      // XSessionWriteStats(hSession, XUID, dwNumViews, pViews, pOverlapped).
+      //
+      // Request buffer layout, confirmed by disassembling the title's wrapper
+      // (default.xex sub_82812EC8; cbUserBuffer = 0x18 = 24 bytes):
+      //   +0   u32 session object
+      //   +4   (4 bytes padding)
+      //   +8   u64 XUID          (std of the 64-bit value)
+      //   +16  u32 dwNumViews
+      //   +20  u32 pViews
+      // NB: the previous 20-byte / xuid@4 layout was wrong and silently
+      // dropped every score.
+      assert_true(!buffer_length || buffer_length == 24);
 
       uint32_t obj_ptr = memory::load_and_swap<uint32_t>(buffer + 0);
-      uint64_t xuid = memory::load_and_swap<uint64_t>(buffer + 4);
-      uint32_t num_views = memory::load_and_swap<uint32_t>(buffer + 12);
-      uint32_t views_ptr = memory::load_and_swap<uint32_t>(buffer + 16);
+      uint64_t xuid = memory::load_and_swap<uint64_t>(buffer + 8);
+      uint32_t num_views = memory::load_and_swap<uint32_t>(buffer + 16);
+      uint32_t views_ptr = memory::load_and_swap<uint32_t>(buffer + 20);
 
       REXKRNL_DEBUG("XSessionWriteStats({:08X}, {:016X}, {:08X}, {:08X})", obj_ptr, xuid, num_views,
                     views_ptr);
 
+      if (views_ptr && num_views) {
+        // The WRITE path uses XSESSION_VIEW_PROPERTIES, not the read-side
+        // XUSER_STATS_VIEW/ROW/COLUMN. There are no rows: the title submits
+        // its own stats for the top-level XUID. Layout confirmed from the
+        // title's stats writer (default.xex sub_8257CD48):
+        //   XSESSION_VIEW_PROPERTIES { u32 dwViewId; u32 dwNumProperties; u32 pProperties; }  (12B)
+        //   XUSER_PROPERTY { u32 dwPropertyId; XUSER_DATA{ u8 type @+8; value @+16 }; } (24B)
+        constexpr uint32_t kViewStride = 12;
+        constexpr uint32_t kPropertyStride = 24;
+
+        auto view_base = memory_->TranslateVirtual(views_ptr);
+        for (uint32_t v = 0; v < num_views; ++v) {
+          uint8_t* view = view_base + v * kViewStride;
+          uint32_t view_id = memory::load_and_swap<uint32_t>(view + 0);
+          uint32_t num_props = memory::load_and_swap<uint32_t>(view + 4);
+          uint32_t props_ptr = memory::load_and_swap<uint32_t>(view + 8);
+
+          std::vector<LeaderboardColumnValue> columns;
+          if (num_props && props_ptr) {
+            auto prop_base = memory_->TranslateVirtual(props_ptr);
+            for (uint32_t p = 0; p < num_props; ++p) {
+              uint8_t* prop = prop_base + p * kPropertyStride;
+              LeaderboardColumnValue value;
+              // dwPropertyId is a full u32 (e.g. 0x20000001); the column id
+              // the read side keys on is the low 16 bits.
+              value.column_id =
+                  static_cast<uint16_t>(memory::load_and_swap<uint32_t>(prop + 0) & 0xFFFF);
+              value.type = static_cast<LeaderboardColumnType>(*(prop + 8));
+              uint8_t* raw = prop + 16;
+              switch (value.type) {
+                case LeaderboardColumnType::kDouble:
+                  value.real = memory::load_and_swap<double>(raw);
+                  break;
+                case LeaderboardColumnType::kFloat:
+                  value.real = memory::load_and_swap<float>(raw);
+                  break;
+                case LeaderboardColumnType::kInt64:
+                case LeaderboardColumnType::kDateTime:
+                  value.number = memory::load_and_swap<int64_t>(raw);
+                  break;
+                case LeaderboardColumnType::kContext:
+                case LeaderboardColumnType::kInt32:
+                default:
+                  value.number = memory::load_and_swap<int32_t>(raw);
+                  break;
+              }
+              columns.push_back(std::move(value));
+            }
+          }
+
+          // LeaderboardManager keys rows by (title, view, xuid). Use the local
+          // profile name (driven by the user_name cvar) as the gamertag.
+          std::string gamertag;
+          if (auto* profile = kernel_state_->user_profile()) {
+            gamertag = profile->name();
+          }
+          kernel_state_->leaderboards().SubmitRow(kernel_state_->title_id(), view_id, xuid,
+                                                  gamertag, std::move(columns));
+        }
+      }
+
       return X_E_SUCCESS;
     }
     case 0x000B0026: {
-      assert_true(!buffer_length || buffer_length == 20);
+      // XSessionFlushStats — same 24-byte buffer shape as WriteStats. Local
+      // store is already write-through in SubmitRow, so nothing to flush.
+      assert_true(!buffer_length || buffer_length == 24);
 
       uint32_t obj_ptr = memory::load_and_swap<uint32_t>(buffer + 0);
-      uint64_t xuid = memory::load_and_swap<uint64_t>(buffer + 4);
-      uint32_t num_views = memory::load_and_swap<uint32_t>(buffer + 12);
-      uint32_t views_ptr = memory::load_and_swap<uint32_t>(buffer + 16);
+      uint64_t xuid = memory::load_and_swap<uint64_t>(buffer + 8);
+      uint32_t num_views = memory::load_and_swap<uint32_t>(buffer + 16);
+      uint32_t views_ptr = memory::load_and_swap<uint32_t>(buffer + 20);
 
       REXKRNL_DEBUG("XSessionFlushStats({:08X}, {:016X}, {:08X}, {:08X})", obj_ptr, xuid, num_views,
                     views_ptr);

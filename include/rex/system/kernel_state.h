@@ -27,6 +27,7 @@
 #include <rex/filesystem/vfs.h>
 #include <rex/logging.h>
 #include <rex/system/achievement_manager.h>
+#include <rex/system/leaderboard_manager.h>
 #include <rex/system/thread_state.h>
 #include <rex/thread/fiber.h>
 #include <rex/system/util/native_list.h>
@@ -336,6 +337,9 @@ class KernelState {
   using AchievementUnlockCallback = std::function<void(const AchievementInfo&)>;
   AchievementListenerHandle RegisterAchievementUnlockCallback(AchievementUnlockCallback cb);
 
+  LeaderboardManager& leaderboards() { return leaderboard_manager_; }
+  const LeaderboardManager& leaderboards() const { return leaderboard_manager_; }
+
  private:
   void SignalAllWaitableObjects();
   void WaitForThreadsToExit(const std::vector<object_ref<XThread>>& threads, uint32_t timeout_ms);
@@ -387,6 +391,7 @@ class KernelState {
   uint32_t kernel_guest_globals_ = 0;
 
   AchievementManager achievement_manager_;
+  LeaderboardManager leaderboard_manager_;
 
   std::atomic<bool> dispatch_thread_running_;
   std::atomic<bool> terminating_title_{false};

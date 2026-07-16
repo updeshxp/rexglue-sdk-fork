@@ -33,6 +33,25 @@ uint32_t xeXamNotifyCreateListener(uint64_t mask, uint32_t is_system, uint32_t m
   auto listener = object_ref<XNotifyListener>(new XNotifyListener(REX_KERNEL_STATE()));
   listener->Initialize(mask, max_version);
 
+  // Seed the current sign-in state to the new listener, mirroring real
+  // hardware (a freshly created listener is immediately told the present
+  // sign-in state). Without this, nothing broadcasts XN_SYS_SIGNINCHANGED at
+  // boot, so the title's network manager never registers user 0 as signed in:
+  // its per-user signed-in bitmask (netmgr+0x9AC, read by sub_82577AF0) stays
+  // 0, and the pause-menu Leaderboards screen reports "You are not signed in
+  // to Xbox Live." Enqueueing XN_SYS_SIGNINCHANGED lets the netmgr's
+  // notification pump (sub_825774A8, case 0xA) re-query XamUserGetSigninState
+  // (now SignedInToLive) and set the bitmask. EnqueueNotification's own mask
+  // check drops this for listeners that didn't subscribe to sign-in changes.
+  {
+    const auto& user_profile = REX_KERNEL_STATE()->user_profile();
+    // Param is the bitmask of users whose sign-in state changed; bit N = user
+    // N. User 0 is signed in, so report bit 0.
+    uint32_t signed_in_mask = user_profile->signin_state() ? 0x1 : 0x0;
+    // XN_SYS_SIGNINCHANGED
+    listener->EnqueueNotification(0x0000000A, signed_in_mask);
+  }
+
   // Handle ref is incremented, so return that.
   uint32_t handle = listener->handle();
 

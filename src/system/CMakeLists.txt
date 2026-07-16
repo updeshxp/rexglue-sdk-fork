@@ -3,6 +3,7 @@ set(REXSYSTEM_SOURCES
     embedded_metadata.cpp
     achievement_manager.cpp
     achievements.cpp
+    leaderboard_manager.cpp
     kernel_state.cpp
     xmemory.cpp
     kernel_module.cpp
