@@ -140,6 +140,18 @@ class FunctionDispatcher : public IModuleRegistrar {
    */
   bool RestoreFunction(uint32_t guest_address, ::PPCFunc* original);
 
+  /**
+   * Last-chance resolver consulted by ResolveIndirectFunction when a call
+   * target has no registered function (e.g. runtime-patched code living
+   * outside every recompiled function). Return a host function to execute
+   * for `guest_address`, or nullptr to fall through to the invalid-function
+   * trap. Set once during startup; the resolver may be called concurrently
+   * from any guest thread and must do its own locking.
+   */
+  using FallbackResolver = ::PPCFunc* (*)(uint32_t guest_address);
+  void SetFallbackResolver(FallbackResolver resolver) { fallback_resolver_ = resolver; }
+  FallbackResolver fallback_resolver() const { return fallback_resolver_; }
+
  private:
   bool Execute(ThreadState* thread_state, uint32_t address);
 
@@ -188,6 +200,9 @@ class FunctionDispatcher : public IModuleRegistrar {
 
   // Protects dispatcher metadata during module registration and callback dispatch.
   mutable std::recursive_mutex dispatch_mutex_;
+
+  // Last-chance resolver for unregistered call targets (see SetFallbackResolver).
+  FallbackResolver fallback_resolver_ = nullptr;
 };
 
 }  // namespace rex::runtime

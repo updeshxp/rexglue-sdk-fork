@@ -163,6 +163,15 @@ class XexModule : public Module {
   uint32_t GetProcAddress(uint16_t ordinal) const;
   uint32_t GetProcAddress(const std::string_view name) const;
 
+  // Decrypts/decompresses a raw xex file (as read from disk) into its flat
+  // basefile image, laid out exactly as it would be mapped at the module's
+  // load address -- without touching guest memory or requiring a runtime.
+  // Handles XEX2 images with no/basic compression, encrypted or not (tries
+  // the retail key, then the devkit key). Returns false for delta patches,
+  // LZX ("normal") compression, or anything that doesn't decrypt to a PE.
+  static bool ExtractBaseImage(const void* xex_addr, size_t xex_length,
+                               std::vector<uint8_t>& out_image);
+
   int ApplyPatch(XexModule* module);
   bool Load(const std::string_view name, const std::string_view path, const void* xex_addr,
             size_t xex_length);
