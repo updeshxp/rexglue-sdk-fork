@@ -11,6 +11,8 @@
  */
 #include <rex/ui/overlay/settings_overlay.h>
 #include <rex/cvar.h>
+#include <rex/input/input.h>
+#include <rex/input/input_system.h>
 #include <rex/string.h>
 #include <rex/ui/imgui_widgets.h>
 #include <rex/ui/keybinds.h>
@@ -24,10 +26,17 @@
 
 namespace rex::ui {
 
-SettingsDialog::SettingsDialog(ImGuiDrawer* imgui_drawer, std::filesystem::path config_path)
-    : ImGuiDialog(imgui_drawer), config_path_(std::move(config_path)) {}
+SettingsDialog::SettingsDialog(ImGuiDrawer* imgui_drawer, std::filesystem::path config_path,
+                               rex::input::InputSystem* input_system)
+    : ImGuiDialog(imgui_drawer),
+      config_path_(std::move(config_path)),
+      input_system_(input_system) {}
 
-SettingsDialog::~SettingsDialog() {}
+SettingsDialog::~SettingsDialog() {
+  if (input_system_ && !capturing_bind_name_.empty()) {
+    input_system_->SetForceActive(false);
+  }
+}
 
 static const char* LifecycleBadge(rex::cvar::Lifecycle lc) {
   switch (lc) {
@@ -157,6 +166,14 @@ static rex::ui::VirtualKey ImGuiKeyToVirtualKey(ImGuiKey key) {
 }
 
 void SettingsDialog::OnDraw(ImGuiIO& /*io*/) {
+  // While capturing a keybind, the mouse is typically hovering this very
+  // overlay (WantCaptureMouse), which would otherwise gate raw gamepad state
+  // off (see InputDriver::is_active) -- bypass that for the duration of the
+  // capture so a controller press can still be picked up.
+  if (input_system_) {
+    input_system_->SetForceActive(!capturing_bind_name_.empty());
+  }
+
   auto& registry = rex::cvar::GetRegistry();
 
   // Collect sorted unique category paths.
@@ -364,6 +381,18 @@ void SettingsDialog::OnDraw(ImGuiIO& /*io*/) {
               rex::cvar::SetFlagByName(entry.name, names[mb], /*persist=*/true);
               capturing_bind_name_.clear();
               break;
+            }
+          }
+          if (!capturing_bind_name_.empty() && input_system_) {
+            rex::input::X_INPUT_STATE state{};
+            if (XSUCCEEDED(input_system_->GetState(0, &state))) {
+              for (const auto& [button_name, mask] : GamepadButtonNames()) {
+                if (state.gamepad.buttons & mask) {
+                  rex::cvar::SetFlagByName(entry.name, button_name, /*persist=*/true);
+                  capturing_bind_name_.clear();
+                  break;
+                }
+              }
             }
           }
         }

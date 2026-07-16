@@ -14,12 +14,19 @@
 #include <string>
 #include <rex/ui/imgui_dialog.h>
 
+namespace rex::input {
+class InputSystem;
+}
+
 namespace rex::ui {
 
 class SettingsDialog : public ImGuiDialog {
  public:
   // config_path: where "Save to config" writes (e.g. exe_dir / "app.toml")
-  SettingsDialog(ImGuiDrawer* imgui_drawer, std::filesystem::path config_path);
+  // input_system: optional; when set, the "Rebind" capture also polls
+  // controller button state so gamepad keybinds can be rebound from the UI.
+  SettingsDialog(ImGuiDrawer* imgui_drawer, std::filesystem::path config_path,
+                 rex::input::InputSystem* input_system = nullptr);
   ~SettingsDialog();
 
  protected:
@@ -27,6 +34,7 @@ class SettingsDialog : public ImGuiDialog {
 
  private:
   std::filesystem::path config_path_;
+  rex::input::InputSystem* input_system_ = nullptr;
   char search_buf_[128] = {};
   std::string selected_category_;
   std::string capturing_bind_name_;

@@ -50,6 +50,13 @@ class InputDriver {
     is_active_callback_ = is_active_callback;
   }
 
+  // Bypasses the is_active_callback_ gate (e.g. an overlay's mouse-capture
+  // check) so raw device state can still be read while the callback would
+  // otherwise report inactive -- used by the settings overlay's keybind
+  // capture, which needs to see gamepad presses even while the mouse hovers
+  // its own "Press any key..." button.
+  void set_force_active(bool force) { force_active_ = force; }
+
  protected:
   explicit InputDriver(rex::ui::Window* window, size_t window_z_order)
       : window_(window), window_z_order_(window_z_order) {}
@@ -57,12 +64,13 @@ class InputDriver {
   rex::ui::Window* window() const { return window_; }
   size_t window_z_order() const { return window_z_order_; }
 
-  bool is_active() const { return !is_active_callback_ || is_active_callback_(); }
+  bool is_active() const { return force_active_ || !is_active_callback_ || is_active_callback_(); }
 
  private:
   rex::ui::Window* window_;
   size_t window_z_order_;
   std::function<bool()> is_active_callback_ = nullptr;
+  bool force_active_ = false;
 };
 
 }  // namespace rex::input

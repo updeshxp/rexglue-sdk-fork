@@ -10,6 +10,7 @@
  */
 #include <rex/ui/keybinds.h>
 #include <rex/cvar.h>
+#include <rex/input/input.h>
 #include <mutex>
 #include <string>
 #include <deque>
@@ -152,6 +153,44 @@ std::string VirtualKeyToString(VirtualKey vk) {
   for (const auto& [name, key] : kKeyNames) {
     if (key == vk) {
       return name;
+    }
+  }
+  return {};
+}
+
+const std::vector<std::pair<std::string, uint16_t>>& GamepadButtonNames() {
+  static const std::vector<std::pair<std::string, uint16_t>> kNames = {
+      {"A", rex::input::X_INPUT_GAMEPAD_A},
+      {"B", rex::input::X_INPUT_GAMEPAD_B},
+      {"X", rex::input::X_INPUT_GAMEPAD_X},
+      {"Y", rex::input::X_INPUT_GAMEPAD_Y},
+      {"LB", rex::input::X_INPUT_GAMEPAD_LEFT_SHOULDER},
+      {"RB", rex::input::X_INPUT_GAMEPAD_RIGHT_SHOULDER},
+      {"LThumb", rex::input::X_INPUT_GAMEPAD_LEFT_THUMB},
+      {"RThumb", rex::input::X_INPUT_GAMEPAD_RIGHT_THUMB},
+      {"Start", rex::input::X_INPUT_GAMEPAD_START},
+      {"Back", rex::input::X_INPUT_GAMEPAD_BACK},
+      {"DPadUp", rex::input::X_INPUT_GAMEPAD_DPAD_UP},
+      {"DPadDown", rex::input::X_INPUT_GAMEPAD_DPAD_DOWN},
+      {"DPadLeft", rex::input::X_INPUT_GAMEPAD_DPAD_LEFT},
+      {"DPadRight", rex::input::X_INPUT_GAMEPAD_DPAD_RIGHT},
+  };
+  return kNames;
+}
+
+uint16_t ParseGamepadButton(std::string_view name) {
+  for (const auto& [button_name, mask] : GamepadButtonNames()) {
+    if (button_name == name) {
+      return mask;
+    }
+  }
+  return 0;
+}
+
+std::string GamepadButtonToString(uint16_t button) {
+  for (const auto& [button_name, mask] : GamepadButtonNames()) {
+    if (mask == button) {
+      return button_name;
     }
   }
   return {};
