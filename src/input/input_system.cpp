@@ -217,6 +217,16 @@ void InputSystem::SetDeviceAssignment(std::unique_ptr<DeviceAssignment> assignme
   }
 }
 
+void InputSystem::SetForceActive(bool force) {
+  force_active_ = force;
+  for (auto& driver : drivers_) {
+    if (force) {
+      driver->set_is_active_callback([] { return true; });
+    } else {
+      driver->set_is_active_callback({});
+    }
+  }
+}
 void InputSystem::RefreshDevices() {
   std::vector<DeviceInfo> seen;
   std::vector<InputDriver*> owners;

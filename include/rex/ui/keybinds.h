@@ -30,9 +30,11 @@
 #pragma once
 #include <rex/ui/ui_event.h>
 #include <rex/ui/virtual_key.h>
+#include <cstdint>
 #include <functional>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace rex::ui {
 
@@ -49,6 +51,28 @@ VirtualKey ParseVirtualKey(std::string_view name);
  * @return    Key name string (e.g. "F3", "LMB"), or empty if unrecognized.
  */
 std::string VirtualKeyToString(VirtualKey vk);
+
+/**
+ * All known gamepad button names paired with their X_INPUT_GAMEPAD_BUTTON
+ * bitmask value, e.g. {"A", 0x1000}. Shared table so any UI that lets a user
+ * rebind a gamepad button (settings overlay, per-feature binds) names buttons
+ * consistently.
+ */
+const std::vector<std::pair<std::string, uint16_t>>& GamepadButtonNames();
+
+/**
+ * Parse a human-readable gamepad button name (e.g. "A", "LThumb", "DPadUp")
+ * to its X_INPUT_GAMEPAD_BUTTON bitmask.
+ * @return  Matching bitmask, or 0 if unrecognized.
+ */
+uint16_t ParseGamepadButton(std::string_view name);
+
+/**
+ * Convert an X_INPUT_GAMEPAD_BUTTON bitmask (single bit) to its
+ * human-readable name.
+ * @return  Button name string, or empty if unrecognized.
+ */
+std::string GamepadButtonToString(uint16_t button);
 
 /**
  * Register a named keybind with a default key and callback.

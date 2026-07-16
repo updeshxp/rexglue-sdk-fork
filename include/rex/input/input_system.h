@@ -42,6 +42,12 @@ class InputSystem : public system::IInputSystem {
   /// Replaces any previous assignment. Call before the guest starts polling.
   void SetDeviceAssignment(std::unique_ptr<DeviceAssignment> assignment);
 
+  // Forces every driver's is_active() to report true regardless of the
+  // active callback, so raw device state (e.g. gamepad buttons) is still
+  // readable while an overlay would normally gate input off (mouse hovering
+  // the overlay). Used by the settings overlay's keybind capture.
+  void SetForceActive(bool force);
+
   X_RESULT GetCapabilities(uint32_t user_index, uint32_t flags, X_INPUT_CAPABILITIES* out_caps);
   X_RESULT GetState(uint32_t user_index, X_INPUT_STATE* out_state);
   X_RESULT SetState(uint32_t user_index, X_INPUT_VIBRATION* vibration);
@@ -65,6 +71,8 @@ class InputSystem : public system::IInputSystem {
   // does not renumber pad two.
   std::vector<DeviceInfo> devices_;
   std::vector<InputDriver*> device_owners_;
+
+  bool force_active_ = false;
 };
 
 /// Create a default InputSystem with SDL + NOP drivers.

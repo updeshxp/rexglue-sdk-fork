@@ -464,7 +464,10 @@ void ReXApp::SetupOverlays(rex::ui::Presenter* presenter, rex::ui::ImmediateDraw
     if (settings_overlay_) {
       settings_overlay_.reset();
     } else {
-      settings_overlay_ = std::make_unique<ui::SettingsDialog>(imgui_drawer_.get(), config_path_);
+      auto* input_sys =
+          runtime_ ? static_cast<rex::input::InputSystem*>(runtime_->input_system()) : nullptr;
+      settings_overlay_ =
+          std::make_unique<ui::SettingsDialog>(imgui_drawer_.get(), config_path_, input_sys);
     }
   });
   rex::ui::RegisterBind("bind_mod_manager", "F1", "Toggle mod manager overlay", [this, drawer] {
