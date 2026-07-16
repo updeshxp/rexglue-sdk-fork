@@ -13,6 +13,7 @@
 
 #include <fmt/format.h>
 
+#include <rex/cvar.h>
 #include <rex/logging.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/xam/user_profile.h>
@@ -91,6 +92,12 @@ UserProfile::UserProfile() {
   AddSetting(std::make_unique<BinarySetting>(0x63E83FFE));
   // XPROFILE_TITLE_SPECIFIC3
   AddSetting(std::make_unique<BinarySetting>(0x63E83FFD));
+}
+
+std::string UserProfile::name() const {
+  // The guest title owns the user_name cvar.
+  std::string cvar_name = REXCVAR_QUERY(std::string, user_name);
+  return cvar_name.empty() ? name_ : cvar_name;
 }
 
 void UserProfile::AddSetting(std::unique_ptr<Setting> setting) {

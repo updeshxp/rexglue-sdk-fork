@@ -15,6 +15,7 @@
 #include <cstring>
 
 #include <rex/cvar.h>
+#include <rex/kernel/xam/apps/leaderboard_stats.h>
 #include <rex/kernel/xam/private.h>
 #include <rex/logging.h>
 #include <rex/math.h>
@@ -595,6 +596,89 @@ class XStaticAchievementEnumerator : public XEnumerator {
   size_t current_item_ = 0;
 };
 
+// Params reverse engineered from the real implementation (xam.xex,
+// `1888PatchedDash` dump, addr 0x818c0150) plus Symphony of the Night's own
+// call sites (default.xex sub_825D77C0/7820/7880, which just forward into
+// this with a title-specific "scope" 2nd arg -- 1/0/3 for the three
+// wrappers). Not confirmed against a real XDK header.
+// Real argument order (confirmed via the game's own wrappers and the
+// 1888PatchedDash xam.xex): the exported prototype is
+//   XamUserCreateStatsEnumerator(a1, scope, user_index+1, num_rows,
+//                                num_specs, specs, pcbBuffer, phEnum)
+// The thin wrappers sub_825D77C0/7820/7880 insert the literal `scope` as arg2,
+// so arg3 is user_index+1 in the "Overall" path but a XUID/context value in the
+// "Friends"/"My Score" paths (hence the uninitialised 0xBABEBABE seen there).
+// The REAL NumStatsSpecs is arg5 and is reliably 1 -- an earlier revision
+// mislabelled arg3 as num_specs and rejected the My Score call because arg3 was
+// garbage. Positions 1/2/3 are not load-bearing for us; only num_rows, the true
+// num_specs, and the three pointers matter.
+u32 XamUserCreateStatsEnumerator_entry(u32 arg1, u32 scope, u32 user_context, u32 num_rows,
+                                       u32 num_specs, mapped_u32 specs_ptr,
+                                       mapped_u32 buffer_size_ptr, mapped_u32 handle_ptr) {
+  using namespace rex::kernel::xam::apps;
+
+  REXKRNL_DEBUG(
+      "XamUserCreateStatsEnumerator(arg1={:08X}, scope={:08X}, user_context={:08X}, "
+      "num_rows={:08X}, num_specs={:08X}, specs_ptr={:08X}, buffer_size_ptr={:08X}, "
+      "handle_ptr={:08X})",
+      arg1, scope, user_context, num_rows, num_specs, specs_ptr.guest_address(),
+      buffer_size_ptr.guest_address(), handle_ptr.guest_address());
+
+  // num_specs/num_rows are both capped at 0x14 by the real xam.xex; anything
+  // above that is a genuinely malformed request, not the param-order confusion
+  // that used to trip this check.
+  if (!num_specs || num_specs > 0x14 || !num_rows || num_rows > 0x14 || !buffer_size_ptr ||
+      !handle_ptr) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
+
+  auto specs = ReadStatsSpecs(REX_KERNEL_MEMORY(), specs_ptr.guest_address(), num_specs);
+  if (specs.empty()) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
+
+  // Symphony of the Night only ever enumerates one board at a time; sizing
+  // for more than the first spec isn't exercised here.
+  const StatsSpec& spec = specs.front();
+  uint32_t rank_column_id = spec.column_ids.empty() ? 0 : spec.column_ids.front();
+  REXKRNL_DEBUG("  spec: view_id={}, num_columns={}, rank_column_id={}", spec.view_id,
+                spec.column_ids.size(), rank_column_id);
+
+  // arg1 is a literal 0 in every observed call, but XSessionWriteStats persists
+  // the player's real scores under the RUNNING title id (kernel title_id), so
+  // prefer that. Fall back to arg1 (the seed store keys placeholder boards under
+  // title_id 0) only for views the player hasn't set yet, so real submitted
+  // rows always win over the seed instead of being shadowed by it.
+  const uint32_t running_title_id = REX_KERNEL_STATE()->title_id();
+  auto rows = REX_KERNEL_STATE()->leaderboards().GetRows(running_title_id, spec.view_id,
+                                                         rank_column_id, num_rows);
+  const uint32_t title_id = arg1;
+  if (rows.empty() && title_id != running_title_id) {
+    rows = REX_KERNEL_STATE()->leaderboards().GetRows(title_id, spec.view_id, rank_column_id,
+                                                      num_rows);
+  }
+  REXKRNL_DEBUG("  rows.size()={}", rows.size());
+
+  auto e = object_ref<XStatsEnumerator>(
+      new XStatsEnumerator(REX_KERNEL_STATE(), title_id, spec, std::move(rows)));
+  // The enumerator's own user_index is bookkeeping only; the request's user is
+  // encoded in user_context (user_index+1) but is garbage on some paths, so 0.
+  auto result = e->Initialize(0, 0xFB, 0xB0023, 0xB0024, 0);
+  // scope (Overall=1, My Score=0, Friends path=0) and user_context are not yet
+  // used to filter rows -- every tab currently shows the same global list.
+  (void)scope;
+  (void)user_context;
+  if (XFAILED(result)) {
+    return result;
+  }
+
+  if (buffer_size_ptr.guest_address()) {
+    *buffer_size_ptr = static_cast<uint32_t>(e->item_size());
+  }
+  *handle_ptr = e->handle();
+  return X_ERROR_SUCCESS;
+}
+
 u32 XamUserCreateAchievementEnumerator_entry(u32 title_id, u32 user_index, u32 xuid, u32 flags,
                                              u32 offset, u32 count, mapped_u32 buffer_size_ptr,
                                              mapped_u32 handle_ptr) {
@@ -751,6 +835,8 @@ REX_EXPORT(__imp__XamUserAreUsersFriends, rex::kernel::xam::XamUserAreUsersFrien
 REX_EXPORT(__imp__XamShowSigninUI, rex::kernel::xam::XamShowSigninUI_entry)
 REX_EXPORT(__imp__XamUserCreateAchievementEnumerator,
            rex::kernel::xam::XamUserCreateAchievementEnumerator_entry)
+REX_EXPORT(__imp__XamUserCreateStatsEnumerator,
+           rex::kernel::xam::XamUserCreateStatsEnumerator_entry)
 REX_EXPORT(__imp__XamParseGamerTileKey, rex::kernel::xam::XamParseGamerTileKey_entry)
 REX_EXPORT(__imp__XamReadTileToTexture, rex::kernel::xam::XamReadTileToTexture_entry)
 REX_EXPORT(__imp__XamWriteGamerTile, rex::kernel::xam::XamWriteGamerTile_entry)
@@ -761,7 +847,6 @@ REX_EXPORT_STUB(__imp__XamUserAddRecentPlayer);
 REX_EXPORT_STUB(__imp__XamUserAllowedToPostToSocialNetwork);
 REX_EXPORT_STUB(__imp__XamUserCreateAvatarAssetEnumerator);
 REX_EXPORT_STUB(__imp__XamUserCreatePlayerEnumerator);
-REX_EXPORT_STUB(__imp__XamUserCreateStatsEnumerator);
 REX_EXPORT_STUB(__imp__XamUserCreateTitlesPlayedEnumerator);
 REX_EXPORT_STUB(__imp__XamUserFlushLogonQueue);
 REX_EXPORT_STUB(__imp__XamUserGetAge);

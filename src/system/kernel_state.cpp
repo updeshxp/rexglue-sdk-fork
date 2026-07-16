@@ -687,6 +687,14 @@ void KernelState::SetExecutableModule(object_ref<UserModule> module) {
   }
 
   LoadAchievementsData();
+
+  const auto user_root = emulator_->user_data_root();
+  REXSYS_INFO("Leaderboard store: user_root='{}' title_id={:08X}", user_root.string(), title_id());
+  if (!user_root.empty()) {
+    leaderboard_manager_.SetStorePath(user_root / "leaderboards" /
+                                      fmt::format("{:08X}.toml", title_id()));
+    leaderboard_manager_.Load();
+  }
 }
 
 void KernelState::LoadKernelModule(object_ref<KernelModule> kernel_module) {
