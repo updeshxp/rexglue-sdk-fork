@@ -208,26 +208,7 @@ void BuilderContext::emit_function_call(uint32_t address) {
         return;
       }
 
-      // An SEH funclet runs on its owner's frame and reads whatever non-volatiles
-      // the owner left live, so hand it the localized copies through ctx and take
-      // them back afterwards. Only registers already localized here can be live at
-      // this point, so that set is the whole live-in the funclet can see.
-      if (targetFn->sharesRegisters() && localizeNonVolatiles()) {
-        for (size_t i = 14; i < 32; ++i) {
-          if (locals.r[i])
-            println("\tctx.r{} = r{};", i, i);
-        }
-        emitCtx.reference(name);
-        println("\t{}(ctx, base);", name);
-        for (size_t i = 14; i < 32; ++i) {
-          if (locals.r[i])
-            println("\tr{} = ctx.r{};", i, i);
-        }
-        return;
-      }
-
-      emitCtx.reference(name);
-      println("\t{}(ctx, base);", name);
+      println("\tREX_CALL_FUNC({}, 0x{:08X});", name, address);
       return;
     }
 

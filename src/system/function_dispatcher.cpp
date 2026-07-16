@@ -316,6 +316,51 @@ uint32_t FunctionDispatcher::AllocateThunk(::PPCFunc* func, uint32_t caller_addr
   return addr;
 }
 
+bool FunctionDispatcher::OverrideFunction(uint32_t guest_address, ::PPCFunc* replacement,
+                                          ::PPCFunc** out_original) {
+  std::lock_guard<std::recursive_mutex> lock(dispatch_mutex_);
+
+  if (overridden_originals_.find(guest_address) != overridden_originals_.end()) {
+    REXLOG_ERROR("OverrideFunction: {:08X} is already overridden by another mod", guest_address);
+    return false;
+  }
+
+  ::PPCFunc* original = GetFunction(guest_address);
+  if (!original) {
+    REXLOG_ERROR("OverrideFunction: no function currently registered at {:08X}", guest_address);
+    return false;
+  }
+
+  if (!SetFunction(guest_address, replacement)) {
+    return false;
+  }
+
+  overridden_originals_[guest_address] = original;
+  if (out_original) {
+    *out_original = original;
+  }
+  return true;
+}
+
+bool FunctionDispatcher::RestoreFunction(uint32_t guest_address, ::PPCFunc* original) {
+  std::lock_guard<std::recursive_mutex> lock(dispatch_mutex_);
+
+  auto it = overridden_originals_.find(guest_address);
+  if (it == overridden_originals_.end()) {
+    REXLOG_ERROR("RestoreFunction: {:08X} is not currently overridden", guest_address);
+    return false;
+  }
+  if (it->second != original) {
+    REXLOG_ERROR("RestoreFunction: {:08X} original pointer mismatch (stale restore?)",
+                 guest_address);
+    return false;
+  }
+
+  bool ok = SetFunction(guest_address, original);
+  overridden_originals_.erase(it);
+  return ok;
+}
+
 void FunctionDispatcher::RegisterModule(const std::string& module_id, uint32_t code_base,
                                         RegisterFn register_func) {
   std::lock_guard<std::recursive_mutex> lock(dispatch_mutex_);
@@ -372,6 +417,7 @@ std::optional<std::pair<uint32_t, uint32_t>> FunctionDispatcher::UnregisterModul
 
   for (uint32_t addr : it->second.addresses) {
     function_table_.erase(addr);
+    overridden_originals_.erase(addr);
     memory_->SetFunction(addr, nullptr);
   }
 
@@ -381,6 +427,7 @@ std::optional<std::pair<uint32_t, uint32_t>> FunctionDispatcher::UnregisterModul
     uint32_t pool_end = table_it->next_thunk_address;
     for (uint32_t addr = pool_start; addr < pool_end; addr += 4) {
       function_table_.erase(addr);
+      overridden_originals_.erase(addr);
       memory_->SetFunction(addr, nullptr);
     }
     cleared_range = std::make_pair(pool_start, pool_end);

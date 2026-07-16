@@ -112,6 +112,34 @@ class FunctionDispatcher : public IModuleRegistrar {
    */
   std::optional<std::pair<uint32_t, uint32_t>> UnregisterModule(const std::string& module_id);
 
+  /**
+   * Replace the function called at `guest_address` for every caller (direct
+   * `bl` and indirect `bctrl`/function-pointer call sites alike), for mods
+   * loaded after the fact. Unlike SetFunction, this is not restricted to a
+   * module's own registration window and may be called at any time; it is
+   * safe to call concurrently with guest execution (a thread already inside
+   * the old function body finishes running it, but the next call sees the
+   * replacement).
+   *
+   * Fails (returns false) if `guest_address` is already overridden by a
+   * prior OverrideFunction call that hasn't been undone via
+   * RestoreFunction — overrides are exclusive, not chainable. On success,
+   * `out_original` (if non-null) receives the function pointer that was
+   * active before this call, so the caller can invoke it (e.g. to wrap
+   * rather than fully replace) and must pass it back to RestoreFunction.
+   */
+  bool OverrideFunction(uint32_t guest_address, ::PPCFunc* replacement,
+                        ::PPCFunc** out_original = nullptr);
+
+  /**
+   * Undo a prior OverrideFunction. `original` must be the pointer that
+   * OverrideFunction returned via out_original for this address. Fails
+   * (returns false, logs) if `guest_address` is not currently overridden,
+   * or is overridden with a different original than `original` (stale/
+   * mismatched restore).
+   */
+  bool RestoreFunction(uint32_t guest_address, ::PPCFunc* original);
+
  private:
   bool Execute(ThreadState* thread_state, uint32_t address);
 
@@ -151,6 +179,12 @@ class FunctionDispatcher : public IModuleRegistrar {
 
   // Recorded state per module, keyed by module_id.
   std::unordered_map<std::string, ModuleRegistration> module_addresses_;
+
+  // Addresses currently overridden via OverrideFunction, mapped to the
+  // function pointer that was active before the override (the value to
+  // restore on RestoreFunction). Exclusive: an address present here cannot
+  // be overridden again until RestoreFunction removes it.
+  std::unordered_map<uint32_t, ::PPCFunc*> overridden_originals_;
 
   // Protects dispatcher metadata during module registration and callback dispatch.
   mutable std::recursive_mutex dispatch_mutex_;
