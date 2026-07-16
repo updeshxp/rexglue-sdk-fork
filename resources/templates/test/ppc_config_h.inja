@@ -99,9 +99,11 @@
 // Function Dispatch
 //=============================================================================
 
-#define REX_CALL_FUNC(x) x(ctx, base)
-
 {% include "codegen/_indirect_call.inja" %}
+
+// See codegen/init_h.inja for rationale: routes bl-resolved calls through
+// the same override-aware table REX_CALL_INDIRECT_FUNC uses.
+#define REX_CALL_FUNC(name, addr) REX_LOOKUP_FUNC(base, (addr))(ctx, base)
 
 //=============================================================================
 // Flush Mode
