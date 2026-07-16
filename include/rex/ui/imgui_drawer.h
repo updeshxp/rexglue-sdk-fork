@@ -17,6 +17,7 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <string>
 #include <vector>
 
 #include <rex/ui/immediate_drawer.h>
@@ -137,6 +138,10 @@ class ImGuiDrawer : public WindowInputListener, public UIDrawer {
   // SetTextInputActive, so DetachIfLastDialogRemoved can clear it without
   // running another ImGui frame (after detaching there won't be one).
   bool text_input_active_ = false;
+
+  // Scratch storage keeping the string returned by the ImGui clipboard getter
+  // alive until ImGui consumes it (the API hands back a borrowed const char*).
+  std::string clipboard_text_;
 };
 
 }  // namespace ui
