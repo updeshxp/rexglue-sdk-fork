@@ -23,6 +23,8 @@
 
 REXCVAR_DEFINE_STRING(hid_mappings_file, "gamecontrollerdb.txt", "Input",
                       "Path to SDL gamecontroller mappings file");
+REXCVAR_DEFINE_BOOL(hid_background_input, true, "Input",
+                    "Keep accepting controller input while the window is unfocused");
 
 namespace rex::input::sdl {
 
@@ -57,6 +59,9 @@ void SDLInputDriver::OnWindowAvailable(rex::ui::Window* window) {
     attached_window_ = window;
     window->AddListener(this);
     window->app_context().CallInUIThreadSynchronous([this]() {
+      SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS,
+                  REXCVAR_GET(hid_background_input) ? "1" : "0");
+
       // Initialize SDL events subsystem
       if (!SDL_InitSubSystem(SDL_INIT_EVENTS)) {
         REXLOG_ERROR("SDL: Failed to init events subsystem: {}", SDL_GetError());
