@@ -335,6 +335,13 @@ class Window {
   bool IsTextInputActive() const { return text_input_active_; }
   void SetTextInputActive(bool active);
 
+  // OS clipboard access, used to back ImGui's copy/cut/paste in text widgets so
+  // they interoperate with the rest of the desktop (e.g. pasting a seed or a
+  // gamertag). Default implementation keeps an in-process buffer so builds
+  // without a real windowing backend still behave sanely.
+  virtual std::string GetClipboardText() { return fallback_clipboard_; }
+  virtual void SetClipboardText(const std::string& text) { fallback_clipboard_ = text; }
+
   // Desired state stored by the common Window, externally modifiable, read-only
   // in the implementation.
   CursorVisibility GetCursorVisibility() const { return cursor_visibility_; }
@@ -737,6 +744,9 @@ class Window {
   CursorVisibility cursor_visibility_ = CursorVisibility::kVisible;
 
   uint32_t cursor_auto_hide_delay_ms_ = kDefaultCursorAutoHideMilliseconds;
+
+  // Backing store for the default (backend-less) clipboard implementation.
+  std::string fallback_clipboard_;
 
   bool has_focus_ = false;
 

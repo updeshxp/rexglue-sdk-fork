@@ -168,6 +168,22 @@ void ImGuiDrawer::Initialize() {
   // Windows.
   io.IniFilename = nullptr;
 
+  // Route ImGui's clipboard through the window/OS clipboard so Ctrl+C/X/V in
+  // text widgets interoperate with the rest of the desktop. Without this ImGui
+  // falls back to an internal-only buffer and pasting external text silently
+  // does nothing. The context stores this drawer as the user data.
+  ImGuiPlatformIO& platform_io = ImGui::GetPlatformIO();
+  platform_io.Platform_ClipboardUserData = this;
+  platform_io.Platform_GetClipboardTextFn = [](ImGuiContext*) -> const char* {
+    auto* drawer = static_cast<ImGuiDrawer*>(ImGui::GetPlatformIO().Platform_ClipboardUserData);
+    drawer->clipboard_text_ = drawer->window_->GetClipboardText();
+    return drawer->clipboard_text_.c_str();
+  };
+  platform_io.Platform_SetClipboardTextFn = [](ImGuiContext*, const char* text) {
+    auto* drawer = static_cast<ImGuiDrawer*>(ImGui::GetPlatformIO().Platform_ClipboardUserData);
+    drawer->window_->SetClipboardText(text ? text : "");
+  };
+
   // Setup the font glyphs.
   ImFontConfig font_config;
   font_config.OversampleH = font_config.OversampleV = 1;
@@ -621,22 +637,40 @@ void ImGuiDrawer::OnKey(KeyEvent& e, bool is_down) {
   if (auto imGuiKey = VirtualKeyToImGuiKey(virtual_key); imGuiKey) {
     io.AddKeyEvent(*imGuiKey, is_down);
   }
+  // Submit the merged modifier events explicitly. In modern ImGui key-IO
+  // (1.87+) the L/R modifier key events above do NOT sync the merged
+  // ImGuiMod_XXX slots, and io.KeyMods / the Shortcut() chords used by
+  // InputText (Ctrl+A/C/V/X/Z) are derived solely from those merged slots
+  // (see GetMergedModsFromKeys). Writing the legacy io.KeyCtrl/etc. bools is a
+  // no-op when obsolete key-IO is disabled, which is why Ctrl shortcuts never
+  // registered. This mirrors what the imgui_impl_sdl3/win32 backends do.
   switch (virtual_key) {
     case VirtualKey::kShift:
-      io.KeyShift = is_down;
+      io.AddKeyEvent(ImGuiMod_Shift, is_down);
       break;
     case VirtualKey::kControl:
-      io.KeyCtrl = is_down;
+      io.AddKeyEvent(ImGuiMod_Ctrl, is_down);
       break;
     case VirtualKey::kMenu:
-      // FIXME(Triang3l): Doesn't work in xenia-ui-window-demo.
-      io.KeyAlt = is_down;
+      io.AddKeyEvent(ImGuiMod_Alt, is_down);
       break;
     case VirtualKey::kLWin:
-      io.KeySuper = is_down;
+      io.AddKeyEvent(ImGuiMod_Super, is_down);
       break;
     default:
       break;
+  }
+
+  // While an ImGui text-entry widget is focused the overlay owns the keyboard:
+  // mark the event handled so it does not also reach the lower-Z game input
+  // driver. Otherwise the letters and modifiers used for text editing
+  // (Ctrl+A/C/V/X/Z) double as bound gameplay controls and the game reacts to
+  // every keystroke, making editing shortcuts appear not to work. ImGui has
+  // already received the event above, so its own shortcut handling is
+  // unaffected. Gate strictly on WantTextInput so normal gameplay and the
+  // F-key overlay toggles keep working when no field is focused.
+  if (io.WantTextInput) {
+    e.set_handled(true);
   }
 }
 

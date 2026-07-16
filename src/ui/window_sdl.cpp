@@ -368,6 +368,18 @@ void WindowSDL::ApplyTextInputActiveNow() {
   }
 }
 
+std::string WindowSDL::GetClipboardText() {
+  // SDL_GetClipboardText always returns an owned (possibly empty) string.
+  char* text = SDL_GetClipboardText();
+  std::string result = text ? text : "";
+  SDL_free(text);
+  return result;
+}
+
+void WindowSDL::SetClipboardText(const std::string& text) {
+  SDL_SetClipboardText(text.c_str());
+}
+
 void WindowSDL::ApplyNewCursorVisibility(CursorVisibility old_cursor_visibility) {
   (void)old_cursor_visibility;
   ApplyCursorVisibilityNow();
