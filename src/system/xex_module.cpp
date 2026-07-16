@@ -104,6 +104,100 @@ const void* XexModule::GetSecurityInfo(const xex2_header* header) {
   return reinterpret_cast<const void*>(uintptr_t(header) + header->security_offset);
 }
 
+bool XexModule::ExtractBaseImage(const void* xex_addr, size_t xex_length,
+                                 std::vector<uint8_t>& out_image) {
+  if (!xex_addr || xex_length < sizeof(xex2_header) || std::memcmp(xex_addr, "XEX2", 4) != 0) {
+    return false;
+  }
+  const auto* header = reinterpret_cast<const xex2_header*>(xex_addr);
+  const uint32_t header_size = header->header_size;
+  if (!header_size || header_size >= xex_length) {
+    return false;
+  }
+  if (header->module_flags &
+      (XEX_MODULE_MODULE_PATCH | XEX_MODULE_PATCH_DELTA | XEX_MODULE_PATCH_FULL)) {
+    return false;
+  }
+
+  xex2_opt_file_format_info* file_info = nullptr;
+  if (!GetOptHeader(header, XEX_HEADER_FILE_FORMAT_INFO, &file_info) || !file_info) {
+    return false;
+  }
+  const auto* security = reinterpret_cast<const xex2_security_info*>(GetSecurityInfo(header));
+
+  const uint8_t* exe_buffer = static_cast<const uint8_t*>(xex_addr) + header_size;
+  const size_t exe_length = xex_length - header_size;
+  const bool encrypted = file_info->encryption_type == XEX_ENCRYPTION_NORMAL;
+
+  // With no encryption the key doesn't matter; with encryption try retail
+  // first and fall back to devkit, validated by the PE magic.
+  for (int key_pass = 0; key_pass < (encrypted ? 2 : 1); ++key_pass) {
+    uint8_t session_key[16];
+    aes_decrypt_buffer(key_pass == 0 ? xe_xex2_retail_key : xe_xex2_devkit_key,
+                       reinterpret_cast<const uint8_t*>(security->aes_key), 16, session_key, 16);
+
+    switch (file_info->compression_type) {
+      case XEX_COMPRESSION_NONE: {
+        out_image.assign(exe_length, 0);
+        if (encrypted) {
+          aes_decrypt_buffer(session_key, exe_buffer, exe_length & ~size_t(15), out_image.data(),
+                             out_image.size());
+        } else {
+          std::memcpy(out_image.data(), exe_buffer, exe_length);
+        }
+        break;
+      }
+      case XEX_COMPRESSION_BASIC: {
+        const auto& comp_info = file_info->compression_info.basic;
+        const uint32_t block_count = (file_info->info_size - 8) / 8;
+        uint64_t total_size = 0, total_data = 0;
+        for (uint32_t n = 0; n < block_count; n++) {
+          total_data += comp_info.blocks[n].data_size;
+          total_size += uint64_t(comp_info.blocks[n].data_size) + comp_info.blocks[n].zero_size;
+        }
+        if (total_data > exe_length || total_size > SIZE_MAX) {
+          return false;
+        }
+        out_image.assign(static_cast<size_t>(total_size), 0);
+
+        const uint8_t* p = exe_buffer;
+        uint8_t* d = out_image.data();
+        uint32_t rk[4 * (MAXNR + 1)];
+        uint8_t ivec[16] = {0};
+        int32_t Nr = rijndaelKeySetupDec(rk, session_key, 128);
+        for (uint32_t n = 0; n < block_count; n++) {
+          const uint32_t data_size = comp_info.blocks[n].data_size;
+          const uint32_t zero_size = comp_info.blocks[n].zero_size;
+          if (encrypted) {
+            const uint8_t* ct = p;
+            uint8_t* pt = d;
+            for (uint32_t m = 0; m < data_size; m += 16, ct += 16, pt += 16) {
+              rijndaelDecrypt(rk, Nr, ct, pt);
+              for (size_t i = 0; i < 16; i++) {
+                pt[i] ^= ivec[i];
+                ivec[i] = ct[i];
+              }
+            }
+          } else {
+            std::memcpy(d, p, data_size);
+          }
+          p += data_size;
+          d += data_size + zero_size;
+        }
+        break;
+      }
+      default:
+        // LZX/delta compression not supported by this helper.
+        return false;
+    }
+
+    if (out_image.size() >= 2 && out_image[0] == 'M' && out_image[1] == 'Z') {
+      return true;
+    }
+  }
+  return false;
+}
+
 const PESection* XexModule::GetPESection(const char* name) {
   for (std::vector<PESection>::iterator it = pe_sections_.begin(); it != pe_sections_.end(); ++it) {
     if (!strcmp(it->name, name)) {
