@@ -382,7 +382,20 @@ X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
     if (driver->GetDeviceState(id, &state) != X_ERROR_SUCCESS) {
       continue;
     }
-    active_devices_.Observe(user_index, id, state.gamepad);
+    // remap_* cvars represent a physical controller's button layout being
+      // reassigned, so they only apply to drivers backed by a real gamepad.
+      // Drivers like the MnK driver already output the final logical button
+      // state through keybind_*, and should not pass through remap.
+      if (driver->is_physical_device()) {
+        uint16_t remapped;
+        uint8_t remap_lt, remap_rt;
+        ApplyRemap(static_cast<uint16_t>(state.gamepad.buttons), state.gamepad.left_trigger,
+                   state.gamepad.right_trigger, remapped, remap_lt, remap_rt);
+        state.gamepad.buttons = remapped;
+        state.gamepad.left_trigger = remap_lt;
+        state.gamepad.right_trigger = remap_rt;
+      }
+      active_devices_.Observe(user_index, id, state.gamepad);
     if (!any) {
       merged = state;
       any = true;
@@ -392,14 +405,6 @@ X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
   }
 
   if (!any) {
-uint16_t remapped_buttons;
-  uint8_t remapped_left_trigger, remapped_right_trigger;
-  ApplyRemap(static_cast<uint16_t>(merged.gamepad.buttons), merged.gamepad.left_trigger,
-             merged.gamepad.right_trigger, remapped_buttons, remapped_left_trigger,
-             remapped_right_trigger);
-  merged.gamepad.buttons = remapped_buttons;
-  merged.gamepad.left_trigger = remapped_left_trigger;
-  merged.gamepad.right_trigger = remapped_right_trigger;
     return X_ERROR_DEVICE_NOT_CONNECTED;
   }
   if (out_state) {

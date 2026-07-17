@@ -44,6 +44,8 @@ class MnkInputDriver final : public InputDriver,
 
   void OnWindowAvailable(rex::ui::Window* window) override;
 
+  bool is_physical_device() const override { return false; }
+
   // WindowInputListener
   void OnKeyDown(rex::ui::KeyEvent& e) override;
   void OnKeyUp(rex::ui::KeyEvent& e) override;
