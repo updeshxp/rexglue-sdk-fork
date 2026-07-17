@@ -46,6 +46,13 @@ class InputDriver {
 
   virtual void OnWindowAvailable(rex::ui::Window* /*window*/) {}
 
+  // True for drivers backed by a physical gamepad (SDL/XInput), whose button
+  // state should pass through the remap_* physical-input remap table. False
+  // for drivers like the MnK driver that synthesize a logical button state
+  // directly from a keybind_* cvar -- that state already *is* the intended
+  // logical button and must not be rerouted by remap_*.
+  virtual bool is_physical_device() const { return true; }
+
   void set_is_active_callback(std::function<bool()> is_active_callback) {
     is_active_callback_ = is_active_callback;
   }

@@ -260,31 +260,53 @@ X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
     if (!driver) {
       continue;
     }
-    X_INPUT_STATE state = {};
-    if (driver->GetDeviceState(id, &state) != X_ERROR_SUCCESS) {
-      continue;
-    }
-    active_devices_.Observe(user_index, id, state.gamepad);
-    if (!any) {
-      merged = state;
-      any = true;
-    } else {
-      MergeInto(merged, state);
+    if (result == X_ERROR_SUCCESS) {
+      // remap_* cvars represent a physical controller's button layout being
+      // reassigned, so they only apply to drivers backed by a real gamepad.
+      // Drivers like the MnK driver already output the final logical button
+      // the user bound a key to, and must be merged in unremapped.
+      if (driver->is_physical_device()) {
+        uint16_t remapped_buttons;
+        uint8_t remapped_left_trigger, remapped_right_trigger;
+        ApplyRemap(static_cast<uint16_t>(state.gamepad.buttons), state.gamepad.left_trigger,
+                   state.gamepad.right_trigger, remapped_buttons, remapped_left_trigger,
+                   remapped_right_trigger);
+        state.gamepad.buttons = remapped_buttons;
+        state.gamepad.left_trigger = remapped_left_trigger;
+        state.gamepad.right_trigger = remapped_right_trigger;
+      }
+
+      if (first_result) {
+        merged = state;
+        first_result = false;
+      } else {
+        // Merge: OR buttons, max triggers, max-magnitude sticks
+        merged.gamepad.buttons = static_cast<uint16_t>(merged.gamepad.buttons) |
+                                 static_cast<uint16_t>(state.gamepad.buttons);
+        merged.gamepad.left_trigger =
+            std::max(merged.gamepad.left_trigger, state.gamepad.left_trigger);
+        merged.gamepad.right_trigger =
+            std::max(merged.gamepad.right_trigger, state.gamepad.right_trigger);
+
+        auto merge_axis = [](int16_t a, int16_t b) -> int16_t {
+          return (std::abs(static_cast<int>(a)) >= std::abs(static_cast<int>(b))) ? a : b;
+        };
+        merged.gamepad.thumb_lx = merge_axis(merged.gamepad.thumb_lx, state.gamepad.thumb_lx);
+        merged.gamepad.thumb_ly = merge_axis(merged.gamepad.thumb_ly, state.gamepad.thumb_ly);
+        merged.gamepad.thumb_rx = merge_axis(merged.gamepad.thumb_rx, state.gamepad.thumb_rx);
+        merged.gamepad.thumb_ry = merge_axis(merged.gamepad.thumb_ry, state.gamepad.thumb_ry);
+
+        if (static_cast<uint32_t>(state.packet_number) >
+            static_cast<uint32_t>(merged.packet_number)) {
+          merged.packet_number = state.packet_number;
+        }
+      }
     }
   }
 
   if (!any) {
     return X_ERROR_DEVICE_NOT_CONNECTED;
   }
-
-  uint16_t remapped_buttons;
-  uint8_t remapped_left_trigger, remapped_right_trigger;
-  ApplyRemap(static_cast<uint16_t>(merged.gamepad.buttons), merged.gamepad.left_trigger,
-             merged.gamepad.right_trigger, remapped_buttons, remapped_left_trigger,
-             remapped_right_trigger);
-  merged.gamepad.buttons = remapped_buttons;
-  merged.gamepad.left_trigger = remapped_left_trigger;
-  merged.gamepad.right_trigger = remapped_right_trigger;
 
   if (out_state) {
     *out_state = merged;
