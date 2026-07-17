@@ -29,9 +29,10 @@
 #include <rex/system/interfaces/graphics.h>
 #include <rex/system/interfaces/input.h>
 #include <rex/system/kernel_state.h>
-#include <rex/system/mod_plugin.h>    // ModInfo
-#include <rex/system/mod_registry.h>  // ModRegistry
-#include <rex/system/xobject.h>       // object_ref
+#include <rex/system/mod_plugin.h>            // ModInfo
+#include <rex/system/mod_conflict_tracker.h>  // ModConflictTracker
+#include <rex/system/mod_registry.h>          // ModRegistry
+#include <rex/system/xobject.h>               // object_ref
 
 // Forward declaration for function mapping (defined in rex/ppc/context.h)
 struct PPCFuncMapping;
@@ -134,6 +135,9 @@ class Runtime {
   system::IAudioSystem* audio_system() const { return audio_system_.get(); }
   system::IInputSystem* input_system() const { return input_system_.get(); }
   system::ModRegistry* mod_registry() const { return mod_registry_.get(); }
+  // Bookkeeping for keybind reassignments and cvar-override conflicts across
+  // mods, surfaced by the mod manager overlay. See mod_conflict_tracker.h.
+  system::ModConflictTracker* mod_conflict_tracker() const { return mod_conflict_tracker_.get(); }
 
   // FunctionDispatcher for guest function dispatch and interrupt execution
   runtime::FunctionDispatcher* function_dispatcher() const { return function_dispatcher_.get(); }
@@ -264,6 +268,7 @@ class Runtime {
   std::unique_ptr<system::IInputSystem> input_system_;
   std::unique_ptr<runtime::ExportResolver> export_resolver_;
   std::unique_ptr<system::ModRegistry> mod_registry_;
+  std::unique_ptr<system::ModConflictTracker> mod_conflict_tracker_;
 
   static Runtime* instance_;
 };

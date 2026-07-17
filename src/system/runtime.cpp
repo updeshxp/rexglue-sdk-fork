@@ -154,6 +154,8 @@ X_STATUS Runtime::Setup(RuntimeConfig config) {
     return module && module->is_patched();
   });
 
+  mod_conflict_tracker_ = std::make_unique<system::ModConflictTracker>();
+
   // Initialize input from injected config
   if (config.input_factory) {
     input_system_ = config.input_factory(tool_mode_);

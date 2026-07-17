@@ -11,6 +11,9 @@
 #include <rex/ui/keybinds.h>
 #include <rex/cvar.h>
 #include <rex/input/input.h>
+#include <rex/logging.h>
+#include <rex/runtime.h>
+#include <rex/system/mod_attribution.h>
 #include <mutex>
 #include <string>
 #include <deque>
@@ -200,12 +203,57 @@ std::string GamepadButtonToString(uint16_t button) {
 
 struct BindEntry {
   std::string name;
-  std::string current_key;
+  std::string description;
+  std::string owner;          // mod folder name, or empty for the base app
+  std::string requested_key;  // what was asked for, before any reassignment
+  std::string current_key;    // effective key; backs the CVAR
+  bool conflicted = false;    // requested_key was taken, no free key found
   std::function<void()> callback;
 };
 
 static std::mutex g_binds_mutex;
 static std::deque<BindEntry> g_binds;
+
+// F-keys not claimed by the base app's own binds (F1 mod manager, F2 shader
+// debugger, F3 debug overlay, F4 settings). F7 (achievements) is included:
+// NocturneRecomp's achievements_menu.cpp clears "bind_achievements" to "" at
+// runtime (that overlay is driven by in-game actions, not a direct keypress),
+// so F7's effective key is empty and it never appears "taken" below -- no
+// special-casing needed here, just don't skip F7 in the pool. F13-F24 are
+// overflow for hosts with extended function-key hardware.
+static const char* const kCandidateKeyPool[] = {
+    "F5",  "F6",  "F7",  "F8",  "F9",  "F10", "F11", "F12", "F13", "F14",
+    "F15", "F16", "F17", "F18", "F19", "F20", "F21", "F22", "F23", "F24",
+};
+
+// True if some other *active* bind's effective key is already `key`. Must be
+// called with g_binds_mutex held.
+bool IsKeyTakenLocked(std::string_view key, const BindEntry* excluding) {
+  if (key.empty()) {
+    return false;
+  }
+  for (auto& entry : g_binds) {
+    if (&entry == excluding || !entry.callback) {
+      continue;
+    }
+    if (entry.current_key == key) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Finds a key from the candidate pool not currently held by any active bind.
+// Returns empty if the whole pool is exhausted. Must be called with
+// g_binds_mutex held.
+std::string FindFreeKeyLocked() {
+  for (const char* candidate : kCandidateKeyPool) {
+    if (!IsKeyTakenLocked(candidate, nullptr)) {
+      return candidate;
+    }
+  }
+  return {};
+}
 
 void RegisterBind(std::string_view name, std::string_view default_key, std::string_view description,
                   std::function<void()> callback) {
@@ -214,6 +262,9 @@ void RegisterBind(std::string_view name, std::string_view default_key, std::stri
   /* Store the bind entry (owns the key string that the CVAR references). */
   auto& entry = g_binds.emplace_back();
   entry.name = std::string(name);
+  entry.description = std::string(description);
+  entry.owner = std::string(rex::system::CurrentActiveMod());
+  entry.requested_key = std::string(default_key);
   entry.current_key = std::string(default_key);
   entry.callback = std::move(callback);
 
@@ -235,6 +286,38 @@ void RegisterBind(std::string_view name, std::string_view default_key, std::stri
       .lifecycle = rex::cvar::Lifecycle::kHotReload,
       .default_value = std::string(default_key),
   });
+
+  // If the user already has a persisted/explicit value for this bind's CVAR
+  // (applied synchronously by RegisterFlag from its pending-values table),
+  // honor it verbatim -- never auto-move a key the user picked themselves.
+  const rex::cvar::FlagEntry* info = rex::cvar::GetFlagInfo(name);
+  if (info && info->persist_to_config) {
+    return;
+  }
+
+  // Otherwise, if the requested default collides with another active bind's
+  // effective key, move this one to a free key instead of silently shadowing
+  // (or being shadowed by) the other bind.
+  if (IsKeyTakenLocked(entry.current_key, &entry)) {
+    std::string requested = entry.current_key;
+    std::string free_key = FindFreeKeyLocked();
+    if (!free_key.empty()) {
+      entry.current_key = free_key;
+      *key_ptr = free_key;
+      REXLOG_WARN("Keybind '{}' (mod '{}') wanted '{}', already in use -- moved to '{}'",
+                  entry.name, entry.owner.empty() ? "<base>" : entry.owner, requested, free_key);
+    } else {
+      entry.conflicted = true;
+      REXLOG_WARN(
+          "Keybind '{}' (mod '{}') wanted '{}', already in use, and no free key was available",
+          entry.name, entry.owner.empty() ? "<base>" : entry.owner, requested);
+    }
+    if (auto* runtime = rex::Runtime::instance()) {
+      if (auto* tracker = runtime->mod_conflict_tracker()) {
+        tracker->RecordKeybindReassignment(entry.owner, entry.name, requested, entry.current_key);
+      }
+    }
+  }
 }
 
 void UnregisterBind(std::string_view name) {
@@ -260,6 +343,57 @@ bool ProcessKeyEvent(KeyEvent& e) {
     }
   }
   return false;
+}
+
+std::vector<BindView> SnapshotBinds() {
+  std::lock_guard lock(g_binds_mutex);
+  std::vector<BindView> result;
+  result.reserve(g_binds.size());
+  for (auto& entry : g_binds) {
+    result.push_back(BindView{
+        .name = entry.name,
+        .description = entry.description,
+        .owner = entry.owner,
+        .requested_key = entry.requested_key,
+        .effective_key = entry.current_key,
+        .active = static_cast<bool>(entry.callback),
+        .conflicted = entry.conflicted,
+    });
+  }
+  return result;
+}
+
+bool SetBindKey(std::string_view name, std::string_view key) {
+  // Accept either a keyboard key or a gamepad button name -- gamepad-bound
+  // effective keys aren't dispatched by ProcessKeyEvent yet (that's the
+  // future fully-gamepad-navigable overlay work), but the rebind UI and this
+  // storage format need to represent one today rather than being retrofitted
+  // later.
+  if (ParseVirtualKey(key) == VirtualKey::kNone && ParseGamepadButton(key) == 0) {
+    return false;
+  }
+
+  bool found = false;
+  {
+    std::lock_guard lock(g_binds_mutex);
+    for (auto& entry : g_binds) {
+      if (entry.name != name) {
+        continue;
+      }
+      entry.current_key = std::string(key);
+      entry.conflicted = false;
+      found = true;
+      break;
+    }
+  }
+  if (!found) {
+    return false;
+  }
+  // Outside the lock: the CVAR setter (see RegisterBind above) only touches
+  // the entry's own current_key string, but SetFlagByName may invoke
+  // registered change callbacks that could re-enter the bind registry.
+  rex::cvar::SetFlagByName(name, key, /*persist=*/true);
+  return true;
 }
 
 }  // namespace rex::ui

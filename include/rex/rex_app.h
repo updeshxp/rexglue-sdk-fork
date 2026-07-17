@@ -345,6 +345,12 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
   // std::filesystem::path (native-encoded, wchar_t on Windows).
   std::vector<std::string> mod_root_strs_;
   std::vector<std::unique_ptr<system::IModPlugin>> mod_plugins_;
+  // Parallel to mod_plugins_ (not mod_infos_: asset-only mods are skipped
+  // when building mod_plugins_, so the indices don't otherwise line up).
+  // Used to attribute each lifecycle call via ScopedActiveMod -- see
+  // mod_attribution.h -- for keybind auto-reassignment and cvar-override
+  // conflict detection.
+  std::vector<std::string> mod_plugin_owners_;
 };
 
 }  // namespace rex

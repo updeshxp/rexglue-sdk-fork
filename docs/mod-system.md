@@ -242,21 +242,34 @@ A few things worth knowing:
   replacement -- there's no way to override just one caller's view of a
   function.
 
-## `platform` strings (code mods only)
+## `platform` strings and per-platform `code/` subdirectories (code mods only)
 
 The SDK's own `ModInfo`/`ParseModInfo` does not read or enforce a `platform`
 key; it is a convention for a downstream project's *own* mod-build tooling,
-worth following if that tooling ships prebuilt per-target binaries (a
-`code/<stem>.dll` and a `code/<stem>.so` for the same mod folder, built from
-the same source against each target's SDK).
+worth following if that tooling ships prebuilt per-target binaries.
 
 The convention: a `platform` key in a code mod's `mod.toml`, holding a
-comma-separated list of target identifiers (e.g. `"windows-x64,linux-x64"`)
-recording which platform(s) that mod's `code/` directory currently ships a
-binary for. It is written by the build tooling after a build, not by the mod
-author, and reflects what's actually on disk right now, not a request or a
-restriction to build for that platform.
+comma-separated list of target identifiers (e.g.
+`"windows-x64,linux-x64,linux-arm64"`) recording which platform(s) that
+mod's `code/` directory currently ships a binary for. It is written by the
+build tooling after a build, not by the mod author, and reflects what's
+actually on disk right now, not a request or a restriction to build for
+that platform.
+
+`LoadModPlugin` (`src/system/mod_plugin_loader.cpp`) resolves those same
+target identifiers as an optional subdirectory under `code/`: it first looks
+for `code/<platform>/<stem>.dll` (or `lib<stem>.so`), where `<platform>` is
+whichever one of `windows-x64`, `linux-x64`, `linux-arm64` matches the
+running host (`REX_PLATFORM_*`/`REX_ARCH_*` at compile time), and falls back
+to the flat `code/<stem>.dll`/`code/lib<stem>.so` if no matching
+subdirectory exists. This is what lets a single mod folder -- and therefore
+a single distributed archive -- carry binaries for every platform side by
+side: a flat `code/` can hold at most one Linux `.so` (linux-x64 and
+linux-arm64 both build to the same `lib<stem>.so` name and would collide),
+so multi-platform distributions need the subdirectory form for at least the
+two Linux targets. A locally-built, single-platform mod can still use the
+flat layout; both are checked.
 
 Asset-only mods (no `code` key) have nothing to record: they ship no native
-binary, so there is no per-platform artifact to track, and this key doesn't
-apply to them at all.
+binary, so there is no per-platform artifact to track, and none of this
+applies to them at all.
