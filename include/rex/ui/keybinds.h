@@ -80,6 +80,15 @@ std::string GamepadButtonToString(uint16_t button);
  * Creates a string CVAR named @p name in the "Keybinds" category so the
  * binding is visible in the settings overlay and persisted to config.
  *
+ * If @p default_key is already claimed by another active bind and the
+ * caller has no persisted/user-set value for @p name, the bind is
+ * auto-reassigned to the next free key from a small candidate pool (mainly
+ * intended for the F5-F12 range mods conventionally use) instead of
+ * silently shadowing the earlier bind. The reassignment (or, if the pool is
+ * exhausted, the unresolved conflict) is recorded on
+ * Runtime::mod_conflict_tracker() when called from within a mod's
+ * IModPlugin lifecycle call (see mod_attribution.h), and logged.
+ *
  * @param name         CVAR name for this bind (e.g. "bind_console").
  * @param default_key  Default key name (e.g. "Backtick", "F3").
  * @param description  Human-readable description for the settings UI.
@@ -93,6 +102,45 @@ void RegisterBind(std::string_view name, std::string_view default_key, std::stri
  * @param name  The CVAR name used when registering the bind.
  */
 void UnregisterBind(std::string_view name);
+
+/**
+ * Describes one registered bind for display/editing (e.g. by the mod manager
+ * overlay), without exposing the internal registry directly.
+ */
+struct BindView {
+  std::string name;           // CVAR name, e.g. "bind_sample_overlay"
+  std::string description;
+  std::string owner;          // mod folder name that registered this bind, or
+                              // empty if registered by the base app
+  std::string requested_key;  // the key the bind originally asked for
+  std::string effective_key;  // the key actually in effect (== requested_key
+                              // unless auto-reassigned)
+  bool active = false;        // false if UnregisterBind was called
+  bool conflicted = false;    // true if requested_key was taken and no free
+                              // key was available (effective_key left as
+                              // requested_key anyway)
+};
+
+/**
+ * Snapshot of every currently-registered bind, in registration order.
+ * Safe to call from UI code; does not touch the internal bind registry.
+ */
+std::vector<BindView> SnapshotBinds();
+
+/**
+ * Sets a bind's effective key, validating @p key as either a keyboard key
+ * (ParseVirtualKey) or a gamepad button name (ParseGamepadButton) -- the
+ * latter is accepted now so the rebind UI is ready for full gamepad-driven
+ * overlays, even though gamepad-bound keys are not yet dispatched by
+ * ProcessKeyEvent. Persists the change via the bind's backing CVAR
+ * (rex::cvar::SetFlagByName(name, key, /*persist=*\/true)) so it survives
+ * across restarts and is treated as an explicit user choice, not subject to
+ * future auto-reassignment. Clears any recorded conflict for this bind.
+ *
+ * @return false if @p name is not a registered bind or @p key is not a
+ *         recognized key/button name.
+ */
+bool SetBindKey(std::string_view name, std::string_view key);
 
 /**
  * Process a key-down event against all registered binds.

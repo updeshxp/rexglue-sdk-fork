@@ -44,6 +44,20 @@ class ModManagerDialog : public ImGuiDialog {
  private:
   ImmediateTexture* GetIcon(const rex::system::ModInfo& mod);
 
+  // Draws the keybind rows for one mod (join of rex::ui::SnapshotBinds() by
+  // owner) with a click-to-rebind control, and the cvar-activity rows from
+  // Runtime::mod_conflict_tracker(). Built from Selectables/Buttons only --
+  // no hover-only or drag-only affordances -- so it stays usable once the
+  // SDK's overlays are driven entirely by gamepad nav (ImGuiConfigFlags_
+  // NavEnableGamepad); the "listening" rebind capture below already reads
+  // gamepad face-button presses alongside keyboard keys for the same reason.
+  void DrawKeybindsSection(const rex::system::ModInfo& mod);
+  void DrawCvarsSection(const rex::system::ModInfo& mod);
+
+  // While non-empty, names the bind currently "listening" for the next key
+  // or gamepad button press to rebind to (see DrawKeybindsSection/OnDraw).
+  std::string listening_bind_;
+
   ImmediateDrawer* immediate_drawer_ = nullptr;
   rex::Runtime* runtime_ = nullptr;
   std::unordered_map<std::string, std::unique_ptr<ImmediateTexture>> icon_cache_;

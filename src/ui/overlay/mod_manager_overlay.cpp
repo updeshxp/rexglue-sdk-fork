@@ -11,21 +11,75 @@
 #include <rex/ui/overlay/mod_manager_overlay.h>
 
 #include <fstream>
+#include <utility>
 #include <vector>
 
 #include <imgui.h>
 
 #include <rex/runtime.h>
+#include <rex/system/mod_conflict_tracker.h>
 #include <rex/ui/image_decode.h>
 #include <rex/ui/immediate_drawer.h>
+#include <rex/ui/keybinds.h>
 
 namespace rex::ui {
 
 namespace {
-constexpr ImVec4 kHeaderText{0.60f, 0.85f, 1.00f, 1.00f};  // accent blue
-constexpr ImVec4 kMutedText{0.60f, 0.62f, 0.66f, 1.00f};   // dim grey
-constexpr ImVec4 kCodeBadge{1.00f, 0.82f, 0.30f, 1.00f};   // gold, matches gamerscore badges
+constexpr ImVec4 kHeaderText{0.60f, 0.85f, 1.00f, 1.00f};     // accent blue
+constexpr ImVec4 kMutedText{0.60f, 0.62f, 0.66f, 1.00f};      // dim grey
+constexpr ImVec4 kCodeBadge{1.00f, 0.82f, 0.30f, 1.00f};      // gold, matches gamerscore badges
+constexpr ImVec4 kConflictBadge{1.00f, 0.55f, 0.35f, 1.00f};  // amber/orange, distinct from gold
 constexpr float kIconSize = 40.0f;
+
+// Gamepad face buttons ImGui already tracks (via io.AddKeyEvent, fed by
+// whatever gamepad backend is active) paired with the button name
+// rex::ui::GamepadButtonNames()/ParseGamepadButton use, so a captured press
+// round-trips through the same string the keyboard path uses. Limited to the
+// four face buttons deliberately: those are the ones free from ImGui's own
+// menu navigation (D-pad/shoulders/sticks drive nav itself), so capturing
+// them here doesn't fight the future fully-gamepad-navigable overlay.
+constexpr std::pair<ImGuiKey, const char*> kCapturableGamepadButtons[] = {
+    {ImGuiKey_GamepadFaceDown, "A"},
+    {ImGuiKey_GamepadFaceRight, "B"},
+    {ImGuiKey_GamepadFaceLeft, "X"},
+    {ImGuiKey_GamepadFaceUp, "Y"},
+};
+
+// Scans for the next keyboard key or gamepad face-button press while a bind
+// is in "listening" mode. Returns the rex::ui key/button name to apply via
+// SetBindKey, or empty if nothing was pressed this frame yet. Escape cancels
+// (returns "\x1b" as a sentinel the caller checks for) without changing the
+// bind.
+constexpr const char* kCancelSentinel = "\x1b";
+
+std::string PollListeningCapture(ImGuiIO& io) {
+  if (ImGui::IsKeyPressed(ImGuiKey_Escape)) {
+    return kCancelSentinel;
+  }
+  for (int key = ImGuiKey_NamedKey_BEGIN; key < ImGuiKey_NamedKey_END; ++key) {
+    ImGuiKey k = static_cast<ImGuiKey>(key);
+    if (k == ImGuiKey_Escape || k == ImGuiKey_MouseLeft || k == ImGuiKey_MouseRight) {
+      continue;
+    }
+    if (!ImGui::IsKeyPressed(k, false)) {
+      continue;
+    }
+    // Translate via ImGui's own key name, skipping keys that don't map to a
+    // rex::ui VirtualKey name -- rebinding is limited to keys the bind system
+    // itself recognizes.
+    const char* imgui_name = ImGui::GetKeyName(k);
+    if (imgui_name && rex::ui::ParseVirtualKey(imgui_name) != rex::ui::VirtualKey::kNone) {
+      return imgui_name;
+    }
+  }
+  for (const auto& [imgui_key, button_name] : kCapturableGamepadButtons) {
+    if (ImGui::IsKeyPressed(imgui_key, false)) {
+      return button_name;
+    }
+  }
+  (void)io;
+  return {};
+}
 
 std::string JoinCommaList(const std::vector<std::string>& names) {
   std::string joined;
@@ -159,6 +213,8 @@ void ModManagerDialog::OnDraw(ImGuiIO& io) {
       if (!mod.description.empty()) {
         ImGui::TextWrapped("%s", mod.description.c_str());
       }
+      DrawKeybindsSection(mod);
+      DrawCvarsSection(mod);
       ImGui::EndGroup();
 
       ImGui::Separator();
@@ -170,6 +226,91 @@ void ModManagerDialog::OnDraw(ImGuiIO& io) {
   ImGui::End();
 
   ImGui::PopStyleVar(2);
+}
+
+void ModManagerDialog::DrawKeybindsSection(const rex::system::ModInfo& mod) {
+  auto binds = rex::ui::SnapshotBinds();
+  bool drew_header = false;
+  for (const auto& bind : binds) {
+    if (bind.owner != mod.folder_name || !bind.active) {
+      continue;
+    }
+    if (!drew_header) {
+      ImGui::TextColored(kMutedText, "Keybinds:");
+      drew_header = true;
+    }
+
+    ImGui::PushID(bind.name.c_str());
+    ImGui::Text("%s", bind.description.empty() ? bind.name.c_str() : bind.description.c_str());
+    ImGui::SameLine();
+
+    bool listening = listening_bind_ == bind.name;
+    std::string label = listening ? "...(press a key)..." : bind.effective_key;
+    if (label.empty()) {
+      label = "(unbound)";
+    }
+    if (ImGui::Button(label.c_str())) {
+      listening_bind_ = listening ? std::string{} : bind.name;
+    }
+    if (bind.conflicted) {
+      ImGui::SameLine();
+      ImGui::TextColored(kConflictBadge, "[unresolved conflict]");
+      if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Wanted '%s'; no free key was available.", bind.requested_key.c_str());
+      }
+    } else if (bind.effective_key != bind.requested_key) {
+      ImGui::SameLine();
+      ImGui::TextColored(kConflictBadge, "[moved]");
+      if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Wanted '%s', already in use by another mod.",
+                          bind.requested_key.c_str());
+      }
+    }
+
+    if (listening) {
+      ImGuiIO& io = ImGui::GetIO();
+      std::string captured = PollListeningCapture(io);
+      if (captured == kCancelSentinel) {
+        listening_bind_.clear();
+      } else if (!captured.empty()) {
+        rex::ui::SetBindKey(bind.name, captured);
+        listening_bind_.clear();
+      }
+    }
+    ImGui::PopID();
+  }
+}
+
+void ModManagerDialog::DrawCvarsSection(const rex::system::ModInfo& mod) {
+  auto* tracker = runtime_ ? runtime_->mod_conflict_tracker() : nullptr;
+  if (!tracker) {
+    return;
+  }
+  auto activity = tracker->CvarActivityFor(mod.folder_name);
+  if (activity.empty()) {
+    return;
+  }
+  auto divergent = tracker->DivergentOverrides();
+
+  ImGui::TextColored(kMutedText, "Cvars:");
+  for (const auto& entry : activity) {
+    ImGui::PushID(entry.name.c_str());
+    if (entry.is_new_definition) {
+      ImGui::TextColored(kMutedText, "defines %s", entry.name.c_str());
+    } else {
+      ImGui::TextColored(kMutedText, "sets %s: %s -> %s", entry.name.c_str(),
+                         entry.old_value.c_str(), entry.new_value.c_str());
+    }
+    auto it = divergent.find(entry.name);
+    if (it != divergent.end()) {
+      ImGui::SameLine();
+      ImGui::TextColored(kConflictBadge, "[conflict]");
+      if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Also set by: %s", JoinCommaList(it->second).c_str());
+      }
+    }
+    ImGui::PopID();
+  }
 }
 
 }  // namespace rex::ui

@@ -37,6 +37,8 @@
 #include <rex/system.h>
 #include <rex/system/achievement_manager.h>
 #include <rex/system/gpu_plugin.h>
+#include <rex/system/mod_attribution.h>
+#include <rex/system/mod_conflict_tracker.h>
 #include <rex/system/mod_plugin.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/xthread.h>
@@ -50,6 +52,7 @@
 #include <algorithm>
 #include <filesystem>
 #include <string_view>
+#include <unordered_map>
 
 REXCVAR_DEFINE_STRING(gpu_plugin, "", "GPU",
                       "GPU emulation plugin to load at startup (e.g. 'xenos'); empty disables "
@@ -61,6 +64,53 @@ REXCVAR_DEFINE_STRING(gpu_backend, "any", "GPU", "Graphics backend: 'any', 'd3d1
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 namespace rex {
+
+namespace detail {
+
+// Snapshot-diff helpers for cvar-override conflict detection (see
+// mod_conflict_tracker.h). Deliberately doesn't touch the cvar core: takes a
+// before/after read of every non-command cvar's current value around a mod's
+// lifecycle call and records what changed, attributing it to that mod. This
+// only covers changes made synchronously during OnCreateDialogs/
+// OnModuleLaunched -- a mod that changes a cvar later (e.g. from a tick
+// callback or its own UI) isn't attributed here.
+std::unordered_map<std::string, std::string> SnapshotCvarValues() {
+  std::unordered_map<std::string, std::string> snapshot;
+  for (auto& entry : rex::cvar::GetRegistry()) {
+    if (entry.type == rex::cvar::FlagType::Command || !entry.getter) {
+      continue;
+    }
+    snapshot.emplace(entry.name, entry.getter());
+  }
+  return snapshot;
+}
+
+void RecordCvarDiff(rex::Runtime* runtime, const std::string& mod_name,
+                    const std::unordered_map<std::string, std::string>& before) {
+  auto* tracker = runtime ? runtime->mod_conflict_tracker() : nullptr;
+  if (!tracker) {
+    return;
+  }
+  for (auto& entry : rex::cvar::GetRegistry()) {
+    if (entry.type == rex::cvar::FlagType::Command || !entry.getter) {
+      continue;
+    }
+    std::string new_value = entry.getter();
+    auto it = before.find(entry.name);
+    if (it == before.end()) {
+      // A cvar registered by this mod during its own lifecycle call.
+      tracker->RecordCvarActivity(
+          mod_name, {.name = entry.name, .is_new_definition = true, .new_value = new_value});
+    } else if (it->second != new_value) {
+      tracker->RecordCvarActivity(mod_name, {.name = entry.name,
+                                             .is_new_definition = false,
+                                             .old_value = it->second,
+                                             .new_value = new_value});
+    }
+  }
+}
+
+}  // namespace detail
 
 // --- ReXApp ---
 
@@ -340,12 +390,17 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
       ctx.mod_name = mod.folder_name.c_str();
       if (auto plugin = rex::system::LoadModPlugin(mod.mod_root, mod.folder_name, mod.code, ctx)) {
         mod_plugins_.push_back(std::move(plugin));
+        mod_plugin_owners_.push_back(mod.folder_name);
       }
     }
   }
   if (imgui_drawer_) {
-    for (auto& plugin : mod_plugins_) {
-      plugin->OnCreateDialogs(imgui_drawer_.get());
+    for (size_t i = 0; i < mod_plugins_.size(); ++i) {
+      const std::string& owner = mod_plugin_owners_[i];
+      rex::system::ScopedActiveMod active_mod(owner);
+      auto cvars_before = detail::SnapshotCvarValues();
+      mod_plugins_[i]->OnCreateDialogs(imgui_drawer_.get());
+      detail::RecordCvarDiff(runtime_.get(), owner, cvars_before);
     }
   }
 
@@ -702,8 +757,12 @@ void ReXApp::LaunchModule() {
     // KernelState/apps are fully live now; notify mod plugins before the
     // project's own OnPostLaunchModule so a mod's own memory/app scans (e.g.
     // ScanFilesystem) are ready by the time the guest starts running.
-    for (auto& plugin : mod_plugins_) {
-      plugin->OnModuleLaunched();
+    for (size_t i = 0; i < mod_plugins_.size(); ++i) {
+      const std::string& owner = mod_plugin_owners_[i];
+      rex::system::ScopedActiveMod active_mod(owner);
+      auto cvars_before = detail::SnapshotCvarValues();
+      mod_plugins_[i]->OnModuleLaunched();
+      detail::RecordCvarDiff(runtime_.get(), owner, cvars_before);
     }
 
     OnPostLaunchModule(main_thread.get());
