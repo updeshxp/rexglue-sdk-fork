@@ -209,6 +209,9 @@ struct BindEntry {
   std::string current_key;    // effective key; backs the CVAR
   bool conflicted = false;    // requested_key was taken, no free key found
   std::function<void()> callback;
+  std::function<bool()> is_visible;
+  std::string window_title;       // optional ImGui window title, see keybinds.h
+  bool gamepad_was_down = false;  // edge-detection state for PollGamepadBinds
 };
 
 static std::mutex g_binds_mutex;
@@ -256,7 +259,8 @@ std::string FindFreeKeyLocked() {
 }
 
 void RegisterBind(std::string_view name, std::string_view default_key, std::string_view description,
-                  std::function<void()> callback) {
+                  std::function<void()> callback, std::function<bool()> is_visible,
+                  std::string_view window_title) {
   std::lock_guard lock(g_binds_mutex);
 
   /* Store the bind entry (owns the key string that the CVAR references). */
@@ -267,6 +271,8 @@ void RegisterBind(std::string_view name, std::string_view default_key, std::stri
   entry.requested_key = std::string(default_key);
   entry.current_key = std::string(default_key);
   entry.callback = std::move(callback);
+  entry.is_visible = std::move(is_visible);
+  entry.window_title = std::string(window_title);
 
   /* Capture a pointer to the entry's key string for the CVAR getter/setter.
      The entry is stable because g_binds is never compacted while binds are
@@ -358,6 +364,9 @@ std::vector<BindView> SnapshotBinds() {
         .effective_key = entry.current_key,
         .active = static_cast<bool>(entry.callback),
         .conflicted = entry.conflicted,
+        .has_visibility_state = static_cast<bool>(entry.is_visible),
+        .visible = entry.is_visible ? entry.is_visible() : false,
+        .window_title = entry.window_title,
     });
   }
   return result;
@@ -394,6 +403,44 @@ bool SetBindKey(std::string_view name, std::string_view key) {
   // registered change callbacks that could re-enter the bind registry.
   rex::cvar::SetFlagByName(name, key, /*persist=*/true);
   return true;
+}
+
+bool InvokeBind(std::string_view name) {
+  std::function<void()> callback;
+  {
+    std::lock_guard lock(g_binds_mutex);
+    for (auto& entry : g_binds) {
+      if (entry.name == name && entry.callback) {
+        callback = entry.callback;
+        break;
+      }
+    }
+  }
+  if (!callback) {
+    return false;
+  }
+  callback();
+  return true;
+}
+
+void PollGamepadBinds(const rex::input::X_INPUT_STATE& state) {
+  std::lock_guard lock(g_binds_mutex);
+  for (auto& entry : g_binds) {
+    if (!entry.callback) {
+      continue;
+    }
+    uint16_t mask = ParseGamepadButton(entry.current_key);
+    if (mask == 0) {
+      entry.gamepad_was_down = false;  // key isn't a gamepad button (anymore)
+      continue;
+    }
+    bool down = (state.gamepad.buttons & mask) != 0;
+    if (down && !entry.gamepad_was_down) {
+      REXLOG_DEBUG("Gamepad bind '{}' fired (button '{}')", entry.name, entry.current_key);
+      entry.callback();
+    }
+    entry.gamepad_was_down = down;
+  }
 }
 
 }  // namespace rex::ui

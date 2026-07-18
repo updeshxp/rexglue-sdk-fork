@@ -29,7 +29,9 @@ set(REXUI_OVERLAY_SOURCES
     overlay/debug_overlay.cpp
     overlay/console_overlay.cpp
     overlay/console_commands.cpp
+    overlay/gamepad_ui.cpp
     overlay/mod_manager_overlay.cpp
+    overlay/overlay_menu.cpp
     overlay/settings_overlay.cpp
     overlay/shader_debugger_overlay.cpp
 )
