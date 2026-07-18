@@ -23,6 +23,8 @@
 #include <rex/ui/flags.h>
 #include <rex/ui/window_sdl.h>
 
+REXCVAR_DECLARE(bool, renderdoc_enabled);
+
 namespace rex::ui {
 
 SDLWindowedAppContext::~SDLWindowedAppContext() {
@@ -38,6 +40,17 @@ SDLWindowedAppContext::~SDLWindowedAppContext() {
 }
 
 bool SDLWindowedAppContext::Initialize() {
+#if !REX_PLATFORM_WIN32 && !defined(VK_USE_PLATFORM_WAYLAND_KHR)
+  SDL_SetHint(SDL_HINT_VIDEO_DRIVER, "x11");
+#elif !REX_PLATFORM_WIN32
+  // RenderDoc cannot capture or present on Wayland; when injection is
+  // requested, run through XWayland so the capture actually works.
+  if (REXCVAR_GET(renderdoc_enabled)) {
+    REXLOG_INFO(
+        "renderdoc_enabled: forcing the SDL x11 video driver (RenderDoc has no Wayland support)");
+    SDL_SetHint(SDL_HINT_VIDEO_DRIVER, "x11");
+  }
+#endif
   // Picked before SDL_InitSubSystem, long before a graphics instance can say
   // which surface extensions it has, so the cvar is the escape hatch.
   std::string requested_driver = REXCVAR_GET(video_driver);

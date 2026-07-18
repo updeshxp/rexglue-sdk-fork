@@ -16,7 +16,10 @@
 #include <string>
 #include <vector>
 
+#include <filesystem>
+
 #include <rex/cvar.h>
+#include <rex/filesystem.h>
 #include <rex/logging.h>
 #include <rex/platform.h>
 #include <rex/ui/windowed_app.h>
@@ -44,6 +47,21 @@ int RunWindowedApp(int argc, char** argv) {
   int result;
   {
     rex::ui::SDLWindowedAppContext app_context;
+
+    std::unique_ptr<rex::ui::WindowedApp> app = rex::ui::GetWindowedAppCreator()(app_context);
+
+    // Load the app's config file before the context initializes SDL: cvars
+    // like renderdoc_enabled influence the video driver choice, and the app's
+    // own OnInitialize-time LoadConfig runs only after the context is up.
+    // That later load is idempotent over this one (same file).
+    {
+      std::filesystem::path config_path =
+          rex::filesystem::GetExecutableFolder() / (app->GetName() + ".toml");
+      if (std::filesystem::exists(config_path)) {
+        rex::cvar::LoadConfig(config_path);
+      }
+    }
+
     if (!app_context.Initialize()) {
       return EXIT_FAILURE;
     }
@@ -54,8 +72,6 @@ int RunWindowedApp(int argc, char** argv) {
       return EXIT_FAILURE;
     }
 #endif
-
-    std::unique_ptr<rex::ui::WindowedApp> app = rex::ui::GetWindowedAppCreator()(app_context);
 
     // Match remaining positional args to the app's expected options.
     const auto& option_names = app->GetPositionalOptions();

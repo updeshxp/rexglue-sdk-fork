@@ -9,8 +9,14 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <rex/cvar.h>
 #include <rex/logging.h>
 #include <rex/ui/renderdoc_api.h>
+
+REXCVAR_DEFINE_BOOL(renderdoc_enabled, false, "UI/RenderDoc",
+                    "Load the RenderDoc library from disk even when the app was not launched "
+                    "through RenderDoc, injecting its capture hooks into the process. Note that "
+                    "RenderDoc does not support Wayland presentation.");
 
 namespace rex {
 namespace ui {
@@ -25,10 +31,16 @@ std::unique_ptr<RenderDocAPI> RenderDocAPI::CreateIfConnected() {
 
   pRENDERDOC_GetAPI get_api = nullptr;
 
-  // Try to load the RenderDoc library. If RenderDoc is attached, the library
-  // should already be loaded into the process and this will increment the
-  // reference count. If not attached, the load will fail and we return nullptr.
-  if (!renderdoc_api->library_.Load(platform::lib_names::kRenderDoc)) {
+  // Only attach to RenderDoc if its library is already mapped into the process
+  // (i.e. the app was launched through RenderDoc). A plain Load() would find a
+  // system-wide librenderdoc.so and inject its capture hooks, which breaks
+  // presentation (RenderDoc has no Wayland support, for one). The
+  // renderdoc_enabled cvar opts into that injection deliberately, making
+  // the in-app capture API usable without launching through RenderDoc.
+  bool loaded = REXCVAR_GET(renderdoc_enabled)
+                    ? renderdoc_api->library_.Load(platform::lib_names::kRenderDoc)
+                    : renderdoc_api->library_.LoadIfAlreadyLoaded(platform::lib_names::kRenderDoc);
+  if (!loaded) {
     return nullptr;
   }
   get_api = renderdoc_api->library_.GetSymbol<pRENDERDOC_GetAPI>("RENDERDOC_GetAPI");
