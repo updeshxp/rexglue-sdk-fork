@@ -31,6 +31,10 @@ class DynamicLibrary {
   DynamicLibrary& operator=(DynamicLibrary&& other) noexcept;
 
   bool Load(const std::filesystem::path& path, SymbolResolution mode = SymbolResolution::kLazy);
+  // Succeeds only if the library is already mapped into the process; never
+  // loads it from disk. Maps to RTLD_NOLOAD on POSIX, GetModuleHandleEx on
+  // Windows.
+  bool LoadIfAlreadyLoaded(const std::filesystem::path& path);
   void Close();
   explicit operator bool() const { return handle_ != nullptr; }
 
