@@ -269,10 +269,9 @@ X_RESULT MnkInputDriver::GetDeviceState(DeviceId id, X_INPUT_STATE* out_state) {
     return X_ERROR_DEVICE_NOT_CONNECTED;
   }
 
-  // Mouse look is opt in. Without this gate, keyboard input alone would hide
-  // and lock the cursor, breaking the ImGui overlays.
-  QueueMouseCaptureUpdate(IsEnabled() && REXCVAR_GET(mnk_mouse) && IsMouseLookActive() &&
-                          has_focus_ && is_active());
+  std::lock_guard lock(state_mutex_);
+
+  UpdateMouseCapture();
 
   if (!is_active() || !has_focus_) {
     if (out_state) {
@@ -281,8 +280,6 @@ X_RESULT MnkInputDriver::GetDeviceState(DeviceId id, X_INPUT_STATE* out_state) {
     }
     return X_ERROR_SUCCESS;
   }
-
-  std::lock_guard lock(state_mutex_);
 
   uint16_t buttons = 0;
   if (IsBindPressed(key_down_, REXCVAR_GET(keybind_a)))
@@ -330,32 +327,32 @@ X_RESULT MnkInputDriver::GetDeviceState(DeviceId id, X_INPUT_STATE* out_state) {
   if (IsBindPressed(key_down_, REXCVAR_GET(keybind_lstick_down)))
     ly -= INT16_MAX;
 
-  int32_t rx = 0;
-  int32_t ry = 0;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_rstick_left)))
-    rx -= INT16_MAX;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_rstick_right)))
-    rx += INT16_MAX;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_rstick_up)))
-    ry += INT16_MAX;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_rstick_down)))
-    ry -= INT16_MAX;
-
-  if (REXCVAR_GET(mnk_mouse) && IsMouseLookActive()) {
-    double sensitivity = REXCVAR_GET(mnk_sensitivity);
-    constexpr double kBaseScale = 200.0;
-    rx += static_cast<int32_t>(double(mouse_dx_) * sensitivity * kBaseScale);
-    ry += static_cast<int32_t>(double(-mouse_dy_) * sensitivity * kBaseScale);
-  }
-  // Drained unconditionally: deltas keep accumulating in OnMouseMove while the
-  // mouse is off, and toggling it on would otherwise dump the whole backlog
-  // into one frame as a camera snap.
-  mouse_dx_ = 0.0f;
-  mouse_dy_ = 0.0f;
-
   auto clamp16 = [](int32_t v) -> int16_t {
     return static_cast<int16_t>(std::clamp(v, (int32_t)INT16_MIN, (int32_t)INT16_MAX));
   };
+
+  // Coalesce polls landing within the same frame (see last_drain_time_'s
+  // comment in the header) so the guest and the gamepad-UI overlay's own
+  // per-frame poll don't race to drain mouse_dx_/mouse_dy_ out from under
+  // each other.
+  constexpr auto kDrainCoalesceWindow = std::chrono::milliseconds(4);
+  auto now = std::chrono::steady_clock::now();
+  int16_t rx, ry;
+  if (have_cached_stick_ && (now - last_drain_time_) < kDrainCoalesceWindow) {
+    rx = cached_rx_;
+    ry = cached_ry_;
+  } else {
+    double sensitivity = REXCVAR_GET(mnk_sensitivity);
+    constexpr double kBaseScale = 200.0;
+    rx = clamp16(static_cast<int32_t>(mouse_dx_ * sensitivity * kBaseScale));
+    ry = clamp16(static_cast<int32_t>(-mouse_dy_ * sensitivity * kBaseScale));
+    mouse_dx_ = 0;
+    mouse_dy_ = 0;
+    cached_rx_ = rx;
+    cached_ry_ = ry;
+    have_cached_stick_ = true;
+    last_drain_time_ = now;
+  }
 
   packet_number_++;
 
@@ -366,8 +363,8 @@ X_RESULT MnkInputDriver::GetDeviceState(DeviceId id, X_INPUT_STATE* out_state) {
     out_state->gamepad.right_trigger = rt;
     out_state->gamepad.thumb_lx = clamp16(lx);
     out_state->gamepad.thumb_ly = clamp16(ly);
-    out_state->gamepad.thumb_rx = clamp16(rx);
-    out_state->gamepad.thumb_ry = clamp16(ry);
+    out_state->gamepad.thumb_rx = rx;
+    out_state->gamepad.thumb_ry = ry;
   }
   return X_ERROR_SUCCESS;
 }

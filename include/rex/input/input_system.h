@@ -45,6 +45,16 @@ class InputSystem : public system::IInputSystem {
   // the overlay). Used by the settings overlay's keybind capture.
   void SetForceActive(bool force);
 
+  // When set, the guest-facing XAM input layer (xam_input.cpp) reports a
+  // neutral controller (XamInputGetState) and no keystrokes
+  // (XamInputGetKeystroke(Ex) returns X_ERROR_EMPTY) regardless of what the
+  // physical controller is doing. Does not affect InputSystem::GetState
+  // itself, so host-side UI code (e.g. rex::ui::GamepadUiController, see
+  // gamepad_ui.h) keeps reading the real controller. Used to fully hand the
+  // gamepad to the overlays while in UI mode.
+  void SetGuestInputSuppressed(bool suppressed) { guest_input_suppressed_ = suppressed; }
+  bool IsGuestInputSuppressed() const { return guest_input_suppressed_; }
+
   X_RESULT GetCapabilities(uint32_t user_index, uint32_t flags, X_INPUT_CAPABILITIES* out_caps);
   X_RESULT GetState(uint32_t user_index, X_INPUT_STATE* out_state);
   X_RESULT SetState(uint32_t user_index, X_INPUT_VIBRATION* vibration);
@@ -60,14 +70,7 @@ class InputSystem : public system::IInputSystem {
   rex::ui::Window* window_ = nullptr;
 
   std::vector<std::unique_ptr<InputDriver>> drivers_;
-
-  std::unique_ptr<DeviceAssignment> assignment_;
-  ActiveDeviceTracker active_devices_;
-
-  // Ordered by ordinal. Ordinals are never recycled, so unplugging pad one
-  // does not renumber pad two.
-  std::vector<DeviceInfo> devices_;
-  std::vector<InputDriver*> device_owners_;
+  bool guest_input_suppressed_ = false;
 };
 
 /// Create a default InputSystem with SDL + NOP drivers.

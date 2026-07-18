@@ -14,7 +14,7 @@
 #include <rex/ui/window.h>
 #include <rex/ui/window_listener.h>
 
-#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <mutex>
 #include <queue>
@@ -103,6 +103,18 @@ class MnkInputDriver final : public InputDriver,
   std::atomic<bool> mouse_capture_update_queued_{false};
 
   std::atomic<bool> has_focus_{true};
+
+  // GetState() is polled independently by both the guest (via
+  // XamInputGetState) and the host's own gamepad-UI overlay every render
+  // frame (see GamepadUiController::OnDraw), so a naive "read and zero"
+  // drain of mouse_dx_/mouse_dy_ lets whichever caller happens to poll
+  // first each frame steal the analog stick before the other ever sees it.
+  // Coalesce polls within a few ms into a single drain so every caller in
+  // that window observes the same rx/ry.
+  std::chrono::steady_clock::time_point last_drain_time_{};
+  int16_t cached_rx_ = 0;
+  int16_t cached_ry_ = 0;
+  bool have_cached_stick_ = false;
 
   // Keystroke queue
   std::queue<X_INPUT_KEYSTROKE> keystroke_queue_;

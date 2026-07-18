@@ -9,6 +9,8 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <cstring>
+
 #include <rex/input/input.h>
 #include <rex/input/input_system.h>
 #include <rex/kernel/xam/private.h>
@@ -112,7 +114,21 @@ u32 XamInputGetState_entry(u32 user_index, u32 flags, ppc_ptr_t<X_INPUT_STATE> i
   }
 
   auto* is = input_system();
-  return is->GetState(actual_user_index, input_state);
+  auto result = is->GetState(actual_user_index, input_state);
+  if (input_state) {
+    // The guest never sees the guide button -- it's reserved for the SDK's
+    // own gameplay/UI mode toggle (see gamepad_ui.h), regardless of whether
+    // guide passthrough is enabled for the host-side read.
+    input_state->gamepad.buttons =
+        static_cast<uint16_t>(input_state->gamepad.buttons) & ~rex::input::X_INPUT_GAMEPAD_GUIDE;
+    // While UI mode owns the gamepad (see InputSystem::SetGuestInputSuppressed),
+    // report a fully neutral controller so the guest's own menus can't react
+    // to the same buttons the overlays are consuming.
+    if (is->IsGuestInputSuppressed()) {
+      std::memset(&input_state->gamepad, 0, sizeof(input_state->gamepad));
+    }
+  }
+  return result;
 }
 
 // https://msdn.microsoft.com/en-us/library/windows/desktop/microsoft.directx_sdk.reference.xinputsetstate(v=vs.85).aspx
@@ -154,6 +170,11 @@ u32 XamInputGetKeystroke_entry(u32 user_index, u32 flags, ppc_ptr_t<X_INPUT_KEYS
   }
 
   auto* is = input_system();
+  if (is->IsGuestInputSuppressed()) {
+    // UI mode owns the gamepad; report no keystroke so the guest's own menu
+    // navigation can't act on the same buttons the overlays are consuming.
+    return X_ERROR_EMPTY;
+  }
   return is->GetKeystroke(actual_user_index, flags, keystroke);
 }
 
@@ -176,6 +197,10 @@ u32 XamInputGetKeystrokeEx_entry(mapped_u32 user_index_ptr, u32 flags,
   }
 
   auto* is = input_system();
+  if (is->IsGuestInputSuppressed()) {
+    // See XamInputGetKeystroke_entry above.
+    return X_ERROR_EMPTY;
+  }
   auto result = is->GetKeystroke(user_index, flags, keystroke);
   if (XSUCCEEDED(result)) {
     *user_index_ptr = keystroke->user_index;

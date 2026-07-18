@@ -36,6 +36,10 @@
 #include <string_view>
 #include <vector>
 
+namespace rex::input {
+struct X_INPUT_STATE;
+}  // namespace rex::input
+
 namespace rex::ui {
 
 /**
@@ -93,9 +97,21 @@ std::string GamepadButtonToString(uint16_t button);
  * @param default_key  Default key name (e.g. "Backtick", "F3").
  * @param description  Human-readable description for the settings UI.
  * @param callback     Function to invoke when the bound key is pressed.
+ * @param is_visible   Optional: returns whether the thing this bind toggles
+ *                     (typically an overlay) is currently shown. Powers the
+ *                     overlay menu (see overlay_menu.h) and the mod manager's
+ *                     per-mod keybind list; omit if the bind doesn't toggle
+ *                     visible state, or the state isn't cheaply queryable.
+ * @param window_title Optional: the ImGui window title (the string passed to
+ *                     ImGui::Begin, including any "##id" suffix) this bind's
+ *                     overlay draws into. Lets gamepad UI navigation (see
+ *                     gamepad_ui.h) focus/move/resize/close the right window
+ *                     when this bind's overlay becomes the "active" one; omit
+ *                     if the bind doesn't toggle a single-window overlay.
  */
 void RegisterBind(std::string_view name, std::string_view default_key, std::string_view description,
-                  std::function<void()> callback);
+                  std::function<void()> callback, std::function<bool()> is_visible = {},
+                  std::string_view window_title = {});
 
 /**
  * Remove a previously registered keybind.
@@ -108,17 +124,23 @@ void UnregisterBind(std::string_view name);
  * overlay), without exposing the internal registry directly.
  */
 struct BindView {
-  std::string name;           // CVAR name, e.g. "bind_sample_overlay"
+  std::string name;  // CVAR name, e.g. "bind_sample_overlay"
   std::string description;
-  std::string owner;          // mod folder name that registered this bind, or
-                              // empty if registered by the base app
-  std::string requested_key;  // the key the bind originally asked for
-  std::string effective_key;  // the key actually in effect (== requested_key
-                              // unless auto-reassigned)
-  bool active = false;        // false if UnregisterBind was called
-  bool conflicted = false;    // true if requested_key was taken and no free
-                              // key was available (effective_key left as
-                              // requested_key anyway)
+  std::string owner;                  // mod folder name that registered this bind, or
+                                      // empty if registered by the base app
+  std::string requested_key;          // the key the bind originally asked for
+  std::string effective_key;          // the key actually in effect (== requested_key
+                                      // unless auto-reassigned)
+  bool active = false;                // false if UnregisterBind was called
+  bool conflicted = false;            // true if requested_key was taken and no free
+                                      // key was available (effective_key left as
+                                      // requested_key anyway)
+  bool has_visibility_state = false;  // true if an is_visible getter was
+                                      // supplied to RegisterBind
+  bool visible = false;               // only meaningful if has_visibility_state
+  std::string window_title;           // the ImGui window title supplied via
+                                      // RegisterBind's window_title param, or
+                                      // empty if none was given
 };
 
 /**
@@ -129,10 +151,9 @@ std::vector<BindView> SnapshotBinds();
 
 /**
  * Sets a bind's effective key, validating @p key as either a keyboard key
- * (ParseVirtualKey) or a gamepad button name (ParseGamepadButton) -- the
- * latter is accepted now so the rebind UI is ready for full gamepad-driven
- * overlays, even though gamepad-bound keys are not yet dispatched by
- * ProcessKeyEvent. Persists the change via the bind's backing CVAR
+ * (ParseVirtualKey, dispatched by ProcessKeyEvent) or a gamepad button name
+ * (ParseGamepadButton, dispatched by PollGamepadBinds). Persists the change
+ * via the bind's backing CVAR
  * (rex::cvar::SetFlagByName(name, key, /*persist=*\/true)) so it survives
  * across restarts and is treated as an explicit user choice, not subject to
  * future auto-reassignment. Clears any recorded conflict for this bind.
@@ -141,6 +162,15 @@ std::vector<BindView> SnapshotBinds();
  *         recognized key/button name.
  */
 bool SetBindKey(std::string_view name, std::string_view key);
+
+/**
+ * Invokes a registered bind's callback directly, bypassing key/gamepad
+ * dispatch -- used by UI that lets a user select a bind by name (e.g. the
+ * overlay menu, see overlay_menu.h) rather than by pressing its key.
+ *
+ * @return false if @p name is not a registered, active bind.
+ */
+bool InvokeBind(std::string_view name);
 
 /**
  * Process a key-down event against all registered binds.
@@ -153,5 +183,18 @@ bool SetBindKey(std::string_view name, std::string_view key);
  * @return   True if a bind matched and the event was consumed.
  */
 bool ProcessKeyEvent(KeyEvent& e);
+
+/**
+ * Edge-triggers any active bind whose effective key is a gamepad button name
+ * (ParseGamepadButton(effective_key) != 0) against the given controller
+ * state, firing its callback once per press (not held). XInput has no
+ * button-event callback, so this must be polled once per UI frame with the
+ * latest state (mirrors the pattern NocturneRecomp's fast_forward.cpp/
+ * achievements_menu.cpp already use for controller-held buttons) -- see
+ * overlay_menu.h's dialog for where the SDK does this polling.
+ *
+ * @param state  Latest controller state (typically player 0).
+ */
+void PollGamepadBinds(const rex::input::X_INPUT_STATE& state);
 
 }  // namespace rex::ui

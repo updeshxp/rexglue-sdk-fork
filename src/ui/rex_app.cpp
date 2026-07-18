@@ -24,8 +24,10 @@
 #include <rex/ui/overlay/achievements_overlay.h>
 #include <rex/ui/overlay/console_overlay.h>
 #include <rex/ui/overlay/debug_overlay.h>
+#include <rex/ui/overlay/gamepad_ui.h>
 #include <rex/ui/overlay/settings_overlay.h>
 #include <rex/ui/overlay/mod_manager_overlay.h>
+#include <rex/ui/overlay/overlay_menu.h>
 #include <rex/ui/overlay/shader_debugger_overlay.h>
 #include <rex/graphics/command_processor.h>
 #include <rex/graphics/graphics_system.h>
@@ -311,10 +313,18 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
     auto* input_sys = static_cast<rex::input::InputSystem*>(runtime_->input_system());
     if (input_sys) {
       input_sys->SetActiveCallback([this]() {
+        bool overlay_menu_open =
+            overlay_menu_ && static_cast<ui::OverlayMenuDialog*>(overlay_menu_.get())->IsVisible();
+        // In UI mode the gamepad_ui_ controller owns the controller entirely
+        // (nav cursor, move/resize, etc.) regardless of mouse position, so
+        // the game must stay gated off even if the mouse never touches an
+        // overlay window.
+        bool ui_mode_active =
+            gamepad_ui_ && static_cast<ui::GamepadUiController*>(gamepad_ui_.get())->IsUiMode();
         if (!debug_overlay_ && !console_overlay_ && !settings_overlay_ && !achievements_overlay_ &&
-            !shader_debugger_overlay_)
+            !shader_debugger_overlay_ && !overlay_menu_open && !ui_mode_active)
           return true;
-        return !imgui_drawer_->GetIO().WantCaptureMouse;
+        return !ui_mode_active && !imgui_drawer_->GetIO().WantCaptureMouse;
       });
     }
   }
@@ -402,6 +412,18 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
       mod_plugins_[i]->OnCreateDialogs(imgui_drawer_.get());
       detail::RecordCvarDiff(runtime_.get(), owner, cvars_before);
     }
+  }
+
+  // Same timing NocturneRecomp's own OnPostSetup relies on for
+  // FastForward/Achievements input binding ("window(), app_context() and the
+  // input system are all live after setup") -- supply the overlay menu's
+  // gamepad poll with an InputSystem* fetched at this point, not earlier
+  // (SetupOverlays constructs the dialog before input_system() is reliably
+  // non-null).
+  if (gamepad_ui_) {
+    auto* input_sys =
+        runtime_ ? static_cast<rex::input::InputSystem*>(runtime_->input_system()) : nullptr;
+    static_cast<ui::GamepadUiController*>(gamepad_ui_.get())->SetInputSystem(input_sys);
   }
 
   OnPostSetup();
@@ -498,189 +520,229 @@ void ReXApp::SetupOverlays(rex::ui::Presenter* presenter, rex::ui::ImmediateDraw
   // gated eager font upload in SetImmediateDrawer is skipped (font uploads
   // lazily on the first Draw instead).
   imgui_drawer_->SetPresenterAndImmediateDrawer(presenter, drawer);
-  rex::ui::RegisterBind("bind_debug_overlay", "F3", "Toggle debug overlay", [this] {
-    if (debug_overlay_) {
-      debug_overlay_.reset();
-    } else {
-      debug_overlay_ =
-          std::make_unique<ui::DebugOverlayDialog>(imgui_drawer_.get(), frame_stats_provider_);
-    }
-  });
-  rex::ui::RegisterBind("bind_console", "Backtick", "Toggle console overlay", [this] {
-    if (console_overlay_) {
-      console_overlay_.reset();
-    } else {
-      console_overlay_ = std::make_unique<ui::ConsoleDialog>(imgui_drawer_.get(), log_sink_);
-    }
-  });
-  rex::ui::RegisterBind("bind_settings", "F4", "Toggle settings overlay", [this] {
-    if (settings_overlay_) {
-      settings_overlay_.reset();
-    } else {
-      auto* input_sys =
-          runtime_ ? static_cast<rex::input::InputSystem*>(runtime_->input_system()) : nullptr;
-      settings_overlay_ =
-          std::make_unique<ui::SettingsDialog>(imgui_drawer_.get(), config_path_, input_sys);
-    }
-  });
-  rex::ui::RegisterBind("bind_mod_manager", "F1", "Toggle mod manager overlay", [this, drawer] {
-    if (mod_manager_overlay_) {
-      mod_manager_overlay_.reset();
-    } else {
-      mod_manager_overlay_ =
-          std::make_unique<ui::ModManagerDialog>(imgui_drawer_.get(), drawer, runtime_.get());
-    }
-  });
-  rex::ui::RegisterBind("bind_achievements", "F7", "Toggle achievements overlay", [this] {
-    if (achievements_overlay_) {
-      achievements_overlay_.reset();
-    } else {
-      achievements_overlay_ = CreateAchievementsOverlay();
-    }
-  });
-  rex::ui::RegisterBind("bind_shader_debugger", "F2", "Toggle shader debugger overlay", [this] {
-    if (shader_debugger_overlay_) {
-      shader_debugger_overlay_.reset();
-    } else {
-      auto snapshot_provider = [this]() {
-        if (shader_debugger_override_.snapshot_provider) {
-          return shader_debugger_override_.snapshot_provider();
-        }
-        std::vector<ui::ShaderDebuggerEntry> out;
-        if (!runtime_)
-          return out;
-        auto* gs = static_cast<rex::graphics::GraphicsSystem*>(runtime_->graphics_system());
-        if (!gs)
-          return out;
-        auto* cp = gs->command_processor();
-        if (!cp)
-          return out;
-        auto snapshot = cp->GetShaderSnapshot();
-        out.reserve(snapshot.size());
-        for (const auto& s : snapshot) {
-          ui::ShaderDebuggerEntry e;
-          e.ucode_hash = s.ucode_hash;
-          e.type = static_cast<uint32_t>(s.type);
-          e.dword_count = s.dword_count;
-          e.disabled = s.disabled;
-          e.active = s.active;
-          e.profile_total_ns = s.profile_total_ns;
-          e.profile_draw_count = s.profile_draw_count;
-          out.push_back(e);
-        }
-        return out;
-      };
-      auto disable_setter = [this](uint64_t hash, bool disabled) {
-        if (shader_debugger_override_.disable_setter) {
-          shader_debugger_override_.disable_setter(hash, disabled);
-          return;
-        }
-        if (!runtime_)
-          return;
-        auto* gs = static_cast<rex::graphics::GraphicsSystem*>(runtime_->graphics_system());
-        if (!gs)
-          return;
-        auto* cp = gs->command_processor();
-        if (!cp)
-          return;
-        // Route through the persistent blacklist so the toggle also applies
-        // to future loads of the same shader, not just the one currently
-        // resident in the cache. Both AddShaderBlacklist and
-        // RemoveShaderBlacklist update already-loaded shaders too.
-        if (disabled) {
-          cp->AddShaderBlacklist(hash);
+  rex::ui::RegisterBind(
+      "bind_debug_overlay", "F3", "Toggle debug overlay",
+      [this] {
+        if (debug_overlay_) {
+          debug_overlay_.reset();
         } else {
-          cp->RemoveShaderBlacklist(hash);
+          debug_overlay_ =
+              std::make_unique<ui::DebugOverlayDialog>(imgui_drawer_.get(), frame_stats_provider_);
         }
-      };
-      auto details_provider = [this](uint64_t hash) {
-        if (shader_debugger_override_.details_provider) {
-          return shader_debugger_override_.details_provider(hash);
+      },
+      [this] { return static_cast<bool>(debug_overlay_); }, "Debug##overlay");
+  rex::ui::RegisterBind(
+      "bind_console", "Backtick", "Toggle console overlay",
+      [this] {
+        if (console_overlay_) {
+          console_overlay_.reset();
+        } else {
+          console_overlay_ = std::make_unique<ui::ConsoleDialog>(imgui_drawer_.get(), log_sink_);
         }
-        ui::ShaderDebuggerDetails out;
-        if (!runtime_)
-          return out;
-        auto* gs = static_cast<rex::graphics::GraphicsSystem*>(runtime_->graphics_system());
-        if (!gs)
-          return out;
-        auto* cp = gs->command_processor();
-        if (!cp)
-          return out;
-        auto details = cp->GetShaderDetails(hash);
-        out.found = details.found;
-        out.info.ucode_hash = details.info.ucode_hash;
-        out.info.type = static_cast<uint32_t>(details.info.type);
-        out.info.dword_count = details.info.dword_count;
-        out.info.disabled = details.info.disabled;
-        out.info.active = details.info.active;
-        out.ucode_disassembly = std::move(details.ucode_disassembly);
-        out.ucode_dwords = std::move(details.ucode_dwords);
-        out.translations.reserve(details.translations.size());
-        for (auto& t : details.translations) {
-          ui::ShaderDebuggerTranslation tt;
-          tt.modification = t.modification;
-          tt.is_translated = t.is_translated;
-          tt.is_valid = t.is_valid;
-          tt.host_disassembly = std::move(t.host_disassembly);
-          tt.translated_binary = std::move(t.translated_binary);
-          out.translations.push_back(std::move(tt));
+      },
+      [this] { return static_cast<bool>(console_overlay_); }, "Console##rex");
+  rex::ui::RegisterBind(
+      "bind_settings", "F4", "Toggle settings overlay",
+      [this] {
+        if (settings_overlay_) {
+          settings_overlay_.reset();
+        } else {
+          auto* input_sys =
+              runtime_ ? static_cast<rex::input::InputSystem*>(runtime_->input_system()) : nullptr;
+          settings_overlay_ =
+              std::make_unique<ui::SettingsDialog>(imgui_drawer_.get(), config_path_, input_sys);
         }
-        return out;
-      };
-      auto binary_replacer = [this](uint64_t hash, uint64_t modification,
-                                    std::vector<uint8_t> binary) {
-        if (shader_debugger_override_.binary_replacer) {
-          return shader_debugger_override_.binary_replacer(hash, modification, std::move(binary));
+      },
+      [this] { return static_cast<bool>(settings_overlay_); }, "Settings##rex");
+  rex::ui::RegisterBind(
+      "bind_mod_manager", "F1", "Toggle mod manager overlay",
+      [this, drawer] {
+        if (mod_manager_overlay_) {
+          mod_manager_overlay_.reset();
+        } else {
+          mod_manager_overlay_ =
+              std::make_unique<ui::ModManagerDialog>(imgui_drawer_.get(), drawer, runtime_.get());
         }
-        if (!runtime_)
-          return false;
-        auto* gs = static_cast<rex::graphics::GraphicsSystem*>(runtime_->graphics_system());
-        if (!gs)
-          return false;
-        auto* cp = gs->command_processor();
-        if (!cp)
-          return false;
-        return cp->ReplaceShaderTranslationBinary(hash, modification, std::move(binary));
-      };
-      auto profiling_toggle = [this](bool enabled) {
-        if (shader_debugger_override_.profiling_toggle) {
-          shader_debugger_override_.profiling_toggle(enabled);
-          return;
+      },
+      [this] { return static_cast<bool>(mod_manager_overlay_); }, "Mods##overlay");
+  rex::ui::RegisterBind(
+      "bind_achievements", "F7", "Toggle achievements overlay",
+      [this] {
+        if (achievements_overlay_) {
+          achievements_overlay_.reset();
+        } else {
+          achievements_overlay_ = CreateAchievementsOverlay();
         }
-        if (!runtime_)
-          return;
-        auto* gs = static_cast<rex::graphics::GraphicsSystem*>(runtime_->graphics_system());
-        if (!gs)
-          return;
-        auto* cp = gs->command_processor();
-        if (!cp)
-          return;
-        cp->SetShaderProfilingEnabled(enabled);
-      };
-      auto profiling_resetter = [this]() {
-        if (shader_debugger_override_.profiling_resetter) {
-          shader_debugger_override_.profiling_resetter();
-          return;
+      },
+      [this] { return static_cast<bool>(achievements_overlay_); }, "Achievements##overlay");
+  overlay_menu_ = std::make_unique<ui::OverlayMenuDialog>(imgui_drawer_.get(), runtime_.get());
+  rex::ui::RegisterBind(
+      "bind_shader_debugger", "F2", "Toggle shader debugger overlay",
+      [this] {
+        if (shader_debugger_overlay_) {
+          shader_debugger_overlay_.reset();
+        } else {
+          auto snapshot_provider = [this]() {
+            if (shader_debugger_override_.snapshot_provider) {
+              return shader_debugger_override_.snapshot_provider();
+            }
+            std::vector<ui::ShaderDebuggerEntry> out;
+            if (!runtime_)
+              return out;
+            auto* gs = static_cast<rex::graphics::GraphicsSystem*>(runtime_->graphics_system());
+            if (!gs)
+              return out;
+            auto* cp = gs->command_processor();
+            if (!cp)
+              return out;
+            auto snapshot = cp->GetShaderSnapshot();
+            out.reserve(snapshot.size());
+            for (const auto& s : snapshot) {
+              ui::ShaderDebuggerEntry e;
+              e.ucode_hash = s.ucode_hash;
+              e.type = static_cast<uint32_t>(s.type);
+              e.dword_count = s.dword_count;
+              e.disabled = s.disabled;
+              e.active = s.active;
+              e.profile_total_ns = s.profile_total_ns;
+              e.profile_draw_count = s.profile_draw_count;
+              out.push_back(e);
+            }
+            return out;
+          };
+          auto disable_setter = [this](uint64_t hash, bool disabled) {
+            if (shader_debugger_override_.disable_setter) {
+              shader_debugger_override_.disable_setter(hash, disabled);
+              return;
+            }
+            if (!runtime_)
+              return;
+            auto* gs = static_cast<rex::graphics::GraphicsSystem*>(runtime_->graphics_system());
+            if (!gs)
+              return;
+            auto* cp = gs->command_processor();
+            if (!cp)
+              return;
+            // Route through the persistent blacklist so the toggle also applies
+            // to future loads of the same shader, not just the one currently
+            // resident in the cache. Both AddShaderBlacklist and
+            // RemoveShaderBlacklist update already-loaded shaders too.
+            if (disabled) {
+              cp->AddShaderBlacklist(hash);
+            } else {
+              cp->RemoveShaderBlacklist(hash);
+            }
+          };
+          auto details_provider = [this](uint64_t hash) {
+            if (shader_debugger_override_.details_provider) {
+              return shader_debugger_override_.details_provider(hash);
+            }
+            ui::ShaderDebuggerDetails out;
+            if (!runtime_)
+              return out;
+            auto* gs = static_cast<rex::graphics::GraphicsSystem*>(runtime_->graphics_system());
+            if (!gs)
+              return out;
+            auto* cp = gs->command_processor();
+            if (!cp)
+              return out;
+            auto details = cp->GetShaderDetails(hash);
+            out.found = details.found;
+            out.info.ucode_hash = details.info.ucode_hash;
+            out.info.type = static_cast<uint32_t>(details.info.type);
+            out.info.dword_count = details.info.dword_count;
+            out.info.disabled = details.info.disabled;
+            out.info.active = details.info.active;
+            out.ucode_disassembly = std::move(details.ucode_disassembly);
+            out.ucode_dwords = std::move(details.ucode_dwords);
+            out.translations.reserve(details.translations.size());
+            for (auto& t : details.translations) {
+              ui::ShaderDebuggerTranslation tt;
+              tt.modification = t.modification;
+              tt.is_translated = t.is_translated;
+              tt.is_valid = t.is_valid;
+              tt.host_disassembly = std::move(t.host_disassembly);
+              tt.translated_binary = std::move(t.translated_binary);
+              out.translations.push_back(std::move(tt));
+            }
+            return out;
+          };
+          auto binary_replacer = [this](uint64_t hash, uint64_t modification,
+                                        std::vector<uint8_t> binary) {
+            if (shader_debugger_override_.binary_replacer) {
+              return shader_debugger_override_.binary_replacer(hash, modification,
+                                                               std::move(binary));
+            }
+            if (!runtime_)
+              return false;
+            auto* gs = static_cast<rex::graphics::GraphicsSystem*>(runtime_->graphics_system());
+            if (!gs)
+              return false;
+            auto* cp = gs->command_processor();
+            if (!cp)
+              return false;
+            return cp->ReplaceShaderTranslationBinary(hash, modification, std::move(binary));
+          };
+          auto profiling_toggle = [this](bool enabled) {
+            if (shader_debugger_override_.profiling_toggle) {
+              shader_debugger_override_.profiling_toggle(enabled);
+              return;
+            }
+            if (!runtime_)
+              return;
+            auto* gs = static_cast<rex::graphics::GraphicsSystem*>(runtime_->graphics_system());
+            if (!gs)
+              return;
+            auto* cp = gs->command_processor();
+            if (!cp)
+              return;
+            cp->SetShaderProfilingEnabled(enabled);
+          };
+          auto profiling_resetter = [this]() {
+            if (shader_debugger_override_.profiling_resetter) {
+              shader_debugger_override_.profiling_resetter();
+              return;
+            }
+            if (!runtime_)
+              return;
+            auto* gs = static_cast<rex::graphics::GraphicsSystem*>(runtime_->graphics_system());
+            if (!gs)
+              return;
+            auto* cp = gs->command_processor();
+            if (!cp)
+              return;
+            cp->ResetShaderProfiling();
+          };
+          const std::filesystem::path shaders_toml_path =
+              runtime_ ? runtime_->ModDumpRoot() / "shaders.toml"
+                       : std::filesystem::path("shaders.toml");
+          shader_debugger_overlay_ = std::make_unique<ui::ShaderDebuggerDialog>(
+              imgui_drawer_.get(), std::move(snapshot_provider), std::move(disable_setter),
+              std::move(details_provider), std::move(binary_replacer), std::move(profiling_toggle),
+              std::move(profiling_resetter), shaders_toml_path);
         }
-        if (!runtime_)
-          return;
-        auto* gs = static_cast<rex::graphics::GraphicsSystem*>(runtime_->graphics_system());
-        if (!gs)
-          return;
-        auto* cp = gs->command_processor();
-        if (!cp)
-          return;
-        cp->ResetShaderProfiling();
-      };
-      const std::filesystem::path shaders_toml_path = runtime_
-                                                          ? runtime_->ModDumpRoot() / "shaders.toml"
-                                                          : std::filesystem::path("shaders.toml");
-      shader_debugger_overlay_ = std::make_unique<ui::ShaderDebuggerDialog>(
-          imgui_drawer_.get(), std::move(snapshot_provider), std::move(disable_setter),
-          std::move(details_provider), std::move(binary_replacer), std::move(profiling_toggle),
-          std::move(profiling_resetter), shaders_toml_path);
-    }
+      },
+      [this] { return static_cast<bool>(shader_debugger_overlay_); }, "Shader Debugger");
+
+  // Gamepad-driven mode controller (Gameplay <-> UI, see gamepad_ui.h).
+  // Constructed alongside overlay_menu_ so it's always live for the whole
+  // app lifetime, same rationale as that dialog: it must exist continuously
+  // to keep polling the guide button / bind_ui_mode regardless of whether
+  // any overlay is currently open.
+  gamepad_ui_ = std::make_unique<ui::GamepadUiController>(imgui_drawer_.get(), runtime_.get());
+  // Lets the overlay menu's own "Y" bind gate itself to UI mode (see
+  // OverlayMenuDialog::SetUiModeQuery) -- wired here, after gamepad_ui_
+  // exists, since overlay_menu_ is constructed earlier above.
+  static_cast<ui::OverlayMenuDialog*>(overlay_menu_.get())->SetUiModeQuery([this] {
+    return static_cast<ui::GamepadUiController*>(gamepad_ui_.get())->IsUiMode();
   });
+  // Lets a newly-opened overlay (selected from the overlay menu) grab
+  // gamepad focus right away -- see OverlayMenuDialog::SetOverlayShownCallback
+  // and GamepadUiController::FocusOverlay.
+  static_cast<ui::OverlayMenuDialog*>(overlay_menu_.get())
+      ->SetOverlayShownCallback([this](const std::string& bind_name) {
+        static_cast<ui::GamepadUiController*>(gamepad_ui_.get())->FocusOverlay(bind_name);
+      });
 
   // Mod code plugins are loaded from ConstructRuntime (not here): Runtime --
   // and therefore EnabledModsInfo()/mod resolution -- doesn't exist until
@@ -886,6 +948,7 @@ void ReXApp::OnDestroy() {
   }
   achievement_notification_.reset();
   achievements_overlay_.reset();
+  overlay_menu_.reset();  // its own destructor unregisters "bind_overlay_menu"
   mod_manager_overlay_.reset();
   settings_overlay_.reset();
   console_overlay_.reset();

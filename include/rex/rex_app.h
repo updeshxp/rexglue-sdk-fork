@@ -339,6 +339,18 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
   // at least as long as ReXApp itself, not just the SetupOverlays call that
   // builds them.
   std::unique_ptr<ui::ImGuiDialog> mod_manager_overlay_;
+  // Gamepad-triggered menu (default Y) listing every overlay -- base app and
+  // mod -- that exposes visibility state via RegisterBind's is_visible
+  // parameter. Always constructed (never toggled itself off via reset like
+  // the others): it must exist continuously for its bind to remain live.
+  // See overlay_menu.h.
+  std::unique_ptr<ui::ImGuiDialog> overlay_menu_;
+  // Two-mode (Gameplay/UI) gamepad controller, toggled by the guide button
+  // (see gamepad_ui.h). Always constructed, for the same reason as
+  // overlay_menu_ above: it must exist continuously to poll guide/
+  // bind_ui_mode and, in Gameplay mode, PollGamepadBinds for every
+  // gamepad-keyed bind (a duty this used to belong to overlay_menu_ alone).
+  std::unique_ptr<ui::ImGuiDialog> gamepad_ui_;
   std::vector<system::ModInfo> mod_infos_;
   // Parallel to mod_infos_: narrow (UTF-8) form of each mod_root, since
   // ModHostContext.mod_root is a const char* but ModInfo::mod_root is a
