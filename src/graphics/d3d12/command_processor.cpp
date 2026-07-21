@@ -274,6 +274,12 @@ bool D3D12CommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffe
     return true;
   };
 
+  // A query is a begin/end pair of EVENT_WRITE_ZPD packets. Only the end packet
+  // has the 0xFFFFFEED marker pre-written into guest memory; the begin packet
+  // does not. The begin and end packets point RB_SAMPLE_COUNT_ADDR at two
+  // *different* adjacent structs (typically one sizeof(xe_gpu_depth_sample_counts)
+  // apart) and the guest computes end.ZPass - begin.ZPass. So the begin and end
+  // addresses legitimately differ and must NOT be required to match.
   bool is_end_via_z_pass =
       sample_counts->ZPass_A == kQueryFinished || sample_counts->ZPass_B == kQueryFinished;
   bool is_end_via_z_fail =
@@ -281,20 +287,31 @@ bool D3D12CommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffe
   bool is_end = is_end_via_z_pass || is_end_via_z_fail;
 
   if (!is_end) {
-    if (active_occlusion_query_.valid &&
-        active_occlusion_query_.sample_count_address != sample_count_addr) {
-      DisableHostOcclusionQueries();
-      return write_fallback_result();
+    // Begin sample. Zero the begin struct so it forms the subtraction baseline
+    // (the host occlusion query measures exactly the begin..end delta, so the
+    // guest's end.ZPass - begin.ZPass yields the host sample count).
+    std::memset(sample_counts, 0, sizeof(xenos::xe_gpu_depth_sample_counts));
+
+    // Discard a still-active query from an unpaired begin without permanently
+    // disabling host queries (BeginGuestOcclusionQuery would otherwise trip the
+    // "another query active" guard and disable the whole path).
+    if (active_occlusion_query_.valid) {
+      uint32_t stale_index = active_occlusion_query_.host_index;
+      active_occlusion_query_ = {};
+      if (occlusion_query_heap_ && BeginSubmission(true)) {
+        deferred_command_list_.D3DEndQuery(occlusion_query_heap_.Get(), D3D12_QUERY_TYPE_OCCLUSION,
+                                           stale_index);
+      }
     }
+
     if (!BeginGuestOcclusionQuery(sample_count_addr)) {
       return write_fallback_result();
     }
     return true;
   }
 
-  if (!active_occlusion_query_.valid ||
-      active_occlusion_query_.sample_count_address != sample_count_addr) {
-    DisableHostOcclusionQueries();
+  // End sample.
+  if (!active_occlusion_query_.valid) {
     return write_fallback_result();
   }
 
