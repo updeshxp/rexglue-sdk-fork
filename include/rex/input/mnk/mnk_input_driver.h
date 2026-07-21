@@ -63,6 +63,11 @@ class MnkInputDriver final : public InputDriver,
   void UpdateMouseCapture();
   void SetKeyState(uint16_t vk, bool down);
   void EnqueueKeystroke(uint16_t vk_pad, bool down);
+  // Decays mouse_dx_/mouse_dy_ toward zero based on time elapsed since the
+  // last decay, then updates last_decay_time_. Called from both OnMouseMove
+  // and GetState's drain so the decay is applied at whatever granularity
+  // either is invoked, rather than jumping in large, timing-dependent steps.
+  void DecayMouseAccumulator();
 
   // Called from the guest thread. The rest of the capture path stays on the UI
   // thread, since every Window call in it reaches SDL.
@@ -79,13 +84,21 @@ class MnkInputDriver final : public InputDriver,
   std::mutex state_mutex_;
   bool key_down_[256] = {};
 
-  // Mouse delta tracking. Fractional because relative motion arrives in
-  // fractions of a pixel, and truncating each event drops slow movement.
-  // Filled on the UI thread, drained on the guest thread, hence the lock.
-  float mouse_dx_ = 0.0f;
-  float mouse_dy_ = 0.0f;
-
-  // UI thread only.
+  // Mouse delta tracking: an exponentially-decaying accumulator (not a
+  // per-poll delta that gets hard-reset to zero) of motion while the mouse is
+  // captured (see MouseEvent::dx/dy, or an absolute-position diff when the
+  // platform can't lock the pointer). A hard reset makes a single mouse-move
+  // event read as full stick deflection for exactly one poll and then snap to
+  // zero the instant no new event has arrived by the next poll -- unlike a
+  // physical stick, which stays deflected for as long as it's held. That
+  // starves any turn-rate ramp/acceleration in the guest's camera code of the
+  // sustained "stick held" input it needs to reach full speed, even though
+  // the instantaneous stick value is already maxed. Decaying instead keeps
+  // the reported stick "held" for a short tail after each flick, closer to
+  // how a gamepad stick behaves.
+  double mouse_dx_ = 0.0;
+  double mouse_dy_ = 0.0;
+  std::chrono::steady_clock::time_point last_decay_time_{};
   int32_t prev_mouse_x_ = 0;
   int32_t prev_mouse_y_ = 0;
   bool mouse_captured_ = false;
