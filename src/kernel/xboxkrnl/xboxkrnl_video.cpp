@@ -78,11 +78,6 @@ float GetConfiguredVideoModeRefreshRate() {
   return float(refresh_rate_hz);
 }
 
-void WarnNoGpuEmulation(const char* export_name, std::atomic<bool>& warned) {
-  if (!warned.exchange(true)) {
-    REXKRNL_WARN("{}: no GPU emulation loaded (gpu_plugin not set); call ignored", export_name);
-  }
-}
 }  // namespace
 
 namespace rex::kernel::xboxkrnl {
@@ -318,8 +313,10 @@ void VdSetGraphicsInterruptCallback_entry(u32 callback, mapped_void user_data) {
   // r4 = user_data (r4 of VdSetGraphicsInterruptCallback)
   auto* graphics_system = REX_KERNEL_STATE()->emulator()->graphics_system();
   if (!graphics_system) {
-    static std::atomic<bool> warned{false};
-    WarnNoGpuEmulation("VdSetGraphicsInterruptCallback", warned);
+    // No GPU plugin loaded: still honor the registration via KernelState's
+    // headless vblank pump, so guest frame-driven logic (audio, input,
+    // timers) keeps progressing even without real GPU emulation.
+    REX_KERNEL_STATE()->SetGraphicsInterruptCallback(callback, user_data.guest_address());
     return;
   }
   graphics_system->SetInterruptCallback(callback, user_data.guest_address());
@@ -331,8 +328,10 @@ void VdInitializeRingBuffer_entry(mapped_void ptr, i32 size_log2) {
   // Buffer pointers are from MmAllocatePhysicalMemory with WRITE_COMBINE.
   auto* graphics_system = REX_KERNEL_STATE()->emulator()->graphics_system();
   if (!graphics_system) {
-    static std::atomic<bool> warned{false};
-    WarnNoGpuEmulation("VdInitializeRingBuffer", warned);
+    // No real ring buffer to initialize; just make sure the GPU register
+    // MMIO range is wired up (see KernelState::HeadlessGpuHooks) and let a
+    // registered consumer know a ring buffer was (re)initialized.
+    REX_KERNEL_STATE()->NotifyHeadlessRingBufferInit(ptr.guest_address(), size_log2);
     return;
   }
   graphics_system->InitializeRingBuffer(ptr.guest_address(), size_log2);
@@ -342,8 +341,10 @@ void VdEnableRingBufferRPtrWriteBack_entry(mapped_void ptr, i32 block_size_log2)
   // r4 = log2(block size), 6, usually --- <=19
   auto* graphics_system = REX_KERNEL_STATE()->emulator()->graphics_system();
   if (!graphics_system) {
-    static std::atomic<bool> warned{false};
-    WarnNoGpuEmulation("VdEnableRingBufferRPtrWriteBack", warned);
+    // No GPU plugin: let a registered consumer (see KernelState::HeadlessGpuHooks)
+    // know the guest wants its ring-buffer read pointer mirrored here.
+    REX_KERNEL_STATE()->NotifyHeadlessRingBufferRPtrWriteBackEnabled(ptr.guest_address(),
+                                                                     block_size_log2);
     return;
   }
   graphics_system->EnableReadPointerWriteBack(ptr.guest_address(), block_size_log2);

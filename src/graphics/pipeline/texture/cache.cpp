@@ -82,9 +82,10 @@ REXCVAR_DEFINE_INT32(resolution_scale, 1, "GPU",
 REXCVAR_DEFINE_BOOL(pre_mask_resolve_l2_block, true, "GPU",
                     "Pre-mask scaled resolve L2 blocks to the write range before iterating");
 
-REXCVAR_DEFINE_BOOL(shader_dump_enabled, false, "GPU/Shader Storage",
-                    "Dump translated shader binaries to disk for mod authoring")
-    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+// shader_dump_enabled is defined in pipeline/shader/translator.cpp (part of
+// the rexgpu-shader-translation library, which needs it too): a single
+// definition site shared by both this plugin and any other consumer that
+// links that library directly.
 
 REXCVAR_DEFINE_BOOL(shader_load_enabled, false, "GPU/Shader Storage",
                     "Load replacement shader binaries from enabled mods when available")

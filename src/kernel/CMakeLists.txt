@@ -68,3 +68,11 @@ list(TRANSFORM REXKERNEL_SOURCES PREPEND "${CMAKE_CURRENT_SOURCE_DIR}/")
 target_sources(rexruntime PRIVATE ${REXKERNEL_SOURCES})
 
 target_link_libraries(rexruntime PRIVATE o1heap rexcore rexfilesystem rexui rexaudio rexinput imgui)
+# rexui is a PRIVATE (object-library) dependency of rexruntime, so its own
+# PUBLIC deps -- notably renderdoc's include dir -- don't propagate through
+# rexruntime's export to consumers that reach into rex/ui/vulkan/* headers
+# directly (rex/ui/renderdoc_api.h includes <renderdoc_app.h>). Re-expose it
+# explicitly so app code (e.g. a custom OnCreateImmediateDrawer) can include
+# those headers without also needing to know about this internal thirdparty
+# dependency.
+target_link_libraries(rexruntime PUBLIC renderdoc)

@@ -23,6 +23,15 @@
 #include <rex/logging.h>
 #include <rex/math.h>
 
+// Defined here (rather than alongside its only other reader,
+// pipeline/texture/cache.cpp) so this file alone is enough to pull the
+// definition into any consumer of the rexgpu-shader-translation library --
+// pipeline/texture/cache.cpp isn't part of that library, and a static
+// library only links in the object files something else already references.
+REXCVAR_DEFINE_BOOL(shader_dump_enabled, false, "GPU/Shader Storage",
+                    "Dump translated shader binaries to disk for mod authoring")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
 namespace rex::graphics {
 
 using namespace ucode;
