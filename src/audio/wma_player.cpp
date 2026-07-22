@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cstring>
 
+#include <rex/audio/ducking.h>
 #include <rex/audio/flags.h>
 #include <rex/logging.h>
 
@@ -368,7 +369,8 @@ void WmaPlayer::OpenSong(size_t index) {
       REXAPU_ERROR("WmaPlayer: SDL_OpenAudioDeviceStream failed: {}", SDL_GetError());
       return;
     }
-    SDL_SetAudioStreamGain(stream_, REXCVAR_GET(audio_mute) ? 0.0f : volume_.load());
+    SDL_SetAudioStreamGain(stream_,
+                           REXCVAR_GET(audio_mute) ? 0.0f : volume_.load() * GetDuckFactor());
     SDL_ResumeAudioStreamDevice(stream_);
   } else {
     SDL_AudioSpec current_input;
@@ -437,13 +439,13 @@ void WmaPlayer::ThreadMain() {
   using namespace std::chrono_literals;
   // Keep roughly this many bytes of decoded audio buffered ahead.
   const int target_queued = 44100 * 2 * static_cast<int>(sizeof(float)) / 2;  // ~0.5s
-  bool was_muted = false;
+  float last_applied_gain = -1.0f;  // unreachable by the formula below, forces the first apply
 
   while (running_.load()) {
-    bool muted = REXCVAR_GET(audio_mute);
-    if (stream_ && muted != was_muted) {
-      SDL_SetAudioStreamGain(stream_, muted ? 0.0f : volume_.load());
-      was_muted = muted;
+    float gain = REXCVAR_GET(audio_mute) ? 0.0f : volume_.load() * GetDuckFactor();
+    if (stream_ && gain != last_applied_gain) {
+      SDL_SetAudioStreamGain(stream_, gain);
+      last_applied_gain = gain;
     }
 
     if (paused_.load()) {
@@ -596,7 +598,7 @@ void WmaPlayer::Resume() {
 void WmaPlayer::SetVolume(float volume) {
   volume_.store(volume);
   if (stream_ && !REXCVAR_GET(audio_mute))
-    SDL_SetAudioStreamGain(stream_, volume);
+    SDL_SetAudioStreamGain(stream_, volume * GetDuckFactor());
 }
 
 }  // namespace rex::audio

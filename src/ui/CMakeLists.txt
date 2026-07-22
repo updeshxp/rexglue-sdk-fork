@@ -2,6 +2,7 @@
 
 # Core UI sources
 set(REXUI_CORE_SOURCES
+    baked_clip_player.cpp
     custom_shader.cpp
     graphics_upload_buffer_pool.cpp
     graphics_util.cpp

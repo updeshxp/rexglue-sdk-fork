@@ -390,6 +390,25 @@ void ImGuiDrawer::SetImmediateDrawer(ImmediateDrawer* new_immediate_drawer) {
   if (immediate_drawer_ && presenter_) {
     SetupFontTexture();
   }
+
+  if (immediate_drawer_ && !immediate_drawer_ready_callbacks_.empty()) {
+    // Moved out first: a callback may itself call OnImmediateDrawerReady
+    // (e.g. re-arming for a future reattach), which must land in a fresh
+    // list rather than the one currently being drained.
+    std::vector<std::function<void()>> callbacks;
+    callbacks.swap(immediate_drawer_ready_callbacks_);
+    for (auto& callback : callbacks) {
+      callback();
+    }
+  }
+}
+
+void ImGuiDrawer::OnImmediateDrawerReady(std::function<void()> callback) {
+  if (immediate_drawer_) {
+    callback();
+    return;
+  }
+  immediate_drawer_ready_callbacks_.push_back(std::move(callback));
 }
 
 void ImGuiDrawer::Draw(UIDrawContext& ui_draw_context) {
