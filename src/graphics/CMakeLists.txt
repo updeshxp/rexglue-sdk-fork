@@ -8,11 +8,7 @@ set(REXGPU_XENOS_SOURCES
     plugin_main.cpp
 
     # Core GPU types
-    flags.cpp
-    register_file.cpp
     registers.cpp
-    pipeline/shader/shader.cpp
-    format/ucode.cpp
     sampler_info.cpp
 
     # GPU system
@@ -24,25 +20,11 @@ set(REXGPU_XENOS_SOURCES
     pipeline/texture/replacement.cpp
     util/draw_extent_estimator.cpp
     util/draw.cpp
-    packet_disassembler.cpp
     primitive_processor.cpp
     pipeline/render_target/cache.cpp
     shared_memory.cpp
     pipeline/texture/cache.cpp
     pipeline/shader/interpreter.cpp
-    pipeline/shader/translator.cpp
-    pipeline/shader/translator_disasm.cpp
-)
-
-# SPIR-V shader translation
-set(REXGPU_XENOS_SPIRV_SOURCES
-    pipeline/shader/spirv_builder.cpp
-    pipeline/shader/spirv.cpp
-    pipeline/shader/spirv_translator.cpp
-    pipeline/shader/spirv_translator_alu.cpp
-    pipeline/shader/spirv_translator_fetch.cpp
-    pipeline/shader/spirv_translator_memexport.cpp
-    pipeline/shader/spirv_translator_rb.cpp
 )
 
 # Vulkan backend
@@ -90,7 +72,7 @@ if(REXGLUE_USE_D3D12)
 endif()
 
 if(REXGLUE_USE_VULKAN)
-    list(APPEND REXGPU_XENOS_SOURCES ${REXGPU_XENOS_SPIRV_SOURCES} ${REXGPU_XENOS_VULKAN_SOURCES})
+    list(APPEND REXGPU_XENOS_SOURCES ${REXGPU_XENOS_VULKAN_SOURCES})
 endif()
 
 if(REXGLUE_USE_D3D12)
@@ -98,6 +80,53 @@ if(REXGLUE_USE_D3D12)
         ${REXGPU_XENOS_DXBC_THIRDPARTY_SOURCES}
         ${REXGPU_XENOS_DXBC_SOURCES}
         ${REXGPU_XENOS_D3D12_SOURCES})
+endif()
+
+if(REXGLUE_USE_VULKAN)
+    # rexgpu-shader-translation: Xenos microcode -> SPIR-V translation, plus
+    # the small set of files it depends on (PM4/register decode, cvar/format
+    # helpers). Split out of rexgpu-xenos into its own static library so it
+    # can be linked directly by a consumer that wants to translate/build
+    # Xenos shaders without loading the full runtime-loaded xenos plugin
+    # (e.g. a from-scratch native renderer) -- previously this required
+    # duplicate-compiling these same files a second time elsewhere.
+    set(REXGPU_SHADER_TRANSLATION_SOURCES
+        flags.cpp
+        register_file.cpp
+        packet_disassembler.cpp
+        format/ucode.cpp
+        pipeline/shader/shader.cpp
+        pipeline/shader/translator.cpp
+        pipeline/shader/translator_disasm.cpp
+        pipeline/shader/spirv_builder.cpp
+        pipeline/shader/spirv.cpp
+        pipeline/shader/spirv_translator.cpp
+        pipeline/shader/spirv_translator_alu.cpp
+        pipeline/shader/spirv_translator_fetch.cpp
+        pipeline/shader/spirv_translator_memexport.cpp
+        pipeline/shader/spirv_translator_rb.cpp
+    )
+
+    add_library(rexgpu-shader-translation STATIC ${REXGPU_SHADER_TRANSLATION_SOURCES})
+    add_library(rex::gpu-shader-translation ALIAS rexgpu-shader-translation)
+
+    set_target_properties(rexgpu-shader-translation PROPERTIES
+        EXPORT_NAME gpu-shader-translation
+        POSITION_INDEPENDENT_CODE ON
+    )
+
+    # PUBLIC: consumers of this library (rexgpu-xenos, or a downstream native
+    # renderer) need rexruntime/rexcore's headers and glslang's SPIRV headers
+    # transitively, since spirv_builder.h/spirv_translator.h include them.
+    target_link_libraries(rexgpu-shader-translation PUBLIC
+        rexruntime
+        glslang::SPIRV
+        glslang
+        MachineIndependent
+        GenericCodeGen
+        OSDependent
+        OGLCompiler
+    )
 endif()
 
 add_library(rexgpu-xenos SHARED ${REXGPU_XENOS_SOURCES})
@@ -147,14 +176,9 @@ target_link_libraries(rexgpu-xenos PRIVATE
 
 if(REXGLUE_USE_VULKAN)
     target_link_libraries(rexgpu-xenos PRIVATE
-        Vulkan::Headers
-        glslang::SPIRV
+        rexgpu-shader-translation
+        volk::volk
         GPUOpen::VulkanMemoryAllocator
-        glslang
-        MachineIndependent
-        GenericCodeGen
-        OSDependent
-        OGLCompiler
     )
 endif()
 

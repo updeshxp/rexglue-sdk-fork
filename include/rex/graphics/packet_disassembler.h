@@ -15,6 +15,10 @@
 #include <rex/graphics/register_file.h>
 #include <rex/memory.h>
 
+namespace rex::memory {
+class Memory;
+}  // namespace rex::memory
+
 namespace rex::graphics {
 
 enum class PacketCategory {
@@ -86,8 +90,14 @@ class PacketDisassembler {
   static bool DisasmPacketType0(const uint8_t* base_ptr, uint32_t packet, PacketInfo* out_info);
   static bool DisasmPacketType1(const uint8_t* base_ptr, uint32_t packet, PacketInfo* out_info);
   static bool DisasmPacketType2(const uint8_t* base_ptr, uint32_t packet, PacketInfo* out_info);
-  static bool DisasmPacketType3(const uint8_t* base_ptr, uint32_t packet, PacketInfo* out_info);
-  static bool DisasmPacket(const uint8_t* base_ptr, PacketInfo* out_info);
+  // `memory`, when non-null, lets PM4_LOAD_ALU_CONSTANT read its constants
+  // for real from guest physical memory instead of emitting placeholder
+  // data (callers that only care about opcode/register-index disassembly,
+  // e.g. the trace viewer, can omit it).
+  static bool DisasmPacketType3(const uint8_t* base_ptr, uint32_t packet, PacketInfo* out_info,
+                                memory::Memory* guest_memory = nullptr);
+  static bool DisasmPacket(const uint8_t* base_ptr, PacketInfo* out_info,
+                           memory::Memory* guest_memory = nullptr);
 };
 
 }  // namespace rex::graphics

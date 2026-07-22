@@ -24,10 +24,14 @@
 #include <rex/stream.h>
 #include <rex/thread/atomic.h>
 #include <rex/string.h>
+#include <rex/chrono/clock.h>
 #include <rex/kernel/xboxkrnl/threading.h>
+#include <rex/kernel/xboxkrnl/video.h>
 #include <rex/system/kernel_module.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/function_dispatcher.h>
+#include <rex/system/xvideo.h>
+#include <rex/thread.h>
 #include <chrono>
 #include <thread>
 
@@ -162,6 +166,13 @@ void KernelState::SetProcessTLSVars(X_KPROCESS* process, uint32_t num_slots, uin
 
 KernelState::~KernelState() {
   app_manager_.reset();
+
+  // Stop the headless vblank thread before touching the object table.
+  if (headless_vblank_thread_) {
+    headless_vblank_thread_running_ = false;
+    headless_vblank_thread_->Wait(0, 0, 0, nullptr);
+    headless_vblank_thread_.reset();
+  }
 
   // Stop the dispatch thread before touching the object table
   if (dispatch_thread_running_) {
@@ -1269,6 +1280,124 @@ void KernelState::EndDPCImpersonation(const DPCImpersonationScope& scope) {
   auto pcr = memory_->TranslateVirtual<X_KPCR*>(static_cast<uint32_t>(ctx->r13.u64));
   pcr->prcb_data.dpc_active = 0;
   pcr->current_irql = scope.previous_irql_;
+}
+
+void KernelState::SetGraphicsInterruptCallback(uint32_t callback, uint32_t user_data) {
+  graphics_interrupt_callback_.store(callback, std::memory_order_release);
+  graphics_interrupt_callback_data_ = user_data;
+  StartHeadlessVblankThreadIfNeeded();
+}
+
+void KernelState::DispatchGraphicsInterruptCallback(uint32_t source, uint32_t cpu) {
+  uint32_t callback = graphics_interrupt_callback_.load(std::memory_order_acquire);
+  if (!callback) {
+    return;
+  }
+
+  auto thread = XThread::GetCurrentThread();
+  assert_not_null(thread);
+
+  if (cpu == 0xFFFFFFFF) {
+    cpu = 2;
+  }
+  thread->SetActiveCpu(static_cast<uint8_t>(cpu));
+
+  uint64_t args[] = {source, graphics_interrupt_callback_data_};
+  function_dispatcher_->ExecuteInterrupt(thread->thread_state(), callback, args,
+                                         rex::countof(args));
+}
+
+void KernelState::SetHeadlessGpuHooks(HeadlessGpuHooks hooks) {
+  headless_gpu_hooks_ = std::move(hooks);
+  InstallHeadlessGpuMmioIfNeeded();
+}
+
+void KernelState::NotifyHeadlessRingBufferInit(uint32_t ptr, uint32_t size_log2) {
+  InstallHeadlessGpuMmioIfNeeded();
+  if (headless_gpu_hooks_.on_ring_buffer_init) {
+    headless_gpu_hooks_.on_ring_buffer_init(ptr, size_log2);
+  }
+}
+
+void KernelState::NotifyHeadlessRingBufferRPtrWriteBackEnabled(uint32_t ptr,
+                                                               uint32_t block_size_log2) {
+  InstallHeadlessGpuMmioIfNeeded();
+  if (headless_gpu_hooks_.on_rptr_writeback_enabled) {
+    headless_gpu_hooks_.on_rptr_writeback_enabled(ptr, block_size_log2);
+  }
+}
+
+void KernelState::InstallHeadlessGpuMmioIfNeeded() {
+  if (headless_gpu_mmio_installed_.exchange(true)) {
+    return;
+  }
+  // Mirrors GraphicsSystem::SetupGuestGpu's MMIO registration (GPU registers
+  // at 0x7FC80000-0x7FCFFFFF), so guest ring-buffer/register accesses still
+  // land somewhere sane when there's no GraphicsSystem to normally own this
+  // range. What happens with those reads/writes is entirely up to whatever
+  // consumer registered via SetHeadlessGpuHooks -- this SDK-level trap does
+  // no register interpretation of its own.
+  memory_->AddVirtualMappedRange(
+      0x7FC80000, 0xFFFF0000, 0x0000FFFF, this,
+      reinterpret_cast<runtime::MMIOReadCallback>(HeadlessReadRegisterThunk),
+      reinterpret_cast<runtime::MMIOWriteCallback>(HeadlessWriteRegisterThunk));
+}
+
+void KernelState::HeadlessWriteRegisterThunk(void* ppc_context, KernelState* kernel_state,
+                                             uint32_t addr, uint32_t value) {
+  if (kernel_state->headless_gpu_hooks_.on_mmio_write) {
+    kernel_state->headless_gpu_hooks_.on_mmio_write(addr, value);
+  }
+}
+
+uint32_t KernelState::HeadlessReadRegisterThunk(void* ppc_context, KernelState* kernel_state,
+                                                uint32_t addr) {
+  if (kernel_state->headless_gpu_hooks_.on_mmio_read) {
+    return kernel_state->headless_gpu_hooks_.on_mmio_read(addr);
+  }
+  return 0;
+}
+
+void KernelState::StartHeadlessVblankThreadIfNeeded() {
+  // Only used when there's no GraphicsSystem (no gpu_plugin loaded) -- with
+  // one loaded, its own "GPU VSync" thread drives this same interrupt off
+  // real presentation timing instead.
+  if (headless_vblank_thread_ || emulator_->graphics_system()) {
+    return;
+  }
+
+  headless_vblank_thread_running_ = true;
+  headless_vblank_thread_ = object_ref<XHostThread>(new XHostThread(this, 128 * 1024, 0, [this]() {
+    X_VIDEO_MODE video_mode;
+    rex::kernel::xboxkrnl::VdQueryVideoMode(&video_mode);
+    double refresh_rate_hz = std::max(1.0, double(float(video_mode.refresh_rate)));
+    uint64_t guest_tick_frequency = chrono::Clock::guest_tick_frequency();
+    uint64_t vsync_interval_ticks =
+        std::max(uint64_t(1), uint64_t(double(guest_tick_frequency) / refresh_rate_hz));
+    uint64_t last_frame_time = chrono::Clock::QueryGuestTickCount();
+    while (headless_vblank_thread_running_) {
+      uint64_t current_time = chrono::Clock::QueryGuestTickCount();
+      // Spiral-of-death cap: if this thread somehow falls many intervals
+      // behind real time, fire at most one vblank and resync rather than
+      // replaying the whole backlog in a tight burst (which the guest
+      // would simulate as one big "skip ahead").
+      constexpr uint64_t kMaxCatchUpTicks = 4;
+      uint64_t missed = (current_time - last_frame_time) / vsync_interval_ticks;
+      if (missed > kMaxCatchUpTicks) {
+        DispatchGraphicsInterruptCallback(0, 2);
+        last_frame_time = current_time;
+      } else {
+        while (current_time - last_frame_time >= vsync_interval_ticks) {
+          DispatchGraphicsInterruptCallback(0, 2);
+          last_frame_time += vsync_interval_ticks;
+        }
+      }
+      rex::thread::Sleep(std::chrono::milliseconds(1));
+    }
+    return 0;
+  }));
+  headless_vblank_thread_->set_name("Headless VBlank");
+  headless_vblank_thread_->Create();
 }
 
 bool KernelState::Save(stream::ByteStream* stream) {

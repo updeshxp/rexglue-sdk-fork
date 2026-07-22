@@ -21,6 +21,19 @@
 #include <rex/graphics/util/draw.h>
 #include <rex/math.h>
 
+namespace rex::graphics::draw_util {
+
+// Defined here (rather than alongside their only other reader,
+// util/draw.cpp) so this file alone is enough to pull the definitions into
+// any consumer of the rexgpu-shader-translation library -- util/draw.cpp
+// isn't part of that library, and a static library only links in the
+// object files something else already references.
+// https://docs.microsoft.com/en-us/windows/win32/api/d3d11/ne-d3d11-d3d11_standard_multisample_quality_levels
+const int8_t kD3D10StandardSamplePositions2x[2][2] = {{4, 4}, {-4, -4}};
+const int8_t kD3D10StandardSamplePositions4x[4][2] = {{-2, -6}, {6, -2}, {-6, 2}, {2, 6}};
+
+}  // namespace rex::graphics::draw_util
+
 namespace rex::graphics {
 
 spv::Id SpirvShaderTranslator::PreClampedFloat32To7e3(SpirvBuilder& builder, spv::Id f32_scalar,

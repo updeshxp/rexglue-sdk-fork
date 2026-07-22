@@ -228,6 +228,35 @@ class KernelState {
   DPCImpersonationScope BeginDPCImpersonation();
   void EndDPCImpersonation(const DPCImpersonationScope& scope);
 
+  // Registers the guest's display interrupt callback (normally set via
+  // VdSetGraphicsInterruptCallback) and, if no GraphicsSystem is loaded
+  // (headless / no gpu_plugin), spins up a host timer thread that dispatches
+  // it at the configured guest refresh rate. This is what keeps the guest's
+  // own frame-driven logic -- audio submission, input polling, timers --
+  // progressing when there's no GPU emulation to generate real vblanks.
+  void SetGraphicsInterruptCallback(uint32_t callback, uint32_t user_data);
+  void DispatchGraphicsInterruptCallback(uint32_t source, uint32_t cpu);
+
+  // Headless GPU MMIO hooks: with no GraphicsSystem loaded, nothing owns the
+  // GPU register range, so VdInitializeRingBuffer/VdEnableRingBufferRPtrWriteBack
+  // would otherwise just warn-and-drop. A consumer implementing its own
+  // headless GPU stand-in (ring-buffer read-pointer mirroring, PM4 decode,
+  // scratch-register emulation, a native renderer, etc.) registers these
+  // hooks once -- before the guest thread starts submitting GPU commands --
+  // to receive the ring-buffer lifecycle notifications and raw MMIO
+  // reads/writes over the GPU register range (0x7FC80000-0x7FCFFFFF). The
+  // SDK does no interpretation of register semantics here: it only installs
+  // the MMIO trap and forwards addr/value verbatim.
+  struct HeadlessGpuHooks {
+    std::function<void(uint32_t ptr, uint32_t size_log2)> on_ring_buffer_init;
+    std::function<void(uint32_t ptr, uint32_t block_size_log2)> on_rptr_writeback_enabled;
+    std::function<void(uint32_t addr, uint32_t value)> on_mmio_write;
+    std::function<uint32_t(uint32_t addr)> on_mmio_read;
+  };
+  void SetHeadlessGpuHooks(HeadlessGpuHooks hooks);
+  void NotifyHeadlessRingBufferInit(uint32_t ptr, uint32_t size_log2);
+  void NotifyHeadlessRingBufferRPtrWriteBackEnabled(uint32_t ptr, uint32_t block_size_log2);
+
   uint32_t AllocateTLS(PPCContext* context);
   void FreeTLS(PPCContext* context, uint32_t slot);
 
@@ -396,6 +425,20 @@ class KernelState {
   std::atomic<bool> dispatch_thread_running_;
   std::atomic<bool> terminating_title_{false};
   object_ref<XHostThread> dispatch_thread_;
+
+  void StartHeadlessVblankThreadIfNeeded();
+  std::atomic<uint32_t> graphics_interrupt_callback_{0};
+  uint32_t graphics_interrupt_callback_data_ = 0;
+  std::atomic<bool> headless_vblank_thread_running_{false};
+  object_ref<XHostThread> headless_vblank_thread_;
+
+  HeadlessGpuHooks headless_gpu_hooks_;
+  std::atomic<bool> headless_gpu_mmio_installed_{false};
+  void InstallHeadlessGpuMmioIfNeeded();
+  static void HeadlessWriteRegisterThunk(void* ppc_context, KernelState* kernel_state,
+                                         uint32_t addr, uint32_t value);
+  static uint32_t HeadlessReadRegisterThunk(void* ppc_context, KernelState* kernel_state,
+                                            uint32_t addr);
   // Must be guarded by the global critical region.
   util::NativeList dpc_list_;
   std::condition_variable_any dispatch_cond_;
