@@ -44,7 +44,9 @@ SDLInputDriver::SDLInputDriver(rex::ui::Window* window, size_t window_z_order)
       controllers_(),
       controllers_mutex_() {}
 
-SDLInputDriver::~SDLInputDriver() {}
+SDLInputDriver::~SDLInputDriver() {
+  StopHidWorker();
+}
 
 X_STATUS SDLInputDriver::Setup() {
   if (!TestSDLVersion()) {
@@ -100,6 +102,7 @@ void SDLInputDriver::OnWindowAvailable(rex::ui::Window* window) {
         return;
       }
       SDL_Gamepad_initialized_ = true;
+      StartHidWorker();
 
       // Load custom controller mappings if available
       if (!REXCVAR_GET(hid_mappings_file).empty()) {
@@ -130,8 +133,14 @@ void SDLInputDriver::OnClosing(rex::ui::UIEvent&) {
       attached_window_->app_context().CallInUIThreadSynchronous(
           [this]() { attached_window_->app_context().ExecutePendingFunctionsFromUIThread(); });
     }
-    for (auto& controller : controllers_) {
-      SDL_CloseGamepad(controller.sdl);
+    // Quiesce the HID worker before closing any gamepads directly here, so an
+    // in-flight rumble/close on the worker thread never races us.
+    StopHidWorker();
+    for (size_t i = 0; i < controllers_.size(); i++) {
+      if (controllers_.at(i).sdl) {
+        SDL_CloseGamepad(controllers_.at(i).sdl);
+        controllers_.at(i) = {};
+      }
     }
     controllers_.clear();
     if (SDL_Gamepad_initialized_) {
@@ -235,20 +244,25 @@ X_RESULT SDLInputDriver::SetDeviceVibration(DeviceId id, X_INPUT_VIBRATION* vibr
 
   QueueControllerUpdate();
 
-  auto guard = DrainAndLock();
+  {
+    auto guard = DrainAndLock();
+    if (!GetControllerState(user_index)) {
+      return X_ERROR_DEVICE_NOT_CONNECTED;
+    }
+  }  // release controllers_mutex_ before touching hid_mutex_.
 
-  auto controller = FindController(id);
-  if (!controller) {
-    return X_ERROR_DEVICE_NOT_CONNECTED;
+  // SDL_RumbleGamepad() can block for a long time on some devices (e.g. a
+  // DualSense over Bluetooth), so the actual call must never happen on the
+  // guest thread. Just hand off the (coalesced) request to the HID worker
+  // and return immediately; rumble is inherently fire-and-forget.
+  {
+    std::lock_guard<std::mutex> lk(hid_mutex_);
+    rumble_pending_.at(user_index) = {vibration->left_motor_speed, vibration->right_motor_speed,
+                                      true};
   }
+  hid_cv_.notify_one();
 
-  // XInput vibration holds until the guest changes it, but SDL rumble expires,
-  // and a zero duration expires on the next SDL_UpdateJoysticks. Arm it for
-  // SDL's maximum instead; each call cancels the previous effect anyway.
-  return SDL_RumbleGamepad(controller->sdl, vibration->left_motor_speed,
-                           vibration->right_motor_speed, kRumbleDurationMs)
-             ? X_ERROR_SUCCESS
-             : X_ERROR_FUNCTION_FAILED;
+  return X_ERROR_SUCCESS;
 }
 
 X_RESULT SDLInputDriver::GetDeviceKeystroke(DeviceId id, uint32_t flags,
@@ -493,28 +507,42 @@ void SDLInputDriver::OnControllerOpenedAsync(SDL_JoystickID instance_id, SDL_Gam
       static_cast<int>(SDL_GetGamepadType(controller)), SDL_GetGamepadVendor(controller),
       SDL_GetGamepadProduct(controller));
 
-  // SDL_GetGamepadPlayerIndex is deliberately ignored: on Windows it reports
-  // the XInput user index the OS assigned, which is unrelated to connection
-  // order and leaves non-XInput pads unnumbered.
-  ControllerState state = {};
-  state.sdl = controller;
-  state.id = AllocateDeviceId();
-  state.state_changed = true;  // XInput starts with packet_number = 1
-  UpdateXCapabilities(state);
-  controllers_.push_back(state);
+    // Let the HID worker know this slot now has a live device it can rumble
+    // / eventually close. Nesting hid_mutex_ inside controllers_mutex_ (which
+    // this function already holds) matches the documented lock order.
+    {
+      std::lock_guard<std::mutex> lk(hid_mutex_);
+      hid_instance_.at(user_id) = SDL_GetJoystickID(SDL_GetGamepadJoystick(controller));
+      rumble_pending_.at(user_id).pending = false;
+    }
 
-  const int ordinal = static_cast<int>(controllers_.size()) - 1;
-  SDL_SetGamepadPlayerIndex(controller, ordinal);
-
-  REXLOG_INFO("SDL OnControllerDeviceAdded: connection order {}, device {}.", ordinal,
-              static_cast<uint64_t>(state.id));
+    REXLOG_INFO("SDL OnControllerDeviceAdded: Added at index {}.", user_id);
+  } else {
+    // No more controllers needed, close it.
+    SDL_CloseGamepad(controller);
+    REXLOG_WARN("SDL OnControllerDeviceAdded: Ignored. No free slots.");
+  }
 }
 
 void SDLInputDriver::OnControllerDeviceRemovedLocked(const SDL_Event& event) {
-  auto idx = GetControllerIndexFromInstanceID(event.gdevice.which);
-  if (!idx) {
-    REXLOG_WARN("SDL OnControllerDeviceRemoved: Ignored. Unknown device.");
-    return;
+  // Find the disconnected gamecontroller and hand it off to the HID worker
+  // to close. SDL_CloseGamepad() can block, so it must not run here (this is
+  // called from DrainAndLock() on the guest thread, under controllers_mutex_).
+  auto idx = GetControllerIndexFromInstanceID(event.cdevice.which);
+  if (idx) {
+    {
+      std::lock_guard<std::mutex> lk(hid_mutex_);
+      hid_instance_.at(*idx) = 0;
+      rumble_pending_.at(*idx).pending = false;
+      hid_close_queue_.push_back(controllers_.at(*idx).sdl);
+    }
+    hid_cv_.notify_one();
+    controllers_.at(*idx) = {};
+    keystroke_states_.at(*idx) = {};
+    REXLOG_INFO("SDL OnControllerDeviceRemoved: Removed at player index {}.", *idx);
+  } else {
+    // Can happen in case all slots where full previously.
+    REXLOG_WARN("SDL OnControllerDeviceRemoved: Ignored. Unused device.");
   }
   SDL_CloseGamepad(controllers_.at(*idx).sdl);
   controllers_.erase(controllers_.begin() + static_cast<ptrdiff_t>(*idx));
@@ -756,6 +784,100 @@ inline uint64_t SDLInputDriver::AnalogToKeyfield(const X_INPUT_GAMEPAD& gamepad)
     thumb_y = static_cast<int16_t>(gamepad.thumb_ry);
   }
   return f;
+}
+
+void SDLInputDriver::StartHidWorker() {
+  if (hid_worker_.joinable()) {
+    return;
+  }
+  hid_worker_stop_ = false;
+  hid_worker_ = std::thread([this]() { HidWorkerMain(); });
+}
+
+void SDLInputDriver::StopHidWorker() {
+  if (!hid_worker_.joinable()) {
+    return;
+  }
+  {
+    std::lock_guard<std::mutex> lk(hid_mutex_);
+    hid_worker_stop_ = true;
+  }
+  hid_cv_.notify_one();
+  hid_worker_.join();
+}
+
+bool SDLInputDriver::HasHidWorkLocked() const {
+  if (!hid_close_queue_.empty()) {
+    return true;
+  }
+  for (const auto& req : rumble_pending_) {
+    if (req.pending) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Runs on a dedicated thread for the lifetime of the driver. This is the only
+// place SDL_RumbleGamepad() and SDL_CloseGamepad() (for a live/registered
+// device) are ever called, which keeps both potentially-blocking calls off
+// the guest thread and off controllers_mutex_. Lock order: callers may nest
+// controllers_mutex_ -> hid_mutex_, but this function never touches
+// controllers_mutex_ and always releases hid_mutex_ before calling into SDL,
+// so hid_mutex_ can never be ordered ahead of SDL's internal joystick lock.
+void SDLInputDriver::HidWorkerMain() {
+  std::unique_lock<std::mutex> lk(hid_mutex_);
+  for (;;) {
+    hid_cv_.wait(lk, [this]() { return hid_worker_stop_ || HasHidWorkLocked(); });
+    if (hid_worker_stop_ && !HasHidWorkLocked()) {
+      break;
+    }
+
+    std::array<RumbleRequest, HID_SDL_USER_COUNT> reqs{};
+    for (size_t i = 0; i < HID_SDL_USER_COUNT; i++) {
+      if (rumble_pending_.at(i).pending) {
+        reqs.at(i) = rumble_pending_.at(i);
+        rumble_pending_.at(i).pending = false;
+      }
+    }
+    std::array<SDL_JoystickID, HID_SDL_USER_COUNT> inst = hid_instance_;
+    std::vector<SDL_Gamepad*> to_close;
+    to_close.swap(hid_close_queue_);
+
+    lk.unlock();
+
+    // Blocking SDL calls happen here, holding no lock at all.
+    for (size_t i = 0; i < HID_SDL_USER_COUNT; i++) {
+      if (!reqs.at(i).pending || inst.at(i) == 0) {
+        continue;
+      }
+      SDL_Gamepad* gp = SDL_GetGamepadFromID(inst.at(i));
+      if (gp) {
+#if SDL_VERSION_ATLEAST(2, 0, 9)
+        SDL_RumbleGamepad(gp, reqs.at(i).low, reqs.at(i).high, 0);
+#endif
+      }
+    }
+    for (SDL_Gamepad* gp : to_close) {
+      if (gp) {
+        SDL_CloseGamepad(gp);
+      }
+    }
+
+    lk.lock();
+  }
+
+  // Stop was requested with rumble already drained above the loop condition;
+  // still flush any close requests queued after the last drain so we never
+  // leak an SDL gamepad handle on shutdown.
+  std::vector<SDL_Gamepad*> to_close;
+  to_close.swap(hid_close_queue_);
+  lk.unlock();
+  for (SDL_Gamepad* gp : to_close) {
+    if (gp) {
+      SDL_CloseGamepad(gp);
+    }
+  }
 }
 
 }  // namespace rex::input::sdl

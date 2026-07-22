@@ -12,9 +12,11 @@
 #pragma once
 
 #include <atomic>
+#include <condition_variable>
 #include <mutex>
 #include <optional>
 #include <set>
+#include <thread>
 #include <vector>
 
 #include <rex/input/input_driver.h>
@@ -92,6 +94,24 @@ class SDLInputDriver final : public InputDriver, public rex::ui::WindowListener 
   void UpdateXCapabilities(ControllerState& state);
   void QueueControllerUpdate();
 
+  // --- Async HID output (rumble / close) worker ---
+  // SDL_RumbleGamepad() and SDL_CloseGamepad() can block for a long time on
+  // some devices (e.g. a DualSense over Bluetooth), so neither may ever be
+  // called on the guest thread or while holding controllers_mutex_ (the
+  // latter would also re-introduce a lock-order inversion against SDL's
+  // internal joystick lock, see HandleEvent()). Both are instead funneled
+  // through a single dedicated worker thread that never holds
+  // controllers_mutex_.
+  struct RumbleRequest {
+    uint16_t low = 0;
+    uint16_t high = 0;
+    bool pending = false;
+  };
+  void StartHidWorker();
+  void StopHidWorker();
+  void HidWorkerMain();
+  bool HasHidWorkLocked() const;
+
   rex::ui::Window* attached_window_ = nullptr;
   bool sdl_events_initialized_;
   bool SDL_Gamepad_initialized_;
@@ -108,8 +128,25 @@ class SDLInputDriver final : public InputDriver, public rex::ui::WindowListener 
   std::set<SDL_JoystickID> pending_opens_;
   std::mutex event_queue_mutex_;
   std::vector<SDL_Event> pending_events_;
-  // Never rewound, so a handle held past a disconnect resolves to nothing.
-  uint64_t next_device_id_ = 1;
+  std::array<KeystrokeState, HID_SDL_USER_COUNT> keystroke_states_;
+
+  // Guarded by hid_mutex_. Never held together with controllers_mutex_ except
+  // for the controllers_mutex_ -> hid_mutex_ nesting order documented above
+  // HidWorkerMain(). hid_mutex_ is always released before any blocking SDL
+  // call, so it can never be ordered ahead of SDL's internal joystick lock.
+  std::thread hid_worker_;
+  std::mutex hid_mutex_;
+  std::condition_variable hid_cv_;
+  bool hid_worker_stop_ = false;
+  // Latest requested rumble per user slot; only the newest value matters.
+  std::array<RumbleRequest, HID_SDL_USER_COUNT> rumble_pending_{};
+  // Worker-owned instance IDs, independent of controllers_[i].sdl, so the
+  // worker can resolve a live SDL_Gamepad* itself instead of being handed a
+  // pointer the guest thread might be about to free. 0 = no device in slot.
+  std::array<SDL_JoystickID, HID_SDL_USER_COUNT> hid_instance_{};
+  // Live devices deferred to the worker to close, so a close never races an
+  // in-flight rumble to the same device (both run serialized on the worker).
+  std::vector<SDL_Gamepad*> hid_close_queue_;
 };
 
 }  // namespace rex::input::sdl
