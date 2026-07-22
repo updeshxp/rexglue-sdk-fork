@@ -49,9 +49,21 @@ class ImGuiDrawer : public WindowInputListener, public UIDrawer {
 
   ImGuiIO& GetIO();
 
-  // Per-overlay styling, patched by the consumer in OnConfigureStyle.
-  Style& style() { return style_; }
-  const Style& style() const { return style_; }
+  // Exposes the presenter-attached ImmediateDrawer (may be nullptr if no
+  // presenter is currently attached) so a mod can create its own
+  // ImmediateTexture instances for custom rendering, e.g. from OnCreateDialogs.
+  ImmediateDrawer* immediate_drawer() const { return immediate_drawer_; }
+
+  // Registers a callback fired the next time an ImmediateDrawer becomes
+  // attached (immediate_drawer() is guaranteed non-null from inside the
+  // callback). If one is already attached, invokes synchronously before
+  // returning. Exists because IModPlugin::OnCreateDialogs (where a mod
+  // dialog is typically constructed) runs before the host attaches its
+  // presenter/ImmediateDrawer (see ReXApp::LaunchModule) -- without this, a
+  // mod that wants to create textures has to poll immediate_drawer() every
+  // OnDraw until it's non-null. Callbacks are one-shot: each fires at most
+  // once, then is discarded.
+  void OnImmediateDrawerReady(std::function<void()> callback);
 
   void AddDialog(ImGuiDialog* dialog);
   void RemoveDialog(ImGuiDialog* dialog);
@@ -120,6 +132,10 @@ class ImGuiDrawer : public WindowInputListener, public UIDrawer {
   // Resources specific to an immediate drawer - must be destroyed before
   // detaching the presenter.
   std::unique_ptr<ImmediateTexture> font_texture_;
+
+  // One-shot callbacks awaiting the next SetImmediateDrawer(non-null). See
+  // OnImmediateDrawerReady.
+  std::vector<std::function<void()>> immediate_drawer_ready_callbacks_;
 
   // If there's an active pointer, the ImGui mouse is controlled by this touch.
   // If it's TouchEvent::kPointerIDNone, the ImGui mouse is controlled by the

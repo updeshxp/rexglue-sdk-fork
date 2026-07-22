@@ -1,6 +1,6 @@
 /**
  * @file        ui/image_decode.cpp
- * @brief       PNG decode via stb_image. See image_decode.h.
+ * @brief       Image decode via stb_image. See image_decode.h.
  *
  * @copyright   Copyright (c) 2026 Rien Gupta <rgupta9@scu.edu>
  *              All rights reserved.
@@ -12,8 +12,12 @@
 
 #define STB_IMAGE_IMPLEMENTATION
 #define STBI_NO_STDIO
-#define STBI_ONLY_PNG
 #define STBI_NO_FAILURE_STRINGS
+// Deliberately not STBI_ONLY_PNG: stb_image auto-detects the format from the
+// header, so leaving every built-in decoder enabled (JPEG, BMP, TGA, non-
+// animated GIF, PSD, PIC, PNM) costs nothing extra to call and lets mods
+// bundle whatever image format they already have (e.g. baked video frames
+// as JPEG to save space) without a separate PNG conversion step.
 #include <stb_image.h>
 
 namespace rex::ui {

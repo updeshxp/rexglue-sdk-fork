@@ -1,6 +1,7 @@
 set(REXSYSTEM_SOURCES
     runtime.cpp
     embedded_metadata.cpp
+    mod_storage.cpp
     achievement_manager.cpp
     achievements.cpp
     leaderboard_manager.cpp

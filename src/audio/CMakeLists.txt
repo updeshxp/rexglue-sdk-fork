@@ -5,6 +5,8 @@ add_library(rexaudio OBJECT
     
     audio_driver.cpp
     audio_system.cpp
+    ducking.cpp
+    raw_pcm_player.cpp
     wma_player.cpp
     xma_context.cpp
     xma_decoder.cpp
