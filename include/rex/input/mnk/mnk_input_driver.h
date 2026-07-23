@@ -58,6 +58,17 @@ class MnkInputDriver final : public InputDriver,
   void OnLostFocus(rex::ui::UISetupEvent& e) override;
   void OnGotFocus(rex::ui::UISetupEvent& e) override;
 
+  // Returns raw, un-decayed relative mouse motion accumulated since the last
+  // call, then hard-resets it to zero (drain semantics). For hooks that write
+  // straight into a processed "final" value (bypassing the guest's own
+  // deadzone/response-curve/ramp entirely) rather than emulating an XINPUT
+  // stick that still has to pass through that pipeline. out_dx/out_dy are in
+  // the same raw relative-motion units as MouseEvent::rel_x/rel_y (not
+  // pre-scaled to stick range) -- callers apply their own sensitivity/scale.
+  // Returns false (out params untouched) if MnK mode is off, the window
+  // doesn't have focus, or the mouse isn't captured.
+  bool TryGetLookDelta(int32_t* out_dx, int32_t* out_dy);
+
  private:
   bool IsEnabled() const;
   void UpdateMouseCapture();
@@ -128,6 +139,18 @@ class MnkInputDriver final : public InputDriver,
   int16_t cached_rx_ = 0;
   int16_t cached_ry_ = 0;
   bool have_cached_stick_ = false;
+
+  // Raw, un-decayed relative motion accumulated since the last
+  // TryGetLookDelta() drain. Separate from mouse_dx_/mouse_dy_ (the decaying
+  // accumulator) so a bypass hook's drain doesn't fight GetState()'s decay
+  // state or vice versa. Coalesced the same way as cached_rx_/cached_ry_ so
+  // multiple callers within a frame see (and drain) the same delta once.
+  double raw_delta_x_ = 0.0;
+  double raw_delta_y_ = 0.0;
+  std::chrono::steady_clock::time_point last_raw_drain_time_{};
+  int32_t cached_raw_dx_ = 0;
+  int32_t cached_raw_dy_ = 0;
+  bool have_cached_raw_delta_ = false;
 
   // Keystroke queue
   std::queue<X_INPUT_KEYSTROKE> keystroke_queue_;

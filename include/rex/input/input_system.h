@@ -39,6 +39,21 @@ class InputSystem : public system::IInputSystem {
   void AttachWindow(rex::ui::Window* window);
   void SetActiveCallback(std::function<bool()> callback);
 
+  // Finds the first driver of concrete type T (e.g. mnk::MnkInputDriver) so
+  // game-specific host code can reach driver functionality beyond the
+  // generic InputDriver interface (e.g. raw un-decayed mouse deltas for a
+  // mid-asm hook wired directly into a guest camera-look routine). Returns
+  // nullptr if no driver of that type is registered.
+  template <typename T>
+  T* GetDriver() const {
+    for (auto& driver : drivers_) {
+      if (T* typed = dynamic_cast<T*>(driver.get())) {
+        return typed;
+      }
+    }
+    return nullptr;
+  }
+
   // Forces every driver's is_active() to report true regardless of the
   // active callback, so raw device state (e.g. gamepad buttons) is still
   // readable while an overlay would normally gate input off (mouse hovering
