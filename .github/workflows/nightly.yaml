@@ -23,26 +23,42 @@ jobs:
       dev_sha: ${{ steps.compare.outputs.dev_sha }}
       prev_nightly_sha: ${{ steps.compare.outputs.prev_nightly_sha }}
       tag_name: ${{ steps.compare.outputs.tag_name }}
+      tag_prefix: ${{ steps.branch.outputs.tag_prefix }}
     steps:
+      - name: Resolve branch and tag prefix
+        id: branch
+        run: |
+          branch="${{ github.ref_name }}"
+          if [ "${branch}" = "${DEV_BRANCH}" ]; then
+            echo "branch=${DEV_BRANCH}" >> "$GITHUB_OUTPUT"
+            echo "tag_prefix=${NIGHTLY_TAG_PREFIX}" >> "$GITHUB_OUTPUT"
+          else
+            slug=$(printf '%s' "${branch}" | tr -c 'a-zA-Z0-9' '-' | tr 'A-Z' 'a-z')
+            echo "branch=${branch}" >> "$GITHUB_OUTPUT"
+            echo "tag_prefix=${slug}-nightly-" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Checkout dev branch
         uses: actions/checkout@v6
         with:
-          ref: ${{ env.DEV_BRANCH }}
+          ref: ${{ steps.branch.outputs.branch }}
           fetch-depth: 1
 
       - name: Compare dev HEAD to most recent nightly
         id: compare
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_PREFIX: ${{ steps.branch.outputs.tag_prefix }}
+          BRANCH_NAME: ${{ steps.branch.outputs.branch }}
         run: |
           dev_sha=$(git rev-parse HEAD)
           short_sha="${dev_sha:0:8}"
-          tag_name="${NIGHTLY_TAG_PREFIX}$(date -u +%Y%m%d)-${short_sha}"
+          tag_name="${TAG_PREFIX}$(date -u +%Y%m%d)-${short_sha}"
           echo "dev_sha=${dev_sha}" >> "$GITHUB_OUTPUT"
           echo "tag_name=${tag_name}" >> "$GITHUB_OUTPUT"
           prev_release=$(gh release list --limit "${RELEASE_LIST_LIMIT}" \
             --json tagName,isPrerelease,createdAt \
-            | jq -r --arg prefix "${NIGHTLY_TAG_PREFIX}" \
+            | jq -r --arg prefix "${TAG_PREFIX}" \
                 '[.[] | select(.isPrerelease) | select(.tagName | startswith($prefix))]
                   | sort_by(.createdAt) | last | .tagName // ""' \
             2>/dev/null || echo "")
@@ -53,10 +69,10 @@ jobs:
           fi
           echo "prev_nightly_sha=${prev_sha}" >> "$GITHUB_OUTPUT"
           if [ "${dev_sha}" = "${prev_sha}" ]; then
-            echo "${DEV_BRANCH} unchanged since last nightly (${dev_sha}); skipping build."
+            echo "${BRANCH_NAME} unchanged since last nightly (${dev_sha}); skipping build."
             echo "should_build=false" >> "$GITHUB_OUTPUT"
           else
-            echo "${DEV_BRANCH} advanced (${prev_sha:-<no prior nightly>} -> ${dev_sha}); building as ${tag_name}."
+            echo "${BRANCH_NAME} advanced (${prev_sha:-<no prior nightly>} -> ${dev_sha}); building as ${tag_name}."
             echo "should_build=true" >> "$GITHUB_OUTPUT"
           fi
 
@@ -116,13 +132,14 @@ jobs:
           DEV_SHA: ${{ needs.check.outputs.dev_sha }}
           PREV_SHA: ${{ needs.check.outputs.prev_nightly_sha }}
           TAG_NAME: ${{ needs.check.outputs.tag_name }}
+          BRANCH_NAME: ${{ github.ref_name }}
         run: |
           if [ -n "${PREV_SHA}" ] && git cat-file -e "${PREV_SHA}^{commit}" 2>/dev/null; then
             commits=$(git log --no-merges --pretty='format:- %s (%h)' "${PREV_SHA}..${DEV_SHA}")
             range_header="Changes since previous nightly (\`${PREV_SHA:0:8}\`):"
           else
             commits=$(git log --no-merges --pretty='format:- %s (%h)' -20 "${DEV_SHA}")
-            range_header="Latest commits on \`${DEV_BRANCH}\`:"
+            range_header="Latest commits on \`${BRANCH_NAME}\`:"
           fi
           if [ -z "${commits}" ]; then
             commits="- (no new commits)"
@@ -140,10 +157,11 @@ jobs:
       - name: Prune old nightlies
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_PREFIX: ${{ needs.check.outputs.tag_prefix }}
         run: |
           gh release list --limit "${RELEASE_LIST_LIMIT}" \
             --json tagName,isPrerelease,createdAt \
-            | jq -r --arg prefix "${NIGHTLY_TAG_PREFIX}" --argjson keep "${NIGHTLY_RETENTION}" \
+            | jq -r --arg prefix "${TAG_PREFIX}" --argjson keep "${NIGHTLY_RETENTION}" \
                 '[.[] | select(.isPrerelease) | select(.tagName | startswith($prefix))]
                   | sort_by(.createdAt) | reverse | .[$keep:] | .[].tagName' \
             | while IFS= read -r tag; do
