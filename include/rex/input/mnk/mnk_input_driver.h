@@ -64,6 +64,18 @@ class MnkInputDriver final : public InputDriver,
   // doesn't have focus, or the mouse isn't captured.
   bool TryGetLookDelta(int32_t* out_dx, int32_t* out_dy);
 
+  // Like TryGetLookDelta, but returns the *continuously decaying* mouse
+  // accumulator (mouse_dx_/mouse_dy_) instead of the hard-drain-since-last-read
+  // net vector sum. Non-destructive: it decays the accumulator by elapsed time
+  // and returns the current value WITHOUT zeroing it, so polling at a low,
+  // irregular cadence doesn't alias a fast flick-and-correct to ~0 the way the
+  // hard-drain sum does (the raw sum buckets motion into discrete read windows;
+  // this signal is never bucketed). Values are in the same raw relative-motion
+  // units as MouseEvent::rel_x/rel_y, already low-pass filtered by the decay --
+  // callers apply their own sensitivity/scale. Returns false (out params
+  // untouched) if MnK mode is off, unfocused, or the mouse isn't captured.
+  bool TryGetLookVelocity(double* out_vx, double* out_vy);
+
  private:
   uint32_t UserIndex() const;
   bool IsEnabled() const;
