@@ -464,6 +464,9 @@ bool D3D12Provider::Initialize() {
   // attached.
   pfn_dxgi_get_debug_interface1_(0, IID_PPV_ARGS(&graphics_analysis_));
 
+  // Load the RenderDoc API if connected.
+  renderdoc_api_ = RenderDocAPI::CreateIfConnected();
+
   return true;
 }
 

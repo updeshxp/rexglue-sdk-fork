@@ -15,6 +15,7 @@
 
 #include <rex/ui/d3d12/d3d12_api.h>
 #include <rex/ui/graphics_provider.h>
+#include <rex/ui/renderdoc_api.h>
 
 namespace rex::ui::d3d12 {
 
@@ -34,6 +35,8 @@ class D3D12Provider : public GraphicsProvider {
   IDXGIFactory2* GetDXGIFactory() const { return dxgi_factory_; }
   // nullptr if PIX not attached.
   IDXGraphicsAnalysis* GetGraphicsAnalysis() const { return graphics_analysis_; }
+  // nullptr if RenderDoc is not attached.
+  const RenderDocAPI* GetRenderDocAPI() const { return renderdoc_api_.get(); }
   ID3D12Device* GetDevice() const { return device_; }
   ID3D12CommandQueue* GetDirectQueue() const { return direct_queue_; }
 
@@ -154,6 +157,7 @@ class D3D12Provider : public GraphicsProvider {
   ID3D12Device* device_ = nullptr;
   ID3D12CommandQueue* direct_queue_ = nullptr;
   IDXGraphicsAnalysis* graphics_analysis_ = nullptr;
+  std::unique_ptr<RenderDocAPI> renderdoc_api_;
 
   uint32_t descriptor_sizes_[D3D12_DESCRIPTOR_HEAP_TYPE_NUM_TYPES];
 

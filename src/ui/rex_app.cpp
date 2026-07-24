@@ -574,6 +574,17 @@ void ReXApp::SetupOverlays(rex::ui::Presenter* presenter, rex::ui::ImmediateDraw
         }
       },
       [this] { return static_cast<bool>(achievements_overlay_); }, "Achievements##overlay");
+  rex::ui::RegisterBind(
+      "bind_renderdoc_capture", "F10", "Capture the next guest-rendered frame with RenderDoc",
+      [this] {
+        if (!runtime_)
+          return;
+        auto* gs = static_cast<rex::graphics::GraphicsSystem*>(runtime_->graphics_system());
+        if (gs && gs->command_processor()) {
+          gs->command_processor()->RequestRenderDocCapture();
+        }
+      },
+      nullptr, "");
   overlay_menu_ = std::make_unique<ui::OverlayMenuDialog>(imgui_drawer_.get(), runtime_.get());
   rex::ui::RegisterBind(
       "bind_shader_debugger", "F2", "Toggle shader debugger overlay",

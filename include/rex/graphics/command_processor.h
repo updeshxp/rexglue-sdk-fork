@@ -327,6 +327,11 @@ class CommandProcessor {
   virtual void BeginTracing(const std::filesystem::path& root_path);
   virtual void EndTracing();
 
+  // Captures the next full guest-rendered frame with RenderDoc, if attached.
+  // Default: no-op. Backends with a RenderDoc integration (currently D3D12
+  // only) override this.
+  virtual void RequestRenderDocCapture() {}
+
   virtual void TracePlaybackWroteMemory(uint32_t base_ptr, uint32_t length) = 0;
 
   void RestoreRegisters(uint32_t first_register, const uint32_t* register_values,

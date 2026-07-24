@@ -225,6 +225,14 @@ void D3D12CommandProcessor::RequestFrameTrace(const std::filesystem::path& root_
   CommandProcessor::RequestFrameTrace(root_path);
 }
 
+void D3D12CommandProcessor::RequestRenderDocCapture() {
+  const ui::RenderDocAPI* renderdoc_api = GetD3D12Provider().GetRenderDocAPI();
+  if (renderdoc_api == nullptr) {
+    return;
+  }
+  renderdoc_capture_requested_.store(true, std::memory_order_relaxed);
+}
+
 void D3D12CommandProcessor::TracePlaybackWroteMemory(uint32_t base_ptr, uint32_t length) {
   shared_memory_->MemoryInvalidationCallback(base_ptr, length, true);
   primitive_processor_->MemoryInvalidationCallback(base_ptr, length, true);
@@ -1725,6 +1733,8 @@ bool D3D12CommandProcessor::SetupContext() {
 
   pix_capture_requested_.store(false, std::memory_order_relaxed);
   pix_capturing_ = false;
+  renderdoc_capture_requested_.store(false, std::memory_order_relaxed);
+  renderdoc_capturing_ = false;
   occlusion_query_resources_available_ = InitializeOcclusionQueryResources();
 
   // Just not to expose uninitialized memory.
@@ -3530,6 +3540,16 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
       }
     }
 
+    renderdoc_capturing_ = renderdoc_capture_requested_.exchange(false, std::memory_order_relaxed);
+    if (renderdoc_capturing_) {
+      const ui::RenderDocAPI* renderdoc_api = GetD3D12Provider().GetRenderDocAPI();
+      if (renderdoc_api != nullptr) {
+        renderdoc_api->api_1_0_0()->StartFrameCapture(nullptr, nullptr);
+      } else {
+        renderdoc_capturing_ = false;
+      }
+    }
+
     primitive_processor_->BeginFrame();
 
     texture_cache_->BeginFrame();
@@ -3629,6 +3649,13 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
         graphics_analysis->EndCapture();
       }
       pix_capturing_ = false;
+    }
+    if (renderdoc_capturing_) {
+      const ui::RenderDocAPI* renderdoc_api = provider.GetRenderDocAPI();
+      if (renderdoc_api != nullptr) {
+        renderdoc_api->api_1_0_0()->EndFrameCapture(nullptr, nullptr);
+      }
+      renderdoc_capturing_ = false;
     }
     frame_open_ = false;
     // Submission already closed now, so minus 1.

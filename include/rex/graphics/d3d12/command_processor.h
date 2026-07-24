@@ -60,6 +60,10 @@ class D3D12CommandProcessor : public CommandProcessor {
 
   void RequestFrameTrace(const std::filesystem::path& root_path) override;
 
+  // Captures the next full guest-rendered frame with RenderDoc, if attached.
+  // No-op if RenderDoc isn't connected to this process.
+  void RequestRenderDocCapture() override;
+
   void TracePlaybackWroteMemory(uint32_t base_ptr, uint32_t length) override;
 
   void RestoreEdramSnapshot(const void* snapshot) override;
@@ -690,6 +694,9 @@ class D3D12CommandProcessor : public CommandProcessor {
 
   std::atomic<bool> pix_capture_requested_ = false;
   bool pix_capturing_;
+
+  std::atomic<bool> renderdoc_capture_requested_ = false;
+  bool renderdoc_capturing_ = false;
 
   // The current fixed-function drawing state.
   D3D12_VIEWPORT ff_viewport_;
