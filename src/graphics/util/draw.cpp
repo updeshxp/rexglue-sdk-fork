@@ -884,10 +884,13 @@ bool GetResolveInfo(const RegisterFile& regs, const memory::Memory& memory,
     y1 = y0 + int32_t(xenos::kMaxResolveSize);
   }
 
-  assert_true(x0 < x1 && y0 < y1);
+  // If the region is empty or inverted after clipping (e.g., entirely outside
+  // EDRAM bounds due to window offset), treat as a no-op rather than an error.
+  // The caller checks the width/height and skips the resolve.
   if (x0 >= x1 || y0 >= y1) {
-    REXGPU_ERROR("Resolve region is empty");
-    return false;
+    info_out.coordinate_info.width_div_8 = 0;
+    info_out.height_div_8 = 0;
+    return true;
   }
 
   info_out.coordinate_info.width_div_8 = uint32_t(x1 - x0) >> xenos::kResolveAlignmentPixelsLog2;
