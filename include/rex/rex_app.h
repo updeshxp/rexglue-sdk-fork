@@ -229,6 +229,13 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
   /// built-in toast renderer. Returning nullptr disables notifications.
   virtual std::unique_ptr<ui::AchievementNotificationDialog> CreateAchievementNotificationDialog();
 
+  /// Creates the overlay toggled by bind_settings (F4) when the
+  /// `settings_manager_enabled` cvar is true. Override to provide a
+  /// game-curated settings UI in place of the built-in developer settings
+  /// panel (which lists every registered cvar). Returning nullptr falls back
+  /// to the developer panel, so this is a no-op by default.
+  virtual std::unique_ptr<ui::ImGuiDialog> OnCreateUserSettingsOverlay() { return nullptr; }
+
   // --- Init phase methods (called in order from OnInitialize) ---
 
   /// Resolve path defaults, load config TOML, initialize logging.
@@ -260,6 +267,11 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
   const std::filesystem::path& update_data_root() const { return update_data_root_; }
   const std::filesystem::path& cache_root() const { return cache_root_; }
   const std::filesystem::path& metadata_root() const { return metadata_root_; }
+
+  /// Path to the app's cvar config TOML (exe_dir / "<name>.toml"), as loaded
+  /// in SetupEnvironment and passed to the built-in SettingsDialog. Useful as
+  /// a base path for a subclass's own OnCreateUserSettingsOverlay.
+  const std::filesystem::path& config_path() const { return config_path_; }
 
   /// Set a callback that provides guest frame stats to the debug overlay.
   void SetGuestFrameStats(ui::DebugOverlayDialog::FrameStatsProvider provider);
@@ -320,6 +332,7 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
   std::unique_ptr<ui::DebugOverlayDialog> debug_overlay_;
   std::unique_ptr<ui::ConsoleDialog> console_overlay_;
   std::unique_ptr<ui::SettingsDialog> settings_overlay_;
+  std::unique_ptr<ui::ImGuiDialog> user_settings_overlay_;
   std::unique_ptr<ui::ImGuiDialog> achievements_overlay_;
   std::shared_ptr<ui::AchievementNotificationDialog> achievement_notification_;
   uint64_t achievement_notification_listener_ = 0;

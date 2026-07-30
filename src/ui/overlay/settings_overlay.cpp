@@ -27,10 +27,11 @@
 namespace rex::ui {
 
 SettingsDialog::SettingsDialog(ImGuiDrawer* imgui_drawer, std::filesystem::path config_path,
-                               rex::input::InputSystem* input_system)
+                               rex::input::InputSystem* input_system, std::string window_title)
     : ImGuiDialog(imgui_drawer),
       config_path_(std::move(config_path)),
-      input_system_(input_system) {}
+      input_system_(input_system),
+      window_title_(std::move(window_title)) {}
 
 SettingsDialog::~SettingsDialog() {
   if (input_system_ && !capturing_bind_name_.empty()) {
@@ -218,7 +219,7 @@ void SettingsDialog::OnDraw(ImGuiIO& /*io*/) {
 
   ImGui::SetNextWindowSize(ImVec2(620, 480), ImGuiCond_FirstUseEver);
   ImGui::SetNextWindowBgAlpha(0.85f);
-  if (!ImGui::Begin("Settings##rex", nullptr, ImGuiWindowFlags_NoCollapse)) {
+  if (!ImGui::Begin(window_title_.c_str(), nullptr, ImGuiWindowFlags_NoCollapse)) {
     ImGui::End();
     return;
   }
@@ -459,67 +460,7 @@ void SettingsDialog::OnDraw(ImGuiIO& /*io*/) {
       }
       ImGui::SameLine(240.0f);
 
-      ImGui::SetNextItemWidth(160.0f);
-      if (entry.type == rex::cvar::FlagType::Boolean) {
-        bool v = (current_val == "true");
-        if (rex::ui::ToggleSwitch("##v", &v)) {
-          rex::cvar::SetFlagByName(entry.name, v ? "true" : "false", /*persist=*/true);
-        }
-      } else if (entry.type == rex::cvar::FlagType::String &&
-                 !entry.constraints.allowed_values.empty()) {
-        const auto& opts = entry.constraints.allowed_values;
-        int cur_idx = 0;
-        for (int i = 0; i < static_cast<int>(opts.size()); ++i) {
-          if (opts[i] == current_val) {
-            cur_idx = i;
-            break;
-          }
-        }
-        if (ImGui::BeginCombo("##v", opts[cur_idx].c_str())) {
-          for (int i = 0; i < static_cast<int>(opts.size()); ++i) {
-            bool sel = (i == cur_idx);
-            if (ImGui::Selectable(opts[i].c_str(), sel)) {
-              rex::cvar::SetFlagByName(entry.name, opts[i], /*persist=*/true);
-            }
-            if (sel)
-              ImGui::SetItemDefaultFocus();
-          }
-          ImGui::EndCombo();
-        }
-      } else if (entry.type == rex::cvar::FlagType::Int32 ||
-                 entry.type == rex::cvar::FlagType::Int64 ||
-                 entry.type == rex::cvar::FlagType::Uint32 ||
-                 entry.type == rex::cvar::FlagType::Uint64) {
-        int v = std::atoi(current_val.c_str());
-        int vmin =
-            entry.constraints.min.has_value() ? static_cast<int>(*entry.constraints.min) : INT_MIN;
-        int vmax =
-            entry.constraints.max.has_value() ? static_cast<int>(*entry.constraints.max) : INT_MAX;
-        if (ImGui::InputInt("##v", &v)) {
-          v = std::clamp(v, vmin, vmax);
-          rex::cvar::SetFlagByName(entry.name, std::to_string(v), /*persist=*/true);
-        }
-      } else if (entry.type == rex::cvar::FlagType::Double) {
-        double v = std::atof(current_val.c_str());
-        if (ImGui::InputDouble("##v", &v, 0.0, 0.0, "%.4f")) {
-          if (entry.constraints.min)
-            v = std::max(v, *entry.constraints.min);
-          if (entry.constraints.max)
-            v = std::min(v, *entry.constraints.max);
-          rex::cvar::SetFlagByName(entry.name, std::to_string(v), /*persist=*/true);
-        }
-      } else if (entry.type == rex::cvar::FlagType::Command) {
-        if (ImGui::Button(std::string(entry.name + "##v").c_str())) {
-          entry.command_callback("");
-        }
-      } else {
-        char buf[256];
-        rex::string::copy_truncating(buf, current_val, sizeof(buf));
-        ImGui::InputText("##v", buf, sizeof(buf), ImGuiInputTextFlags_EnterReturnsTrue);
-        if (ImGui::IsItemDeactivatedAfterEdit()) {
-          rex::cvar::SetFlagByName(entry.name, buf, /*persist=*/true);
-        }
-      }
+      rex::ui::DrawCvarWidget(entry, 160.0f, /*persist=*/true);
     }
 
     if (read_only)
