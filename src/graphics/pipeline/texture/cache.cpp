@@ -240,12 +240,16 @@ TextureCache::TextureCache(const RegisterFile& register_file, SharedMemory& shar
 void TextureCache::InitTextureReplacement(std::vector<std::filesystem::path> mod_roots,
                                           std::filesystem::path dump_root) {
   replacement_ = std::make_unique<TextureReplacement>(std::move(mod_roots), std::move(dump_root));
-  base_page_hash_cache_.clear();
+  {
+    std::lock_guard<std::mutex> lock(base_page_hash_cache_mutex_);
+    base_page_hash_cache_.clear();
+  }
 }
 
 void TextureCache::RescanTextureReplacements() {
   if (replacement_) {
     replacement_->Rescan();
+    std::lock_guard<std::mutex> lock(base_page_hash_cache_mutex_);
     base_page_hash_cache_.clear();
   }
 }
@@ -933,13 +937,27 @@ TextureCache::Texture* TextureCache::FindOrCreateTexture(TextureKey key) {
     const uint32_t guest_size = original_guest_layout.base.level_data_extent_bytes;
     if (guest_size > 0) {
       // Use cached hash if available — only rehash when guest memory changed.
-      auto hash_it = base_page_hash_cache_.find(key.base_page);
-      if (hash_it != base_page_hash_cache_.end()) {
-        replacement_content_hash = hash_it->second;
-      } else {
+      // base_page_hash_cache_ is also erased from guest CPU threads via the
+      // shared-memory watch callback, so every access needs the mutex. The
+      // hash itself is computed outside the lock (it can be expensive, and
+      // holding the lock across it would stall watch invalidation).
+      bool hash_cached = false;
+      {
+        std::lock_guard<std::mutex> lock(base_page_hash_cache_mutex_);
+        auto hash_it = base_page_hash_cache_.find(key.base_page);
+        if (hash_it != base_page_hash_cache_.end()) {
+          replacement_content_hash = hash_it->second;
+          hash_cached = true;
+        }
+      }
+      if (!hash_cached) {
         const uint8_t* guest_bytes = shared_memory().TranslatePhysical(guest_addr);
         replacement_content_hash = TextureReplacement::HashGuestData(guest_bytes, guest_size);
         const uint32_t bp = key.base_page;
+        std::lock_guard<std::mutex> lock(base_page_hash_cache_mutex_);
+        // A watch may have fired for this page while the hash was being
+        // computed; insert_or_assign would resurrect a just-invalidated entry,
+        // so leave any concurrently-written value alone.
         base_page_hash_cache_.emplace(bp, replacement_content_hash);
       }
       repl = replacement_->FindReplacement(replacement_content_hash);
