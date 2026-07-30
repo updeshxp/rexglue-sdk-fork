@@ -265,13 +265,7 @@ set(SDL_FILESYSTEM OFF CACHE BOOL "" FORCE)
 set(SDL_LOCALE OFF CACHE BOOL "" FORCE)
 set(SDL_FILE OFF CACHE BOOL "" FORCE)
 set(SDL_MISC OFF CACHE BOOL "" FORCE)
-# File dialogs: Linux consumers rely on SDL's xdg-desktop-portal/zenity
-# backends; Windows apps use IFileOpenDialog directly, so keep it off there.
-if(WIN32)
-    set(SDL_DIALOG OFF CACHE BOOL "" FORCE)
-else()
-    set(SDL_DIALOG ON CACHE BOOL "" FORCE)
-endif()
+set(SDL_DIALOG ON CACHE BOOL "" FORCE)
 set(SDL_TRAY OFF CACHE BOOL "" FORCE)
 set(SDL_CAMERA OFF CACHE BOOL "" FORCE)
 

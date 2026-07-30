@@ -68,6 +68,16 @@ std::unordered_map<std::string, PendingValues>& GetPendingValuesStorage() {
   return pending;
 }
 
+// Default overrides queued via SetDefaultValue() for a cvar that hasn't
+// registered yet (e.g. one owned by a GPU plugin DLL, loaded well after an
+// app's early SetDefaultValue calls). Applied by RegisterFlag once the cvar
+// appears, before any pending cmdline/env/config override so the normal
+// precedence (config beats app default) still holds.
+std::unordered_map<std::string, std::string>& GetPendingDefaultsStorage() {
+  static std::unordered_map<std::string, std::string> pending;
+  return pending;
+}
+
 // Convert flag name to environment variable: gpu_vsync -> REX_GPU_VSYNC
 std::string FlagNameToEnvVar(std::string_view name) {
   std::string result = "REX_";
@@ -248,6 +258,21 @@ std::optional<size_t> RegisterFlag(FlagEntry entry) {
   size_t pos = storage.size();
   index[entry.name] = pos;
   storage.push_back(std::move(entry));
+
+  // Apply a queued app default (SetDefaultValue called before this cvar
+  // registered) first, so it behaves exactly as if the cvar had already
+  // existed: pending cmdline/env/config overrides below still take
+  // precedence over it.
+  {
+    auto& pending_defaults = GetPendingDefaultsStorage();
+    auto pd_it = pending_defaults.find(storage[pos].name);
+    if (pd_it != pending_defaults.end()) {
+      FlagEntry& stored = storage[pos];
+      stored.default_value = pd_it->second;
+      stored.setter(pd_it->second);
+      pending_defaults.erase(pd_it);
+    }
+  }
 
   // Late registration: apply pending values in the startup order used for
   // static cvars (command line, then environment, then config file).
@@ -530,6 +555,28 @@ std::vector<std::string> ListModifiedFlags() {
   return result;
 }
 
+bool SetDefaultValue(std::string_view name, std::string_view value) {
+  std::lock_guard lock(GetRegistryMutex());
+  auto it = GetRegistryIndex().find(std::string(name));
+  if (it == GetRegistryIndex().end()) {
+    // Not registered yet -- likely owned by a plugin DLL loaded later.
+    // Queue it; RegisterFlag applies it once the cvar appears. Constraints
+    // can't be validated until then.
+    GetPendingDefaultsStorage()[std::string(name)] = std::string(value);
+    return true;
+  }
+  auto& entry = GetRegistryStorage()[it->second];
+  if (!ValidateConstraints(entry, value)) {
+    return false;
+  }
+  entry.default_value = value;
+  // Apply directly through the setter (like ResetToDefault) rather than
+  // SetFlagByName, so this can override kInitOnly flags before FinalizeInit
+  // and doesn't mark the flag as persist_to_config.
+  entry.setter(value);
+  return true;
+}
+
 std::string SerializeToTOML() {
   std::lock_guard lock(GetRegistryMutex());
   std::string result;
@@ -798,6 +845,90 @@ void SaveConfig(const std::filesystem::path& config_path) {
     REXLOG_INFO("Saved config to {}", config_path.string());
   } catch (const std::exception& e) {
     REXLOG_ERROR("SaveConfig: {}", e.what());
+  }
+}
+
+void SaveConfigSubset(const std::filesystem::path& config_path,
+                      const std::vector<std::string>& names) {
+  std::lock_guard lock(GetRegistryMutex());
+
+  std::unordered_map<std::string, const FlagEntry*> all_entries;
+  for (const auto& entry : GetRegistryStorage()) {
+    all_entries[entry.name] = &entry;
+  }
+
+  std::unordered_map<std::string, const FlagEntry*> to_write;
+  for (const auto& name : names) {
+    auto it = all_entries.find(name);
+    if (it == all_entries.end()) {
+      continue;
+    }
+    to_write[name] = it->second;
+  }
+
+  auto format_value = [](const FlagEntry& entry) {
+    if (entry.type == FlagType::String) {
+      return "\"" + EscapeTomlString(entry.getter()) + "\"";
+    }
+    return entry.getter();
+  };
+
+  // Same in-place patch strategy as SaveConfig, but scoped to `names`: lines
+  // for cvars outside the subset are preserved verbatim even if they are
+  // known, persisted cvars, since they belong to a different config file.
+  std::vector<std::string> result;
+  if (std::filesystem::exists(config_path)) {
+    std::ifstream in(config_path);
+    std::string line;
+    while (std::getline(in, line)) {
+      auto key = ExtractTomlKey(line);
+      if (!key) {
+        result.push_back(line);
+        continue;
+      }
+
+      auto entry_it = to_write.find(*key);
+      if (entry_it == to_write.end()) {
+        result.push_back(line);
+        continue;
+      }
+
+      std::string new_line = *key + " = " + format_value(*entry_it->second);
+      size_t comment_start = FindTomlCommentStart(line);
+      if (comment_start != std::string::npos) {
+        new_line += "  " + line.substr(comment_start);
+      }
+      result.push_back(std::move(new_line));
+      to_write.erase(entry_it);
+    }
+  } else {
+    result.push_back("# Auto-generated cvar configuration");
+  }
+
+  if (!to_write.empty()) {
+    if (!result.empty() && !result.back().empty()) {
+      result.push_back("");
+    }
+    for (const auto& name : names) {
+      auto it = to_write.find(name);
+      if (it != to_write.end()) {
+        result.push_back(name + " = " + format_value(*it->second));
+      }
+    }
+  }
+
+  try {
+    std::ofstream file(config_path);
+    if (!file) {
+      REXLOG_ERROR("SaveConfigSubset: failed to open {}", config_path.string());
+      return;
+    }
+    for (const auto& line : result) {
+      file << line << "\n";
+    }
+    REXLOG_INFO("Saved config subset to {}", config_path.string());
+  } catch (const std::exception& e) {
+    REXLOG_ERROR("SaveConfigSubset: {}", e.what());
   }
 }
 

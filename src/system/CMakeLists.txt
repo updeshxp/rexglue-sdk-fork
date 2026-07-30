@@ -1,4 +1,5 @@
 set(REXSYSTEM_SOURCES
+    game_data_selector.cpp
     runtime.cpp
     embedded_metadata.cpp
     mod_storage.cpp
