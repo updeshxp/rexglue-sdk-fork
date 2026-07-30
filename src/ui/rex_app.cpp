@@ -64,6 +64,11 @@ REXCVAR_DEFINE_STRING(gpu_backend, "any", "GPU", "Graphics backend: 'any', 'd3d1
     .allowed({"any", "d3d12", "vulkan"})
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
+REXCVAR_DEFINE_BOOL(settings_manager_enabled, true, "UI",
+                    "Use the application's user-facing settings overlay (via "
+                    "ReXApp::OnCreateUserSettingsOverlay) instead of the built-in developer "
+                    "settings panel when F4 is pressed");
+
 namespace rex {
 
 namespace detail {
@@ -320,8 +325,9 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
         // overlay window.
         bool ui_mode_active =
             gamepad_ui_ && static_cast<ui::GamepadUiController*>(gamepad_ui_.get())->IsUiMode();
-        if (!debug_overlay_ && !console_overlay_ && !settings_overlay_ && !achievements_overlay_ &&
-            !shader_debugger_overlay_ && !overlay_menu_open && !ui_mode_active)
+        if (!debug_overlay_ && !console_overlay_ && !settings_overlay_ && !user_settings_overlay_ &&
+            !achievements_overlay_ && !shader_debugger_overlay_ && !overlay_menu_open &&
+            !ui_mode_active)
           return true;
         return !ui_mode_active && !imgui_drawer_->GetIO().WantCaptureMouse;
       });
@@ -543,8 +549,19 @@ void ReXApp::SetupOverlays(rex::ui::Presenter* presenter, rex::ui::ImmediateDraw
   rex::ui::RegisterBind(
       "bind_settings", "F4", "Toggle settings overlay",
       [this] {
-        if (settings_overlay_) {
+        if (settings_overlay_ || user_settings_overlay_) {
           settings_overlay_.reset();
+          user_settings_overlay_.reset();
+        } else if (REXCVAR_GET(settings_manager_enabled)) {
+          user_settings_overlay_ = OnCreateUserSettingsOverlay();
+          if (!user_settings_overlay_) {
+            // App opted in but didn't provide one; fall back to the dev panel.
+            auto* input_sys = runtime_
+                                  ? static_cast<rex::input::InputSystem*>(runtime_->input_system())
+                                  : nullptr;
+            settings_overlay_ =
+                std::make_unique<ui::SettingsDialog>(imgui_drawer_.get(), config_path_, input_sys);
+          }
         } else {
           auto* input_sys =
               runtime_ ? static_cast<rex::input::InputSystem*>(runtime_->input_system()) : nullptr;
@@ -552,7 +569,10 @@ void ReXApp::SetupOverlays(rex::ui::Presenter* presenter, rex::ui::ImmediateDraw
               std::make_unique<ui::SettingsDialog>(imgui_drawer_.get(), config_path_, input_sys);
         }
       },
-      [this] { return static_cast<bool>(settings_overlay_); }, "Settings##rex");
+      [this] {
+        return static_cast<bool>(settings_overlay_) || static_cast<bool>(user_settings_overlay_);
+      },
+      "Settings##rex");
   rex::ui::RegisterBind(
       "bind_mod_manager", "F1", "Toggle mod manager overlay",
       [this, drawer] {
@@ -961,6 +981,7 @@ void ReXApp::OnDestroy() {
   overlay_menu_.reset();  // its own destructor unregisters "bind_overlay_menu"
   mod_manager_overlay_.reset();
   settings_overlay_.reset();
+  user_settings_overlay_.reset();
   console_overlay_.reset();
   shader_debugger_overlay_.reset();
   debug_overlay_.reset();

@@ -25,8 +25,15 @@ class SettingsDialog : public ImGuiDialog {
   // config_path: where "Save to config" writes (e.g. exe_dir / "app.toml")
   // input_system: optional; when set, the "Rebind" capture also polls
   // controller button state so gamepad keybinds can be rebound from the UI.
+  // window_title: ImGui window title/ID passed to ImGui::Begin. Defaults to
+  // the historical "Settings##rex" used by the F4 bind; pass a different
+  // ID here when embedding this dialog alongside another ImGui window that
+  // also happens to be titled "Settings##rex" (e.g. a game's own curated
+  // settings overlay) -- same title means same ImGui window ID, which
+  // merges both dialogs' draws into one squeezed window instead of two.
   SettingsDialog(ImGuiDrawer* imgui_drawer, std::filesystem::path config_path,
-                 rex::input::InputSystem* input_system = nullptr);
+                 rex::input::InputSystem* input_system = nullptr,
+                 std::string window_title = "Settings##rex");
   ~SettingsDialog();
 
  protected:
@@ -35,6 +42,7 @@ class SettingsDialog : public ImGuiDialog {
  private:
   std::filesystem::path config_path_;
   rex::input::InputSystem* input_system_ = nullptr;
+  std::string window_title_;
   char search_buf_[128] = {};
   std::string selected_category_;
   std::string capturing_bind_name_;
