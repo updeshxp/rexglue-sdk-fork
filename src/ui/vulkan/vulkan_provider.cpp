@@ -10,6 +10,8 @@
  */
 
 #include <algorithm>
+#include <array>
+#include <cstring>
 #include <vector>
 
 #include <rex/cvar.h>
@@ -23,7 +25,7 @@ REXCVAR_DEFINE_BOOL(vulkan_validation_enabled, false, "UI/Vulkan",
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 REXCVAR_DEFINE_INT32(vulkan_device, -1, "UI/Vulkan", "Vulkan device index (-1 for auto selection)")
-    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 REXCVAR_DEFINE_BOOL(vulkan_prefer_geometry_shader, true, "UI/Vulkan",
                     "Prefer physical devices supporting geometryShader when auto-selecting")
@@ -43,6 +45,52 @@ REXCVAR_DEFINE_BOOL(vulkan_prefer_fill_mode_non_solid, true, "UI/Vulkan",
 namespace rex {
 namespace ui {
 namespace vulkan {
+
+std::vector<DeviceInfo> EnumerateDevices() {
+  std::vector<DeviceInfo> devices;
+
+  auto instance = VulkanInstance::Create(/*with_surface=*/false, /*try_enable_validation=*/false);
+  if (!instance) {
+    return devices;
+  }
+
+  std::vector<VkPhysicalDevice> physical_devices;
+  instance->EnumeratePhysicalDevices(physical_devices);
+
+  const VulkanInstance::Functions& ifn = instance->functions();
+  const bool have_properties2 =
+      instance->extensions().ext_1_1_KHR_get_physical_device_properties2 &&
+      ifn.vkGetPhysicalDeviceProperties2 != nullptr;
+
+  devices.reserve(physical_devices.size());
+  std::vector<std::array<uint8_t, VK_UUID_SIZE>> seen_uuids;
+  for (VkPhysicalDevice physical_device : physical_devices) {
+    DeviceInfo info;
+
+    if (have_properties2) {
+      VkPhysicalDeviceIDProperties id_properties{};
+      id_properties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES;
+      VkPhysicalDeviceProperties2 properties2{};
+      properties2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+      properties2.pNext = &id_properties;
+      ifn.vkGetPhysicalDeviceProperties2(physical_device, &properties2);
+      info.name = properties2.properties.deviceName;
+
+      std::array<uint8_t, VK_UUID_SIZE> uuid;
+      std::memcpy(uuid.data(), id_properties.deviceUUID, VK_UUID_SIZE);
+      info.is_duplicate_of_earlier =
+          std::find(seen_uuids.begin(), seen_uuids.end(), uuid) != seen_uuids.end();
+      seen_uuids.push_back(uuid);
+    } else {
+      VkPhysicalDeviceProperties properties;
+      ifn.vkGetPhysicalDeviceProperties(physical_device, &properties);
+      info.name = properties.deviceName;
+    }
+
+    devices.push_back(std::move(info));
+  }
+  return devices;
+}
 
 std::unique_ptr<VulkanProvider> VulkanProvider::Create(const bool with_gpu_emulation,
                                                        const bool with_presentation) {
