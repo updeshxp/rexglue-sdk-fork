@@ -26,7 +26,8 @@
 #include <rex/logging.h>
 
 REXCVAR_DEFINE_STRING(input_backend, "sdl", "Input", "Input backend: sdl, xinput")
-    .allowed({"sdl", "xinput"});
+    .allowed({"sdl", "xinput"})
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 REXCVAR_DEFINE_BOOL(guide_button, false, "Input", "Enable guide button pass-through");
 namespace rex::input {
