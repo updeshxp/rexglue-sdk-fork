@@ -1,0 +1,48 @@
+/**
+ * @file        core/platform/process_win.cpp
+ * @brief       Windows implementation of rex::platform::process.
+ *
+ * @copyright   Copyright (c) 2026 Tom Clay <tomc@tctechstuff.com>
+ *              All rights reserved.
+ *
+ * @license     BSD 3-Clause License
+ *              See LICENSE file in the project root for full license text.
+ */
+
+#include <rex/platform.h>
+#include <rex/platform/process.h>
+
+static_assert(REX_PLATFORM_WIN32, "This file is Windows-only");
+
+#include "../platform_win.h"
+
+#include <rex/logging.h>
+
+#include <vector>
+
+namespace rex::platform::process {
+
+bool Relaunch() {
+  // GetCommandLineW() returns the exact command line this process was
+  // started with (module path + args), so no argv capture at startup is
+  // needed. CreateProcessW requires a mutable buffer for lpCommandLine.
+  std::wstring cmdline = GetCommandLineW();
+  std::vector<wchar_t> buffer(cmdline.begin(), cmdline.end());
+  buffer.push_back(L'\0');
+
+  STARTUPINFOW si{};
+  si.cb = sizeof(si);
+  PROCESS_INFORMATION pi{};
+
+  if (!CreateProcessW(nullptr, buffer.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si,
+                      &pi)) {
+    REXLOG_ERROR("Relaunch: CreateProcessW failed (GetLastError={})", GetLastError());
+    return false;
+  }
+
+  CloseHandle(pi.hThread);
+  CloseHandle(pi.hProcess);
+  return true;
+}
+
+}  // namespace rex::platform::process
