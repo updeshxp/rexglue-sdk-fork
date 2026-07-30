@@ -58,11 +58,11 @@
 REXCVAR_DEFINE_STRING(gpu_plugin, "", "GPU",
                       "GPU emulation plugin to load at startup (e.g. 'xenos'); empty disables "
                       "GPU emulation")
-    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 REXCVAR_DEFINE_STRING(gpu_backend, "any", "GPU", "Graphics backend: 'any', 'd3d12', or 'vulkan'")
     .allowed({"any", "d3d12", "vulkan"})
-    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 REXCVAR_DEFINE_BOOL(settings_manager_enabled, true, "UI",
                     "Use the application's user-facing settings overlay (via "
