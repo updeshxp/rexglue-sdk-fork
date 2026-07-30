@@ -47,6 +47,7 @@ if(WIN32)
         memory_win.cpp
         platform/console_win.cpp
         platform/env_win.cpp
+        platform/process_win.cpp
         seh_win.cpp
         socket_win.cpp
         system_win.cpp
@@ -69,6 +70,7 @@ elseif(UNIX)
         memory_posix.cpp
         platform/console_posix.cpp
         platform/env_posix.cpp
+        platform/process_posix.cpp
         seh_posix.cpp
         socket_posix.cpp
         system_posix.cpp
