@@ -10,6 +10,8 @@
  */
 
 #include <cstdlib>
+#include <string_view>
+#include <vector>
 
 #include <rex/cvar.h>
 #include <rex/logging.h>
@@ -477,6 +479,45 @@ std::unique_ptr<Presenter> D3D12Provider::CreatePresenter(
 
 std::unique_ptr<ImmediateDrawer> D3D12Provider::CreateImmediateDrawer() {
   return D3D12ImmediateDrawer::Create(*this);
+}
+
+void D3D12Provider::DrainDebugMessages() const {
+  if (!REXCVAR_GET(d3d12_debug) || !device_) {
+    return;
+  }
+  ID3D12InfoQueue* info_queue;
+  if (FAILED(device_->QueryInterface(IID_PPV_ARGS(&info_queue)))) {
+    return;
+  }
+  UINT64 message_count = info_queue->GetNumStoredMessages();
+  for (UINT64 i = 0; i < message_count; ++i) {
+    SIZE_T message_size = 0;
+    if (FAILED(info_queue->GetMessage(i, nullptr, &message_size)) || !message_size) {
+      continue;
+    }
+    std::vector<uint8_t> message_bytes(message_size);
+    D3D12_MESSAGE* message = reinterpret_cast<D3D12_MESSAGE*>(message_bytes.data());
+    if (FAILED(info_queue->GetMessage(i, message, &message_size))) {
+      continue;
+    }
+    std::string_view description(message->pDescription, message->DescriptionByteLength
+                                                            ? message->DescriptionByteLength - 1
+                                                            : 0);
+    switch (message->Severity) {
+      case D3D12_MESSAGE_SEVERITY_CORRUPTION:
+      case D3D12_MESSAGE_SEVERITY_ERROR:
+        REXLOG_ERROR("D3D12 validation [id {}]: {}", uint32_t(message->ID), description);
+        break;
+      case D3D12_MESSAGE_SEVERITY_WARNING:
+        REXLOG_WARN("D3D12 validation [id {}]: {}", uint32_t(message->ID), description);
+        break;
+      default:
+        REXLOG_INFO("D3D12 validation [id {}]: {}", uint32_t(message->ID), description);
+        break;
+    }
+  }
+  info_queue->ClearStoredMessages();
+  info_queue->Release();
 }
 
 }  // namespace rex::ui::d3d12

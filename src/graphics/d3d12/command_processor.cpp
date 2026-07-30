@@ -3613,7 +3613,11 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
     command_allocator->Reset();
     command_list_->Reset(command_allocator, nullptr);
     deferred_command_list_.Execute(command_list_, command_list_1_);
+    // Drain before Close(): a corrupt command-list resource list makes Close()
+    // spin forever, so anything logged after it would never be reached.
+    provider.DrainDebugMessages();
     command_list_->Close();
+    provider.DrainDebugMessages();
     ID3D12CommandList* execute_command_lists[] = {command_list_};
     direct_queue->ExecuteCommandLists(1, execute_command_lists);
     command_allocator_writable_first_->last_usage_submission = submission_current_;

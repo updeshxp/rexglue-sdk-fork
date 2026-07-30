@@ -40,6 +40,12 @@ class D3D12Provider : public GraphicsProvider {
   ID3D12Device* GetDevice() const { return device_; }
   ID3D12CommandQueue* GetDirectQueue() const { return direct_queue_; }
 
+  // Drains the Direct3D 12 debug layer's info queue into the log. No-op unless
+  // the d3d12_debug cvar is set and the debug layer actually loaded. The SDK
+  // otherwise only configures break-on-severity, so validation messages go to
+  // OutputDebugString and are invisible without an attached debugger.
+  void DrainDebugMessages() const;
+
   uint32_t GetDescriptorSize(D3D12_DESCRIPTOR_HEAP_TYPE type) const {
     return descriptor_sizes_[type];
   }
