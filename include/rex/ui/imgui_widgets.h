@@ -14,6 +14,11 @@
 #include <imgui.h>
 
 namespace rex {
+
+namespace cvar {
+struct FlagEntry;
+}  // namespace cvar
+
 namespace ui {
 
 // A sliding pill-shaped toggle, drawn as a themed alternative to
@@ -66,6 +71,16 @@ inline bool ToggleSwitch(const char* label, bool* v) {
 
   return changed;
 }
+
+// Draws the value editor for a single cvar (toggle for Boolean, combo for a
+// String with allowed_values, InputInt/InputDouble clamped to range for
+// numeric types, a button for Command, plain text input otherwise). Does not
+// draw the entry's name/label - callers place this next to their own label.
+// Any edit is applied via cvar::SetFlagByName(entry.name, ..., persist).
+// Returns true the frame the value changes. Shared by the SDK's developer
+// settings panel and any game-provided settings overlay so there is one
+// implementation of "how do I edit a cvar" for all widget layouts.
+bool DrawCvarWidget(const cvar::FlagEntry& entry, float item_width = 160.0f, bool persist = true);
 
 }  // namespace ui
 }  // namespace rex
