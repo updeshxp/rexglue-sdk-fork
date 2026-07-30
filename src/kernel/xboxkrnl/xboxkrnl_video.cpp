@@ -39,6 +39,24 @@ constexpr uint32_t kDisplayGammaType = 2;
 // Display gamma power (used with gamma type 3)
 constexpr double kDisplayGammaPower = 2.22222233;
 
+// Real Xbox 360 hardware never reported a video mode above 1920x1080 --
+// titles size their own EDRAM/surface allocations (color/depth/resolve
+// tile counts, etc.) against that ceiling, in units tied to the real 10MB
+// EDRAM budget. When the "resolution" preset (e.g. "1440p", "4k") is above
+// this, the *window*/presentation surface still opens at the full preset
+// size (see ResolveWindowWidth/Height in window_sdl.cpp, which isn't
+// clamped), but XGetVideoMode must keep reporting a mode the guest's own
+// hardware-bound math can actually handle; draw_resolution_scale (the
+// "resolution_scale" cvar) is what should carry the guest past that
+// ceiling, by supersampling the render instead of raising the reported
+// mode. Titles that don't clamp this themselves (i.e. use the reported
+// dwDisplayWidth/Height verbatim for surface sizing) will otherwise size
+// EDRAM allocations the console could never have created, and/or exceed
+// tile-index bitfields sized for real hardware, corrupting rendering above
+// 1080p even when the allocation itself doesn't outright fail.
+constexpr int32_t kMaxHardwareVideoModeWidth = 1920;
+constexpr int32_t kMaxHardwareVideoModeHeight = 1080;
+
 uint32_t GetConfiguredVideoModeWidth() {
   int32_t configured_width = REXCVAR_GET(video_mode_width);
   if (!rex::cvar::HasNonDefaultValue("video_mode_width")) {
@@ -49,7 +67,7 @@ uint32_t GetConfiguredVideoModeWidth() {
       int32_t preset_height = 0;
       if (rex::graphics::video_mode_util::TryGetResolutionPresetFromCVar(preset_width,
                                                                          preset_height)) {
-        configured_width = preset_width;
+        configured_width = std::min(preset_width, kMaxHardwareVideoModeWidth);
       }
     }
   }
@@ -66,7 +84,7 @@ uint32_t GetConfiguredVideoModeHeight() {
       int32_t preset_height = 0;
       if (rex::graphics::video_mode_util::TryGetResolutionPresetFromCVar(preset_width,
                                                                          preset_height)) {
-        configured_height = preset_height;
+        configured_height = std::min(preset_height, kMaxHardwareVideoModeHeight);
       }
     }
   }
