@@ -226,6 +226,25 @@ std::vector<std::string> ListModifiedFlags();
 std::string SerializeToTOML();
 std::string SerializeToTOML(std::string_view category);
 
+// Override a flag's default value. Intended for applications that ship
+// different defaults than the cvar's SDK-registered default (e.g. a game
+// wants `fullscreen` to default to false while the SDK default is true).
+// Applies the new default through the entry's current value as well
+// (bypassing lifecycle enforcement, same as ResetToDefault), so callers
+// should call this before LoadConfig()/ApplyEnvironment() so a config file
+// or env override can still take precedence. If `name` isn't registered yet
+// (e.g. it belongs to a GPU plugin DLL loaded later in startup), the
+// override is queued and applied automatically once the cvar registers,
+// still ahead of any pending cmdline/env/config value for it. Returns false
+// only if the cvar is already registered and `value` fails its constraints.
+bool SetDefaultValue(std::string_view name, std::string_view value);
+
+// Write only the named flags to `config_path`, leaving any other lines in
+// that file untouched. Companion to SaveConfig() for applications that split
+// user-facing settings from a separate developer/advanced config file.
+void SaveConfigSubset(const std::filesystem::path& config_path,
+                      const std::vector<std::string>& names);
+
 /// Callback invoked when a CVAR value changes
 /// @param name The CVAR name
 /// @param new_value The new value as a string
