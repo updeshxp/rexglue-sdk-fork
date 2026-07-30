@@ -34,6 +34,11 @@ bool g_finalized = false;
 bool g_lifecycle_override = false;
 std::mutex g_mutex;
 
+// Defined below; forward-declared so ApplyTomlTable (defined before it in
+// this file) can call it.
+bool SetFlagByNameImpl(std::string_view name, std::string_view value, bool persist,
+                       bool mark_restart);
+
 // Set once cvar::Init has parsed the command line; later registrations are
 // from runtime-loaded modules and drain pending values.
 std::atomic<bool> g_init_done = false;
@@ -113,7 +118,10 @@ void ApplyTomlTable(const toml::table& table, const std::string& prefix) {
         std::lock_guard lock(GetRegistryMutex());
         GetPendingValuesStorage()[full_key].config = value_str;
         REXLOG_DEBUG("Config: '{}' deferred (cvar not yet registered)", full_key);
-      } else if (SetFlagByName(full_key, value_str, /*persist=*/true)) {
+        // Loading a config file establishes the process's initial values, not
+        // a pending runtime change -- don't mark restart-required cvars as
+        // needing a restart just because a config load set their value.
+      } else if (SetFlagByNameImpl(full_key, value_str, /*persist=*/true, /*mark_restart=*/false)) {
         REXLOG_DEBUG("Config: {} = {}", full_key, value_str);
       } else {
         REXLOG_WARN("Config: invalid value for cvar '{}'", full_key);
@@ -123,9 +131,18 @@ void ApplyTomlTable(const toml::table& table, const std::string& prefix) {
 }
 
 // todo(tomc): move restart manager to Runtime
-std::vector<std::string>& GetPendingRestartStorage() {
-  static std::vector<std::string> pending;
-  return pending;
+//
+// Maps a kRequiresRestart cvar's name to its value as of the first live
+// change this session (i.e. what's actually still running, since a
+// restart-required cvar's setter takes effect immediately in-process even
+// though some external resource wasn't recreated to match). A cvar is
+// "pending restart" exactly when its current value differs from this
+// baseline -- so toggling gpu_backend from d3d12 to vulkan and back to
+// d3d12 correctly clears pending again, rather than staying stuck once
+// changed at all.
+std::unordered_map<std::string, std::string>& GetPendingRestartBaselines() {
+  static std::unordered_map<std::string, std::string> baselines;
+  return baselines;
 }
 
 // Callback storage for change notifications
@@ -134,12 +151,9 @@ std::unordered_map<std::string, std::vector<ChangeCallback>>& GetCallbackStorage
   return callbacks;
 }
 
-void MarkPendingRestart(std::string_view name) {
-  auto& pending = GetPendingRestartStorage();
-  std::string name_str(name);
-  if (std::find(pending.begin(), pending.end(), name_str) == pending.end()) {
-    pending.push_back(name_str);
-  }
+void MarkPendingRestart(std::string_view name, std::string_view value_before_change) {
+  auto& baselines = GetPendingRestartBaselines();
+  baselines.try_emplace(std::string(name), std::string(value_before_change));
 }
 
 // Escapes a value for use inside a TOML basic (double-quoted) string.
@@ -238,7 +252,7 @@ std::vector<FlagEntry>& GetRegistry() {
 std::optional<size_t> RegisterFlag(FlagEntry entry) {
   std::lock_guard lock(GetRegistryMutex());
   (void)GetCallbackStorage();
-  (void)GetPendingRestartStorage();
+  (void)GetPendingRestartBaselines();
   auto& index = GetRegistryIndex();
   auto& storage = GetRegistryStorage();
   auto it = index.find(entry.name);
@@ -316,8 +330,7 @@ void UnregisterFlag(std::string_view name) {
     }
   }
   GetCallbackStorage().erase(key);
-  auto& pending = GetPendingRestartStorage();
-  pending.erase(std::remove(pending.begin(), pending.end(), key), pending.end());
+  GetPendingRestartBaselines().erase(key);
 }
 
 void FlagRegistrar::apply_(std::function<void(FlagEntry&)> fn) {
@@ -333,7 +346,15 @@ void FlagRegistrar::apply_(std::function<void(FlagEntry&)> fn) {
   fn(GetRegistryStorage()[it->second]);
 }
 
-bool SetFlagByName(std::string_view name, std::string_view value, bool persist) {
+namespace {
+
+// `mark_restart` is false for values applied while establishing the
+// process's initial state (LoadConfig): those aren't a pending action for
+// the user to act on, just the boot-time value taking effect. It's true for
+// every other caller (SetFlagByName's public API), i.e. actual runtime
+// changes -- from the settings UI, console, mods, etc.
+bool SetFlagByNameImpl(std::string_view name, std::string_view value, bool persist,
+                       bool mark_restart) {
   std::lock_guard lock(GetRegistryMutex());
   auto it = GetRegistryIndex().find(std::string(name));
   if (it == GetRegistryIndex().end()) {
@@ -353,6 +374,11 @@ bool SetFlagByName(std::string_view name, std::string_view value, bool persist) 
     return false;
   }
 
+  // Captured before the setter call so the very first live change this
+  // session records what's actually still running as the pending-restart
+  // baseline (see GetPendingRestartBaselines).
+  std::string value_before_change = entry.getter();
+
   bool success = entry.setter(value);
 
   if (success && persist) {
@@ -360,8 +386,8 @@ bool SetFlagByName(std::string_view name, std::string_view value, bool persist) 
   }
 
   // Track pending restart flags
-  if (success && entry.lifecycle == Lifecycle::kRequiresRestart) {
-    MarkPendingRestart(name);
+  if (success && mark_restart && entry.lifecycle == Lifecycle::kRequiresRestart) {
+    MarkPendingRestart(name, value_before_change);
   }
 
   // Invoke registered callbacks
@@ -376,6 +402,12 @@ bool SetFlagByName(std::string_view name, std::string_view value, bool persist) 
   }
 
   return success;
+}
+
+}  // namespace
+
+bool SetFlagByName(std::string_view name, std::string_view value, bool persist) {
+  return SetFlagByNameImpl(name, value, persist, /*mark_restart=*/true);
 }
 
 bool InvokeCommand(std::string_view name, std::string_view args) {
@@ -509,12 +541,18 @@ std::string Query<std::string>(std::string_view name) {
 
 std::vector<std::string> GetPendingRestartFlags() {
   std::lock_guard lock(GetRegistryMutex());
-  return GetPendingRestartStorage();
+  std::vector<std::string> result;
+  for (const auto& [name, baseline_value] : GetPendingRestartBaselines()) {
+    if (GetFlagByName(name) != baseline_value) {
+      result.push_back(name);
+    }
+  }
+  return result;
 }
 
 void ClearPendingRestartFlags() {
   std::lock_guard lock(GetRegistryMutex());
-  GetPendingRestartStorage().clear();
+  GetPendingRestartBaselines().clear();
 }
 
 void ResetToDefault(std::string_view name) {
