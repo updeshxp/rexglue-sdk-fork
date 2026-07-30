@@ -9,6 +9,7 @@ set(REXUI_CORE_SOURCES
     image_decode.cpp
     imgui_dialog.cpp
     imgui_drawer.cpp
+    imgui_widgets.cpp
     immediate_drawer.cpp
     keybinds.cpp
     menu_item.cpp
