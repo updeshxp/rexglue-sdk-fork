@@ -11,6 +11,8 @@
  */
 
 #include <memory>
+#include <string>
+#include <vector>
 
 #include <rex/ui/graphics_provider.h>
 #include <rex/ui/vulkan/device.h>
@@ -20,6 +22,31 @@
 namespace rex {
 namespace ui {
 namespace vulkan {
+
+struct DeviceInfo {
+  std::string name;
+
+  // True if an earlier entry in the same EnumerateDevices() call has the
+  // identical VkPhysicalDeviceIDProperties::deviceUUID -- a known ICD quirk
+  // on some hybrid-graphics Windows laptops that registers one physical
+  // adapter twice, not a second distinct GPU. A UI should skip rendering a
+  // selectable item for these (selecting the earlier, canonical entry
+  // selects the exact same physical device), but this entry's index is
+  // still a valid, equivalent choice for `vulkan_device`. Always false if
+  // VK_KHR_get_physical_device_properties2 isn't supported (no UUID to
+  // compare), so duplicates then show up uncollapsed.
+  bool is_duplicate_of_earlier = false;
+};
+
+// Lists Vulkan-capable physical devices on this system, in the same order as
+// the index a UI would pass to the `vulkan_device` cvar (see
+// VulkanProvider::Create) -- i.e. this vector's size and order always
+// matches what VulkanProvider::Create itself enumerates, even for entries
+// flagged as duplicates. Independent of whether a VulkanProvider has been
+// created yet -- for building a device-selection dropdown before graphics
+// setup runs. Creates and destroys a throwaway VkInstance; returns an empty
+// vector if Vulkan isn't available on this system.
+std::vector<DeviceInfo> EnumerateDevices();
 
 class VulkanProvider : public GraphicsProvider {
  public:
