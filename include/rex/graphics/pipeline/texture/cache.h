@@ -16,6 +16,7 @@
 #include <cstring>
 #include <filesystem>
 #include <memory>
+#include <mutex>
 #include <unordered_map>
 #include <vector>
 
@@ -657,7 +658,10 @@ class TextureCache {
   // constants again and again.
   uint32_t texture_bindings_in_sync_ = 0;
 
-  void InvalidateHashCache(uint32_t base_page) { base_page_hash_cache_.erase(base_page); }
+  void InvalidateHashCache(uint32_t base_page) {
+    std::lock_guard<std::mutex> lock(base_page_hash_cache_mutex_);
+    base_page_hash_cache_.erase(base_page);
+  }
 
   // Texture dump/replacement pipeline. Null when the feature is disabled.
   std::unique_ptr<TextureReplacement> replacement_;
@@ -665,6 +669,13 @@ class TextureCache {
   // Cache: base_page -> XXH3 content hash, populated by FindOrCreateTexture.
   // Entries are erased when the shared-memory watch fires for that page, so
   // the hash is only recomputed when guest memory actually changes.
+  //
+  // Guarded by base_page_hash_cache_mutex_: erases run on guest CPU threads
+  // (SharedMemory::MemoryInvalidationCallback -> FireWatches -> WatchCallback)
+  // while lookups/inserts run on the GPU command-processor thread, so every
+  // access must be synchronized. Only ever locked around the map operation
+  // itself - never take any other lock while holding it.
+  std::mutex base_page_hash_cache_mutex_;
   std::unordered_map<uint32_t, uint64_t> base_page_hash_cache_;
 };
 
