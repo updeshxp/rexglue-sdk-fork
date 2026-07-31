@@ -21,6 +21,8 @@ input/input_assignment_test.cpp
     codegen/output_stamp_test.cpp
     system/mod_registry_test.cpp
     system/mod_dependency_test.cpp
+    system/mod_state_test.cpp
+    system/mod_catalog_test.cpp
     codegen/manifest_test.cpp
     rexglue/migration_scan_test.cpp
     rexglue/ui_test.cpp
@@ -40,6 +42,7 @@ target_include_directories(unit_tests PRIVATE
 target_link_libraries(unit_tests PRIVATE
     rexcodegen
     rexruntime
+    miniz
     Catch2::Catch2WithMain
 )
 

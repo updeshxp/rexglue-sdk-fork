@@ -133,5 +133,25 @@ bool IsAndroidContentUri(const std::string_view source);
 int OpenAndroidContentFileDescriptor(const std::string_view uri, const char* mode);
 #endif  // REX_PLATFORM_ANDROID
 
+// Extracts `archive` (a .zip file) into `dest_dir`, creating it if needed.
+// Rejects any entry with an absolute path or a ".." path segment (path
+// traversal) -- archives handled here come off the network (catalog mod
+// installs), so this must never be trusted to stay inside `archive`'s own
+// top-level names. Returns false and populates `error` on any failure
+// (corrupt archive, path traversal attempt, filesystem error); never throws.
+bool ExtractZip(const std::filesystem::path& archive, const std::filesystem::path& dest_dir,
+                std::string& error);
+
+// Moves (renames) `from` to `to`, falling back to a recursive copy (then
+// removing `from`) if the rename fails, e.g. because `from`/`to` land on
+// different filesystems. Retries both the rename and the copy a few times
+// with a short backoff before giving up: on Windows a file that was just
+// written (as an archive extraction just did) is briefly held open by
+// real-time antivirus scanning, and losing that race produces a rename/copy
+// failure the caller can do nothing about except try again shortly after.
+// Returns false and populates `error` if every attempt fails; never throws.
+bool MoveOrCopyDirectory(const std::filesystem::path& from, const std::filesystem::path& to,
+                         std::string& error);
+
 }  // namespace filesystem
 }  // namespace rex

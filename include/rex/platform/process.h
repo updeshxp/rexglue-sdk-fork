@@ -19,6 +19,22 @@ namespace rex::platform::process {
 // process down themselves afterward (e.g. WindowedApp::window()->
 // RequestClose()) -- this only starts the replacement. Returns false if the
 // new process could not be spawned (current process is left running).
+//
+// The new process starts concurrently with the old one's (caller-driven)
+// shutdown -- there's no guarantee the old process has actually exited, or
+// released any files it had open, by the time the new process's own startup
+// runs. Records this process's id (via an environment variable the new
+// process inherits) so the new process's WaitForPreviousInstanceExit() can
+// wait on it.
 bool Relaunch();
+
+// If this process was started by another instance's Relaunch(), blocks
+// (up to a few seconds) until that instance has fully exited; a no-op
+// otherwise, or once already called (the handoff is consumed on first use).
+// Call this once, as early in startup as practical, before anything that
+// might need a file/handle the old instance could still be holding open
+// during its own shutdown (e.g. applying a staged mod update onto a folder
+// the old process had a mod DLL loaded from).
+void WaitForPreviousInstanceExit();
 
 }  // namespace rex::platform::process

@@ -10,6 +10,7 @@
  */
 
 #include <string>
+#include <vector>
 
 #include <io.h>
 #include <shlobj.h>
@@ -43,9 +44,22 @@ std::filesystem::path to_path(const std::u16string_view source) {
 namespace filesystem {
 
 std::filesystem::path GetExecutablePath() {
-  wchar_t* path;
-  auto error = _get_wpgmptr(&path);
-  return !error ? std::filesystem::path(path) : std::filesystem::path();
+  // _get_wpgmptr reads the calling module's own per-module CRT state, which
+  // is invalid when this is called from inside a DLL (e.g. rexruntimerd.dll)
+  // rather than the main EXE -- it fires the CRT invalid-parameter handler
+  // and __fastfail()s. GetModuleFileNameW(nullptr, ...) queries the actual
+  // process executable regardless of which module calls it.
+  std::vector<wchar_t> buf(MAX_PATH);
+  for (;;) {
+    DWORD len = GetModuleFileNameW(nullptr, buf.data(), static_cast<DWORD>(buf.size()));
+    if (len == 0) {
+      return std::filesystem::path();
+    }
+    if (len < buf.size()) {
+      return std::filesystem::path(buf.data(), buf.data() + len);
+    }
+    buf.resize(buf.size() * 2);
+  }
 }
 
 std::filesystem::path GetExecutableFolder() {

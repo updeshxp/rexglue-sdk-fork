@@ -16,16 +16,29 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
 
 #include <rex/logging.h>
 
+#include <chrono>
+#include <cerrno>
+#include <cstdlib>
 #include <fstream>
 #include <string>
+#include <thread>
 #include <vector>
 
+#include <signal.h>
 #include <unistd.h>
 
 namespace rex::platform::process {
 
+namespace {
+// execv() replaces the forked child's image in place, so on the new binary's
+// side this is just an inherited environment variable (setenv() before
+// fork()+execv() below), same handoff trick as the Windows implementation.
+constexpr const char* kRelaunchFromPidEnvVar = "REX_RELAUNCH_FROM_PID";
+}  // namespace
+
 bool Relaunch() {
 #if REX_PLATFORM_LINUX
+  setenv(kRelaunchFromPidEnvVar, std::to_string(getpid()).c_str(), 1);
   // /proc/self/cmdline holds the original argv, NUL-separated; there's no
   // Linux equivalent of Win32's GetCommandLineW() to re-fetch it otherwise.
   std::ifstream cmdline_file("/proc/self/cmdline", std::ios::binary);
@@ -72,6 +85,37 @@ bool Relaunch() {
 #else
   REXLOG_ERROR("Relaunch: not implemented on this platform");
   return false;
+#endif
+}
+
+void WaitForPreviousInstanceExit() {
+#if REX_PLATFORM_LINUX
+  const char* pid_string = getenv(kRelaunchFromPidEnvVar);
+  if (!pid_string || !*pid_string) {
+    return;  // not a relaunch -- nothing to wait on.
+  }
+  pid_t pid = static_cast<pid_t>(std::atoi(pid_string));
+  // Consume the handoff so a later, unrelated Relaunch() done by *this*
+  // process (which re-sets the var to its own pid) can't be misread as
+  // still referring to the original one.
+  unsetenv(kRelaunchFromPidEnvVar);
+  if (pid <= 0) {
+    return;
+  }
+
+  // The old instance is our parent (fork()+execv() in Relaunch() above), not
+  // our child, so waitpid() can't be used here -- poll for its exit via
+  // kill(pid, 0) instead. Bounded: a hung old instance shouldn't block this
+  // one's startup forever.
+  constexpr auto kTimeout = std::chrono::milliseconds(5000);
+  constexpr auto kPollInterval = std::chrono::milliseconds(50);
+  auto deadline = std::chrono::steady_clock::now() + kTimeout;
+  while (std::chrono::steady_clock::now() < deadline) {
+    if (kill(pid, 0) != 0 && errno == ESRCH) {
+      return;  // exited
+    }
+    std::this_thread::sleep_for(kPollInterval);
+  }
 #endif
 }
 
