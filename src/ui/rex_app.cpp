@@ -52,6 +52,7 @@
 #include <imgui.h>
 
 #include <algorithm>
+#include <cctype>
 #include <filesystem>
 #include <string_view>
 #include <unordered_map>
@@ -618,8 +619,8 @@ void ReXApp::SetupOverlays(rex::ui::Presenter* presenter, rex::ui::ImmediateDraw
         if (mod_manager_overlay_) {
           mod_manager_overlay_.reset();
         } else {
-          mod_manager_overlay_ =
-              std::make_unique<ui::ModManagerDialog>(imgui_drawer_.get(), drawer, runtime_.get());
+          mod_manager_overlay_ = std::make_unique<ui::ModManagerDialog>(
+              imgui_drawer_.get(), drawer, runtime_.get(), window_.get(), config_path_);
         }
       },
       [this] { return static_cast<bool>(mod_manager_overlay_); }, "Mods##overlay");
@@ -975,6 +976,24 @@ void ReXApp::OnMinimized(ui::UIEvent& e) {
 void ReXApp::OnRestored(ui::UIEvent& e) {
   (void)e;
   OnWindowRestored();
+}
+
+void ReXApp::OnFileDrop(ui::FileDropEvent& e) {
+  std::string ext = e.filename().extension().string();
+  std::transform(ext.begin(), ext.end(), ext.begin(),
+                 [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+  if (ext != ".zip") {
+    return;  // not a mod archive; ignore silently
+  }
+  if (!imgui_drawer_) {
+    return;  // dropped before overlays exist (e.g. mid-setup); nothing to show progress in
+  }
+
+  if (!mod_manager_overlay_) {
+    mod_manager_overlay_ = std::make_unique<ui::ModManagerDialog>(
+        imgui_drawer_.get(), immediate_drawer_.get(), runtime_.get(), window_.get(), config_path_);
+  }
+  static_cast<ui::ModManagerDialog*>(mod_manager_overlay_.get())->SideloadArchive(e.filename());
 }
 
 void ReXApp::OnDestroy() {
