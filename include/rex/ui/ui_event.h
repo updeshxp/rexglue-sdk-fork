@@ -126,8 +126,15 @@ class MouseEvent : public UIEvent {
   static constexpr uint32_t kScrollPerDetent = 120;
 
   explicit MouseEvent(Window* target, Button button, int32_t x, int32_t y, int32_t scroll_x = 0,
-                      int32_t scroll_y = 0)
-      : UIEvent(target), button_(button), x_(x), y_(y), scroll_x_(scroll_x), scroll_y_(scroll_y) {}
+                      int32_t scroll_y = 0, int32_t dx = 0, int32_t dy = 0)
+      : UIEvent(target),
+        button_(button),
+        x_(x),
+        y_(y),
+        scroll_x_(scroll_x),
+        scroll_y_(scroll_y),
+        dx_(dx),
+        dy_(dy) {}
   ~MouseEvent() override = default;
 
   bool is_handled() const { return handled_; }
@@ -138,6 +145,11 @@ class MouseEvent : public UIEvent {
   int32_t y() const { return y_; }
   int32_t scroll_x() const { return scroll_x_; }
   int32_t scroll_y() const { return scroll_y_; }
+  // Movement since the previous motion event, as reported by the platform.
+  // Unlike x()/y() deltas these stay meaningful while the pointer is locked
+  // by Window::SetRelativeMouseMode, where the position no longer moves.
+  int32_t dx() const { return dx_; }
+  int32_t dy() const { return dy_; }
 
  private:
   bool handled_ = false;
@@ -147,6 +159,8 @@ class MouseEvent : public UIEvent {
   int32_t scroll_x_ = 0;
   // Positive is up (away from the user), negative is down (towards the user).
   int32_t scroll_y_ = 0;
+  int32_t dx_ = 0;
+  int32_t dy_ = 0;
 };
 
 class TouchEvent : public UIEvent {

@@ -59,6 +59,10 @@ class VulkanInstance {
 #ifdef VK_USE_PLATFORM_XCB_KHR
 #include <rex/ui/vulkan/functions/instance_khr_xcb_surface.inc>
 #endif
+    // VK_KHR_wayland_surface (#7)
+#ifdef VK_USE_PLATFORM_WAYLAND_KHR
+#include <rex/ui/vulkan/functions/instance_khr_wayland_surface.inc>
+#endif
     // VK_KHR_android_surface (#9)
 #ifdef VK_USE_PLATFORM_ANDROID_KHR
 #include <rex/ui/vulkan/functions/instance_khr_android_surface.inc>
@@ -85,6 +89,9 @@ class VulkanInstance {
     bool ext_KHR_surface = false;  // #1
 #ifdef VK_USE_PLATFORM_XCB_KHR
     bool ext_KHR_xcb_surface = false;  // #6
+#endif
+#ifdef VK_USE_PLATFORM_WAYLAND_KHR
+    bool ext_KHR_wayland_surface = false;  // #7
 #endif
 #ifdef VK_USE_PLATFORM_ANDROID_KHR
     bool ext_KHR_android_surface = false;  // #9

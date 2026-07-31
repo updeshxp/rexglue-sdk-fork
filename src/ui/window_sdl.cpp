@@ -221,6 +221,17 @@ void* WindowSDL::GetNativeWindowHandle() const {
 #endif
 }
 
+bool WindowSDL::SetRelativeMouseMode(bool enable) {
+  if (!sdl_window_) {
+    return false;
+  }
+  if (!SDL_SetWindowRelativeMouseMode(sdl_window_, enable)) {
+    REXLOG_WARN("SDL_SetWindowRelativeMouseMode({}) failed: {}", enable, SDL_GetError());
+    return false;
+  }
+  return enable;
+}
+
 uint32_t WindowSDL::GetLatestDpiImpl() const {
   float scale = sdl_window_ ? SDL_GetWindowDisplayScale(sdl_window_)
                             : SDL_GetDisplayContentScale(SDL_GetPrimaryDisplay());
@@ -312,6 +323,17 @@ std::unique_ptr<Surface> WindowSDL::CreateSurfaceImpl(Surface::TypeFlags allowed
     }
   }
 #else
+#ifdef VK_USE_PLATFORM_WAYLAND_KHR
+  if (allowed_types & Surface::kTypeFlag_WaylandSurface) {
+    auto* wl_display_ptr = static_cast<struct wl_display*>(
+        SDL_GetPointerProperty(props, SDL_PROP_WINDOW_WAYLAND_DISPLAY_POINTER, nullptr));
+    auto* wl_surface_ptr = static_cast<struct wl_surface*>(
+        SDL_GetPointerProperty(props, SDL_PROP_WINDOW_WAYLAND_SURFACE_POINTER, nullptr));
+    if (wl_display_ptr && wl_surface_ptr) {
+      return std::make_unique<WaylandSurface>(wl_display_ptr, wl_surface_ptr, sdl_window_);
+    }
+  }
+#endif
   if (allowed_types & Surface::kTypeFlag_XcbWindow) {
     auto* display = static_cast<Display*>(
         SDL_GetPointerProperty(props, SDL_PROP_WINDOW_X11_DISPLAY_POINTER, nullptr));
@@ -458,7 +480,8 @@ void WindowSDL::HandleMouseEvent(SDL_Event& event) {
         RearmCursorAutoHideTimer();
       }
       MouseEvent e(this, MouseEvent::Button::kNone, int32_t(event.motion.x * density),
-                   int32_t(event.motion.y * density));
+                   int32_t(event.motion.y * density), 0, 0, int32_t(event.motion.xrel * density),
+                   int32_t(event.motion.yrel * density));
       OnMouseMove(e, destruction_receiver);
       break;
     }

@@ -107,6 +107,11 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
     requested_extensions.emplace("VK_KHR_xcb_surface",
                                  &vulkan_instance->extensions_.ext_KHR_xcb_surface);
 #endif
+#ifdef VK_USE_PLATFORM_WAYLAND_KHR
+    // #7.
+    requested_extensions.emplace("VK_KHR_wayland_surface",
+                                 &vulkan_instance->extensions_.ext_KHR_wayland_surface);
+#endif
 #ifdef VK_USE_PLATFORM_ANDROID_KHR
     // #9.
     requested_extensions.emplace("VK_KHR_android_surface",
@@ -368,6 +373,11 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
 #ifdef VK_USE_PLATFORM_XCB_KHR
   if (vulkan_instance->extensions_.ext_KHR_xcb_surface) {
 #include <rex/ui/vulkan/functions/instance_khr_xcb_surface.inc>
+  }
+#endif
+#ifdef VK_USE_PLATFORM_WAYLAND_KHR
+  if (vulkan_instance->extensions_.ext_KHR_wayland_surface) {
+#include <rex/ui/vulkan/functions/instance_khr_wayland_surface.inc>
   }
 #endif
 #ifdef VK_USE_PLATFORM_ANDROID_KHR

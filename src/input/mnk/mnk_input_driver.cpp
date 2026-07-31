@@ -21,10 +21,6 @@
 #include <cmath>
 #include <cstring>
 
-#if REX_PLATFORM_WIN32
-#include <Windows.h>
-#endif
-
 REXCVAR_DEFINE_BOOL(mnk_mode, false, "Input", "Enable keyboard/mouse controller emulation");
 REXCVAR_DEFINE_INT32(mnk_user_index, 0, "Input", "Controller slot (0-3) for MnK").range(0, 3);
 REXCVAR_DEFINE_DOUBLE(mnk_sensitivity, 1.0, "Input", "Mouse sensitivity for right stick")
@@ -87,6 +83,8 @@ void MnkInputDriver::OnClosing(rex::ui::UIEvent&) {
     if (mouse_captured_) {
       mouse_captured_ = false;
       attached_window_->SetCursorVisibility(precapture_cursor_visibility_);
+      attached_window_->SetRelativeMouseMode(false);
+      relative_mouse_mode_ = false;
       attached_window_->ReleaseMouse();
     }
     attached_window_->RemoveInputListener(this);
@@ -256,23 +254,6 @@ void MnkInputDriver::EnqueueKeystroke(uint16_t vk_pad, bool down) {
   keystroke_queue_.push(ks);
 }
 
-void MnkInputDriver::CenterCursor() {
-  if (!attached_window_)
-    return;
-  int32_t cx = static_cast<int32_t>(attached_window_->GetActualLogicalWidth() / 2);
-  int32_t cy = static_cast<int32_t>(attached_window_->GetActualLogicalHeight() / 2);
-  prev_mouse_x_ = cx;
-  prev_mouse_y_ = cy;
-#if REX_PLATFORM_WIN32
-  HWND hwnd = static_cast<HWND>(attached_window_->GetNativeWindowHandle());
-  if (hwnd) {
-    POINT pt = {static_cast<LONG>(cx), static_cast<LONG>(cy)};
-    ClientToScreen(hwnd, &pt);
-    SetCursorPos(pt.x, pt.y);
-  }
-#endif
-}
-
 void MnkInputDriver::UpdateMouseCapture() {
   if (!attached_window_)
     return;
@@ -284,18 +265,20 @@ void MnkInputDriver::UpdateMouseCapture() {
     precapture_cursor_visibility_ = attached_window_->GetCursorVisibility();
     attached_window_->SetCursorVisibility(rex::ui::Window::CursorVisibility::kHidden);
     attached_window_->CaptureMouse();
+    // Lock the pointer so mouse-look isn't clamped at the window edge. This
+    // replaces warping the cursor back to the center every frame, which
+    // Wayland compositors reject. If the platform can't lock the pointer we
+    // fall back to absolute-position deltas, as before.
+    relative_mouse_mode_ = attached_window_->SetRelativeMouseMode(true);
     // Reset deltas to avoid a spike on capture start
     mouse_dx_ = 0;
     mouse_dy_ = 0;
   } else if (!should_capture && mouse_captured_) {
     mouse_captured_ = false;
     attached_window_->SetCursorVisibility(precapture_cursor_visibility_);
+    attached_window_->SetRelativeMouseMode(false);
+    relative_mouse_mode_ = false;
     attached_window_->ReleaseMouse();
-  }
-
-  // Re-center cursor each frame while captured to prevent edge clamping
-  if (mouse_captured_) {
-    CenterCursor();
   }
 }
 
@@ -365,8 +348,14 @@ void MnkInputDriver::OnMouseMove(rex::ui::MouseEvent& e) {
   std::lock_guard lock(state_mutex_);
   int32_t x = e.x();
   int32_t y = e.y();
-  mouse_dx_ += x - prev_mouse_x_;
-  mouse_dy_ += y - prev_mouse_y_;
+  if (relative_mouse_mode_) {
+    // The pointer is locked; absolute positions no longer move.
+    mouse_dx_ += e.dx();
+    mouse_dy_ += e.dy();
+  } else {
+    mouse_dx_ += x - prev_mouse_x_;
+    mouse_dy_ += y - prev_mouse_y_;
+  }
   prev_mouse_x_ = x;
   prev_mouse_y_ = y;
 }
@@ -380,6 +369,8 @@ void MnkInputDriver::OnLostFocus(rex::ui::UISetupEvent&) {
   if (mouse_captured_ && attached_window_) {
     mouse_captured_ = false;
     attached_window_->SetCursorVisibility(precapture_cursor_visibility_);
+    attached_window_->SetRelativeMouseMode(false);
+    relative_mouse_mode_ = false;
     attached_window_->ReleaseMouse();
   }
 }

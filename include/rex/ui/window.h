@@ -301,6 +301,16 @@ class Window {
   bool IsMouseCaptureRequested() const { return mouse_capture_request_count_ != 0; }
   void CaptureMouse();
   void ReleaseMouse();
+  // Locks the pointer to the window and switches mouse motion events to
+  // relative deltas (MouseEvent::dx/dy), for mouse-look style input. Warping
+  // the pointer to re-center it is not usable for this: Wayland compositors
+  // reject client pointer warps outside of an explicit pointer lock, so the
+  // platform's own relative-motion path has to be used instead. Returns true
+  // if relative mode is active afterwards. No-op returning false by default.
+  virtual bool SetRelativeMouseMode(bool enable) {
+    (void)enable;
+    return false;
+  }
 
   // Desired state stored by the common Window, externally modifiable, read-only
   // in the implementation.
