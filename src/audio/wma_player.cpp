@@ -369,8 +369,10 @@ void WmaPlayer::OpenSong(size_t index) {
       REXAPU_ERROR("WmaPlayer: SDL_OpenAudioDeviceStream failed: {}", SDL_GetError());
       return;
     }
-    SDL_SetAudioStreamGain(stream_,
-                           REXCVAR_GET(audio_mute) ? 0.0f : volume_.load() * GetDuckFactor());
+    SDL_SetAudioStreamGain(stream_, REXCVAR_GET(audio_mute)
+                                        ? 0.0f
+                                        : volume_.load() * GetDuckFactor() *
+                                              static_cast<float>(REXCVAR_GET(audio_volume)));
     SDL_ResumeAudioStreamDevice(stream_);
   } else {
     SDL_AudioSpec current_input;
@@ -442,7 +444,9 @@ void WmaPlayer::ThreadMain() {
   float last_applied_gain = -1.0f;  // unreachable by the formula below, forces the first apply
 
   while (running_.load()) {
-    float gain = REXCVAR_GET(audio_mute) ? 0.0f : volume_.load() * GetDuckFactor();
+    float gain = REXCVAR_GET(audio_mute) ? 0.0f
+                                         : volume_.load() * GetDuckFactor() *
+                                               static_cast<float>(REXCVAR_GET(audio_volume));
     if (stream_ && gain != last_applied_gain) {
       SDL_SetAudioStreamGain(stream_, gain);
       last_applied_gain = gain;
@@ -597,8 +601,17 @@ void WmaPlayer::Resume() {
 
 void WmaPlayer::SetVolume(float volume) {
   volume_.store(volume);
+  // Must use the same gain expression as stream creation and ThreadMain's
+  // poll, master volume included. Leaving audio_volume out here does not just
+  // lose it for one call: ThreadMain only re-applies when its *computed* gain
+  // differs from the one it last applied, so a SetVolume that writes the
+  // stream directly with a different formula leaves a gain the poll believes
+  // is already correct. It then never corrects it, and the master volume
+  // stays bypassed until something else happens to move volume_ or
+  // audio_volume again.
   if (stream_ && !REXCVAR_GET(audio_mute))
-    SDL_SetAudioStreamGain(stream_, volume * GetDuckFactor());
+    SDL_SetAudioStreamGain(
+        stream_, volume * GetDuckFactor() * static_cast<float>(REXCVAR_GET(audio_volume)));
 }
 
 }  // namespace rex::audio
