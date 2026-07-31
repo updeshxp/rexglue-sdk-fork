@@ -138,6 +138,49 @@ ModManagerDialog::~ModManagerDialog() {
     if (thread.joinable())
       thread.join();
   }
+  if (sideload_thread_.joinable()) {
+    sideload_thread_.join();
+  }
+}
+
+void ModManagerDialog::SideloadArchive(std::filesystem::path zip_path) {
+  // Resolve the mods root directly rather than going through ReloadFromDisk
+  // (which would also mark loaded_ = true and skip OnDraw's first-frame
+  // catalog_.Refresh() kickoff -- this can run before OnDraw ever sees this
+  // dialog, e.g. when a drop opens the overlay instead of the F1 bind).
+  auto root = rex::system::ModState::ResolveModsRoot();
+
+  bool expected = false;
+  if (!sideload_in_flight_.compare_exchange_strong(expected, true)) {
+    return;  // an install is already running; ignore this drop
+  }
+  if (sideload_thread_.joinable()) {
+    sideload_thread_.join();
+  }
+  {
+    std::lock_guard<std::mutex> lock(sideload_mutex_);
+    sideload_result_ = SideloadResult{};
+    sideload_result_.in_progress = true;
+  }
+
+  sideload_thread_ = std::thread([this, root, zip_path = std::move(zip_path)] {
+    std::string error;
+    auto result = rex::system::ModState::InstallLocalArchive(root, zip_path, error);
+
+    std::lock_guard<std::mutex> lock(sideload_mutex_);
+    sideload_result_.in_progress = false;
+    sideload_result_.done = true;
+    sideload_result_.ok = result.has_value();
+    if (result) {
+      sideload_result_.message = (result->updated ? "Updated \"" : "Sideloaded \"") + result->id +
+                                 "\"" +
+                                 (result->version.empty() ? "" : " (v" + result->version + ")");
+      sideload_result_.focus_id = result->id;
+    } else {
+      sideload_result_.message = error;
+    }
+    sideload_in_flight_.store(false, std::memory_order_release);
+  });
 }
 
 void ModManagerDialog::ReloadFromDisk() {
@@ -277,6 +320,30 @@ void ModManagerDialog::DrawRestartBanner() {
 }
 
 void ModManagerDialog::DrawInstalledTab() {
+  {
+    SideloadResult sideload_snapshot;
+    {
+      std::lock_guard<std::mutex> lock(sideload_mutex_);
+      sideload_snapshot = sideload_result_;
+      // Consume the focus request exactly once; the message itself persists
+      // (same "shows forever until the next install" convention the catalog
+      // tab's install status already uses).
+      sideload_result_.focus_id.clear();
+    }
+    if (sideload_snapshot.in_progress) {
+      ImGui::TextColored(kMutedText, "Installing dropped mod...");
+      ImGui::Separator();
+    } else if (sideload_snapshot.done) {
+      ImGui::TextColored(sideload_snapshot.ok ? kUpdateBadge : kErrorBadge, "%s",
+                         sideload_snapshot.message.c_str());
+      ImGui::Separator();
+    }
+    if (sideload_snapshot.ok && !sideload_snapshot.focus_id.empty()) {
+      ReloadFromDisk();
+      focus_mod_id_ = sideload_snapshot.focus_id;
+    }
+  }
+
   if (ImGui::SmallButton("Auto-sort")) {
     entries_ = rex::system::ModState::AutoSort(entries_, manifests_);
     PersistAndRevalidate();
@@ -325,6 +392,13 @@ void ModManagerDialog::DrawInstalledTab() {
         manifest_it != manifests_.end() ? manifest_it->second : kEmptyInfo;
 
     ImGui::PushID(entry.id.c_str());
+    bool is_focused = entry.id == focus_mod_id_;
+    if (is_focused) {
+      // One-shot: consume so this only scrolls/highlights on the frame right
+      // after a sideload lands, not on every subsequent draw.
+      focus_mod_id_.clear();
+      ImGui::SetScrollHereY(0.2f);
+    }
     if (!entry.enabled) {
       ImGui::PushStyleColor(ImGuiCol_Text, kMutedText);
     }
@@ -360,7 +434,12 @@ void ModManagerDialog::DrawInstalledTab() {
       ImGui::TextColored(kHeaderText, "#%d", priority++);
       ImGui::SameLine();
     }
-    ImGui::Text("%s", mod.display_name.empty() ? entry.id.c_str() : mod.display_name.c_str());
+    if (is_focused) {
+      ImGui::TextColored(kUpdateBadge, "%s",
+                         mod.display_name.empty() ? entry.id.c_str() : mod.display_name.c_str());
+    } else {
+      ImGui::Text("%s", mod.display_name.empty() ? entry.id.c_str() : mod.display_name.c_str());
+    }
     if (!mod.version.empty()) {
       ImGui::SameLine();
       ImGui::TextColored(kMutedText, "v%s", mod.version.c_str());
@@ -370,7 +449,18 @@ void ModManagerDialog::DrawInstalledTab() {
       ImGui::TextColored(kCodeBadge, "[code]");
     }
 
-    if (const auto* catalog_entry = find_catalog_entry(entry.id)) {
+    const auto* catalog_entry = find_catalog_entry(entry.id);
+    if (catalog_.state() == rex::system::CatalogState::kReady && !catalog_entry) {
+      ImGui::SameLine();
+      ImGui::TextColored(kMutedText, "[Sideloaded]");
+      if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip(
+            "Installed locally (drag-and-drop or manually copied) -- not from the "
+            "mod catalog, so it won't get automatic update checks.");
+      }
+    }
+
+    if (catalog_entry) {
       if (!mod.version.empty() &&
           rex::system::CompareVersionStrings(catalog_entry->version, mod.version) > 0) {
         ImGui::SameLine();

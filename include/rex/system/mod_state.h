@@ -19,6 +19,7 @@
 #pragma once
 
 #include <filesystem>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -45,6 +46,14 @@ struct ModIssue {
   std::string id;
   enum class Kind { kError, kWarning } kind = Kind::kError;
   std::string message;
+};
+
+// Outcome of a successful ModState::InstallLocalArchive call.
+struct ModInstallResult {
+  std::string id;
+  std::string version;
+  // true if this replaced an already-installed mod of the same id.
+  bool updated = false;
 };
 
 class ModState {
@@ -108,6 +117,26 @@ class ModState {
   // This process's platform id in the "platform" mod.toml key convention
   // (e.g. "windows-x64", "linux-x64", "linux-arm64").
   static std::string HostPlatformId();
+
+  // Sideloads a local mod archive (.zip) dropped onto the game window:
+  // extracts it into `root`, mirroring the same top-level-directory
+  // convention as a catalog install (a single top-level directory becomes the
+  // mod and lends its name to the id; otherwise the archive's own content is
+  // used flat and named after the zip's file stem). Unlike a catalog install
+  // (which trusts the catalog's modId), this is the only signal available to
+  // tell an actual mod archive apart from an arbitrary zip a player might
+  // drop, so the resolved content root MUST contain a mod.toml or the
+  // install is refused. If a mod of the same id is already installed, this
+  // replaces it only when the archive's mod.toml `version` is >= the
+  // installed one's (CompareVersionStrings), same not-older-clobbers-newer
+  // rule as a catalog update; otherwise it's refused. Appends the new id to
+  // mods.toml (enabled, at the end) or, when replacing, keeps the existing
+  // entry's slot/enabled flag untouched, then saves. Never throws; returns
+  // std::nullopt and fills `error` on any failure (not a zip, corrupt
+  // archive, no mod.toml, older version, filesystem error).
+  static std::optional<ModInstallResult> InstallLocalArchive(const std::filesystem::path& root,
+                                                             const std::filesystem::path& zip_path,
+                                                             std::string& error);
 };
 
 }  // namespace rex::system

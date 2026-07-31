@@ -48,6 +48,14 @@ class ModManagerDialog : public ImGuiDialog {
                    rex::Runtime* runtime, Window* window);
   ~ModManagerDialog() override;
 
+  // Sideloads a mod archive dropped onto the game window (see ReXApp::
+  // OnFileDrop): installs it via rex::system::ModState::InstallLocalArchive
+  // on a background thread, then, on success, focuses this dialog's
+  // Installed tab on the newly (re)installed mod. Safe to call while another
+  // sideload/install is already in flight -- a second drop while one is
+  // running is ignored rather than queued.
+  void SideloadArchive(std::filesystem::path zip_path);
+
  protected:
   void OnDraw(ImGuiIO& io) override;
 
@@ -97,6 +105,24 @@ class ModManagerDialog : public ImGuiDialog {
   std::mutex remote_icon_mutex_;
   std::unordered_map<std::string, std::vector<uint8_t>> remote_icon_bytes_;
   std::unordered_map<std::string, std::thread> icon_downloads_;
+
+  // Sideload (drag-and-drop zip install) state -- see SideloadArchive.
+  struct SideloadResult {
+    bool in_progress = false;
+    bool done = false;
+    bool ok = false;
+    std::string message;
+    // Id to focus in the Installed tab once this result is consumed; empty
+    // on failure (nothing to focus).
+    std::string focus_id;
+  };
+  std::atomic<bool> sideload_in_flight_{false};
+  std::thread sideload_thread_;
+  std::mutex sideload_mutex_;
+  SideloadResult sideload_result_;
+  // Id of the mod to auto-scroll to and highlight in the Installed tab, on
+  // the next draw after a successful sideload. Cleared once applied.
+  std::string focus_mod_id_;
 };
 
 }  // namespace rex::ui

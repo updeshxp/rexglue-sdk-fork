@@ -306,6 +306,27 @@ read/write UI over everything above:
   - Installing verifies the downloaded asset's SHA-256 against the
     catalog's `checksum` and **hard-refuses on mismatch**, never
     extracting a payload that doesn't match what was approved.
+- **Sideloading (drag-and-drop)**: dropping a `.zip` onto the game window
+  (`ReXApp::OnFileDrop`, `src/ui/rex_app.cpp`) installs it the same way a
+  catalog install does -- extract, unwrap a single top-level directory if
+  present (otherwise treat the archive as flat and derive the id from the
+  zip's own file stem), rename into `<mods_root>/<id>` -- via
+  `ModState::InstallLocalArchive`. Unlike a catalog install (which trusts the
+  catalog's `modId`), a dropped zip has no other signal to confirm it's
+  actually a mod, so the resolved content root **must contain a `mod.toml`**
+  or the install is refused; anything else dropped onto the window (a
+  non-`.zip` file, or a `.zip` with no manifest) is silently ignored/rejected
+  rather than treated as a mod. If a mod of the same id is already installed,
+  the drop only replaces it when its `mod.toml` `version` is >= the installed
+  one's (same not-older-clobbers-newer rule as a catalog update); otherwise
+  it's refused. This opens (or reuses) the mod manager overlay automatically
+  and scrolls/highlights the (re)installed mod's row in the "Installed" tab,
+  so the result is visible without the player having to press F1 themselves.
+  A mod installed this way carries no persisted "how did this get here"
+  flag -- the overlay marks any installed mod not present in the currently
+  loaded catalog snapshot as `[Sideloaded]`, purely as a derived comparison
+  against `ModCatalog::Snapshot()` (so it only shows once the "All" tab has
+  data; nothing is marked when the catalog is disabled/unreachable).
 
 ## `platform` strings and per-platform `code/` subdirectories (code mods only)
 

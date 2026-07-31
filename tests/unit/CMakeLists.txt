@@ -39,6 +39,7 @@ target_include_directories(unit_tests PRIVATE
 target_link_libraries(unit_tests PRIVATE
     rexcodegen
     rexruntime
+    miniz
     Catch2::Catch2WithMain
 )
 

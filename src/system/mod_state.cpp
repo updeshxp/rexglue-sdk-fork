@@ -11,6 +11,7 @@
 #include <rex/system/mod_state.h>
 
 #include <algorithm>
+#include <cctype>
 #include <fstream>
 #include <random>
 #include <sstream>
@@ -28,6 +29,54 @@ namespace rex::system {
 
 namespace {
 constexpr const char* kSidecarName = "mods.toml";
+
+// Sanitizes a candidate mod id the same way the companion desktop launcher's
+// build tags are: alnum/-/_/. pass through, everything else collapses to
+// '_'; an empty result falls back to "mod" so a pathological zip name never
+// produces an unusable/empty folder name.
+std::string SanitizeModId(const std::string& candidate) {
+  std::string sanitized;
+  sanitized.reserve(candidate.size());
+  for (char c : candidate) {
+    if (std::isalnum(static_cast<unsigned char>(c)) || c == '-' || c == '_' || c == '.') {
+      sanitized += c;
+    } else {
+      sanitized += '_';
+    }
+  }
+  // Trim any leading/trailing whitespace-turned-underscores from a name that
+  // started/ended with spaces.
+  while (!sanitized.empty() && sanitized.front() == '_') {
+    sanitized.erase(sanitized.begin());
+  }
+  while (!sanitized.empty() && sanitized.back() == '_') {
+    sanitized.pop_back();
+  }
+  return sanitized.empty() ? "mod" : sanitized;
+}
+
+// Best-effort read of a mod.toml's `version` key; empty on any failure
+// (missing file, parse error, missing key) -- mirrors ParseModInfo's own
+// tolerance in runtime.cpp.
+std::string ReadModVersion(const std::filesystem::path& manifest_path) {
+  if (!std::filesystem::is_regular_file(manifest_path)) {
+    return {};
+  }
+  try {
+    auto table = toml::parse_file(manifest_path.string());
+    return table["version"].value_or<std::string>("");
+  } catch (const toml::parse_error&) {
+    return {};
+  }
+}
+
+bool HasZipExtension(const std::filesystem::path& path) {
+  std::string ext = path.extension().string();
+  std::transform(ext.begin(), ext.end(), ext.begin(),
+                 [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+  return ext == ".zip";
+}
+
 }  // namespace
 
 std::filesystem::path ModState::ResolveModsRoot() {
@@ -386,6 +435,110 @@ std::vector<ModIssue> ModState::Validate(const std::vector<ModStateEntry>& entri
   }
 
   return issues;
+}
+
+std::optional<ModInstallResult> ModState::InstallLocalArchive(const std::filesystem::path& root,
+                                                              const std::filesystem::path& zip_path,
+                                                              std::string& error) {
+  error.clear();
+
+  if (!HasZipExtension(zip_path)) {
+    error = "not a .zip file";
+    return std::nullopt;
+  }
+
+  std::error_code ec;
+  std::filesystem::create_directories(root, ec);
+  if (ec) {
+    error = "failed to create mods folder: " + ec.message();
+    return std::nullopt;
+  }
+
+  auto staging = root / (".sideload-staging-" + zip_path.stem().string());
+  std::filesystem::remove_all(staging, ec);
+  std::string extract_error;
+  if (!rex::filesystem::ExtractZip(zip_path, staging, extract_error)) {
+    std::filesystem::remove_all(staging, ec);
+    error = "failed to extract archive: " + extract_error;
+    return std::nullopt;
+  }
+
+  // Unwrap a single top-level directory if present, same convention as a
+  // catalog install (ModCatalog::InstallWorker) and the companion desktop
+  // launcher's install_one_archive.
+  std::filesystem::path content_root = staging;
+  std::string derived_id;
+  {
+    std::vector<std::filesystem::directory_entry> top_level;
+    for (auto& entry : std::filesystem::directory_iterator(staging, ec)) {
+      top_level.push_back(entry);
+    }
+    if (top_level.size() == 1 && top_level[0].is_directory()) {
+      content_root = top_level[0].path();
+      derived_id = SanitizeModId(top_level[0].path().filename().string());
+    } else {
+      derived_id = SanitizeModId(zip_path.stem().string());
+    }
+  }
+
+  // Unlike a catalog install (which trusts the catalog's modId), a dropped
+  // zip has no other signal to confirm it's actually a mod archive and not
+  // some unrelated file the player dragged in by mistake.
+  if (!std::filesystem::is_regular_file(content_root / "mod.toml")) {
+    std::filesystem::remove_all(staging, ec);
+    error = "archive does not contain a mod.toml -- not a valid mod";
+    return std::nullopt;
+  }
+
+  std::string new_version = ReadModVersion(content_root / "mod.toml");
+
+  auto dest = root / derived_id;
+  bool updated = std::filesystem::exists(dest, ec);
+  if (updated) {
+    std::string existing_version = ReadModVersion(dest / "mod.toml");
+    std::vector<int> want;
+    std::vector<int> have;
+    bool new_parses = ParseVersionComponents(new_version, want);
+    bool existing_parses = ParseVersionComponents(existing_version, have);
+    // Same "can't-verify never blocks" posture as the rest of the mod
+    // system: only refuse when both sides parse and the drop is strictly
+    // older, so an unversioned mod (or one predating this check) is always
+    // safe to re-drop over itself.
+    if (new_parses && existing_parses && CompareVersions(have, want) > 0) {
+      std::filesystem::remove_all(staging, ec);
+      error = "a newer version of \"" + derived_id + "\" is already installed (installed v" +
+              (existing_version.empty() ? "?" : existing_version) + ", dropped v" +
+              (new_version.empty() ? "?" : new_version) + ")";
+      return std::nullopt;
+    }
+    std::filesystem::remove_all(dest, ec);
+  }
+
+  std::filesystem::rename(content_root, dest, ec);
+  if (ec) {
+    // Cross-filesystem rename can fail; fall back to a recursive copy.
+    ec.clear();
+    std::filesystem::create_directories(dest, ec);
+    std::filesystem::copy(content_root, dest,
+                          std::filesystem::copy_options::recursive |
+                              std::filesystem::copy_options::overwrite_existing,
+                          ec);
+    if (ec) {
+      std::filesystem::remove_all(staging, ec);
+      error = "failed to install extracted mod: " + ec.message();
+      return std::nullopt;
+    }
+  }
+  std::filesystem::remove_all(staging, ec);
+
+  auto entries = LoadReconciled(root);
+  if (std::none_of(entries.begin(), entries.end(),
+                   [&](const ModStateEntry& e) { return e.id == derived_id; })) {
+    entries.push_back(ModStateEntry{derived_id, true});
+  }
+  Save(root, entries);
+
+  return ModInstallResult{derived_id, new_version, updated};
 }
 
 }  // namespace rex::system
