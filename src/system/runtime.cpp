@@ -29,6 +29,8 @@
 #include <rex/system/export_resolver.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/function_dispatcher.h>
+#include <rex/system/mod_state.h>
+#include <rex/system/mod_version.h>
 #include <rex/system/user_module.h>
 #include <rex/system/xmemory.h>
 #include <rex/system/xthread.h>
@@ -47,6 +49,9 @@ REXCVAR_DEFINE_STRING(enabled_mods, "", "Runtime",
 REXCVAR_DEFINE_STRING(mods_dump_root, "", "Runtime",
                       "Host directory dumped assets (textures, shaders) are written under; "
                       "defaults to <exe folder>/dumps");
+
+// mod_catalog_* cvars are defined in mod_catalog.cpp, alongside the client
+// that uses them.
 
 namespace rex {
 
@@ -131,6 +136,7 @@ X_STATUS Runtime::Setup(RuntimeConfig config) {
 
   tool_mode_ = config.tool_mode;
   game_version_ = config.game_version;
+  catalog_name_ = config.catalog_name;
 
   // Create memory system first
   memory_ = std::make_unique<memory::Memory>();
@@ -323,114 +329,11 @@ uint8_t* Runtime::virtual_membase() const {
 
 namespace {
 
-// Splits a comma-separated list, trims whitespace around each entry, and
-// drops empty entries. Shared by ResolveEnabledMods() (enabled_mods cvar) and
-// ParseModInfo() (mod.toml's requires/load_after/conflicts keys); both use
-// the same "comma list of folder names" convention.
-std::vector<std::string> SplitCommaList(std::string_view csv) {
-  std::vector<std::string> result;
-  std::istringstream ss{std::string(csv)};
-  std::string token;
-  while (std::getline(ss, token, ',')) {
-    auto start = token.find_first_not_of(" \t");
-    auto end = token.find_last_not_of(" \t");
-    if (start == std::string::npos) {
-      continue;
-    }
-    token = token.substr(start, end - start + 1);
-    if (!token.empty()) {
-      result.push_back(std::move(token));
-    }
-  }
-  return result;
-}
-
-// Splits one `requires` entry into a mod name and an optional minimum-version
-// constraint: "game_symbols >= 1.0.0" -> {"game_symbols", "1.0.0"}; a bare
-// "game_symbols" -> {"game_symbols", ""} (unconstrained). Whitespace around
-// the name and version is trimmed; SplitCommaList() has already trimmed the
-// entry's outer edges.
-system::ModRequirement ParseRequirement(std::string_view entry) {
-  system::ModRequirement req;
-  auto op_pos = entry.find(">=");
-  if (op_pos == std::string_view::npos) {
-    req.name = std::string(entry);
-    return req;
-  }
-  auto name_part = entry.substr(0, op_pos);
-  auto name_end = name_part.find_last_not_of(" \t");
-  req.name =
-      std::string(name_part.substr(0, name_end == std::string_view::npos ? 0 : name_end + 1));
-
-  auto version_part = entry.substr(op_pos + 2);
-  auto version_start = version_part.find_first_not_of(" \t");
-  if (version_start != std::string_view::npos) {
-    req.min_version = std::string(version_part.substr(version_start));
-  }
-  return req;
-}
-
-// Parses mod.toml's `game_version` key into a minimum-version constraint.
-// Both "1.2.0" and ">= 1.2.0" mean "must be at least 1.2.0" -- no other
-// comparison operators are supported. Returns empty for an absent/blank key.
-std::string ParseGameVersionConstraint(std::string_view value) {
-  auto start = value.find_first_not_of(" \t");
-  if (start == std::string_view::npos) {
-    return "";
-  }
-  value = value.substr(start);
-  if (value.substr(0, 2) == ">=") {
-    value = value.substr(2);
-    auto version_start = value.find_first_not_of(" \t");
-    value =
-        version_start == std::string_view::npos ? std::string_view() : value.substr(version_start);
-  }
-  auto end = value.find_last_not_of(" \t");
-  return end == std::string_view::npos ? "" : std::string(value.substr(0, end + 1));
-}
-
-// Parses a dotted numeric version ("1.0.0", "2.3") into its components.
-// Returns false if any '.'-separated part isn't a non-negative integer or the
-// string is empty -- callers treat that as "not a usable version" rather than
-// trying to compare it.
-bool ParseVersionComponents(std::string_view version, std::vector<int>& out) {
-  out.clear();
-  std::string current;
-  auto flush = [&]() -> bool {
-    if (current.empty() || !std::all_of(current.begin(), current.end(),
-                                        [](unsigned char c) { return std::isdigit(c) != 0; })) {
-      return false;
-    }
-    out.push_back(std::stoi(current));
-    current.clear();
-    return true;
-  };
-  for (char c : version) {
-    if (c == '.') {
-      if (!flush()) {
-        return false;
-      }
-    } else {
-      current += c;
-    }
-  }
-  return flush();
-}
-
-// Compares two parsed versions component-wise; missing trailing components
-// count as 0, so "1.0" == "1.0.0". Returns <0, 0, >0 as `have` compares to
-// `want`.
-int CompareVersions(const std::vector<int>& have, const std::vector<int>& want) {
-  size_t n = std::max(have.size(), want.size());
-  for (size_t i = 0; i < n; ++i) {
-    int hv = i < have.size() ? have[i] : 0;
-    int wv = i < want.size() ? want[i] : 0;
-    if (hv != wv) {
-      return hv - wv;
-    }
-  }
-  return 0;
-}
+using rex::system::CompareVersions;
+using rex::system::ParseGameVersionConstraint;
+using rex::system::ParseRequirement;
+using rex::system::ParseVersionComponents;
+using rex::system::SplitCommaList;
 
 // mod.toml is optional and purely descriptive except for `code`, which names
 // the DLL stem the mod loader should load from <mod_root>/code/, and
@@ -465,6 +368,7 @@ system::ModInfo ParseModInfo(const std::filesystem::path& mod_root) {
     }
     info.load_after_mods = SplitCommaList(table["load_after"].value_or<std::string>(""));
     info.conflicts_mods = SplitCommaList(table["conflicts"].value_or<std::string>(""));
+    info.platforms = SplitCommaList(table["platform"].value_or<std::string>(""));
     info.min_game_version =
         ParseGameVersionConstraint(table["game_version"].value_or<std::string>(""));
   } catch (const toml::parse_error& error) {
@@ -478,13 +382,9 @@ system::ModInfo ParseModInfo(const std::filesystem::path& mod_root) {
 void Runtime::ResolveEnabledMods() {
   enabled_mod_roots_.clear();
   enabled_mods_info_.clear();
+  mod_state_at_startup_.clear();
 
   std::string mods_root_cvar = REXCVAR_GET(mods_data_root);
-  std::string enabled_cvar = REXCVAR_GET(enabled_mods);
-  if (enabled_cvar.empty()) {
-    return;
-  }
-
   // Default to <exe folder>/mods when unset, so a packaged build with mods
   // enabled in its config works without a launcher passing --mods_data_root
   // explicitly (relative values are otherwise resolved against CWD, not the
@@ -493,13 +393,37 @@ void Runtime::ResolveEnabledMods() {
                        ? rex::filesystem::GetExecutableFolder() / "mods"
                        : std::filesystem::absolute(std::filesystem::path(mods_root_cvar));
   if (!std::filesystem::is_directory(mods_root)) {
+    // No mods.toml possible either; fall back straight to the enabled_mods
+    // cvar below (empty mods_root means "nothing installed").
+    std::string enabled_cvar = REXCVAR_GET(enabled_mods);
+    if (enabled_cvar.empty()) {
+      return;
+    }
     REXSYS_WARN("  mods_data_root does not exist: {}", mods_root.string());
     return;
   }
 
+  // mods.toml is the source of truth: an ordered list of {id, enabled}
+  // entries, reconciled against what's actually on disk. The enabled_mods
+  // cvar is only consulted as a fallback, so a bare command-line launch
+  // (no launcher-managed sidecar) still works.
+  std::vector<std::string> enabled_ids;
+  auto sidecar_path = mods_root / "mods.toml";
+  if (std::filesystem::is_regular_file(sidecar_path)) {
+    auto entries = system::ModState::LoadReconciled(mods_root);
+    mod_state_at_startup_ = entries;
+    enabled_ids = system::ModState::EnabledIdsInOrder(entries);
+  } else {
+    std::string enabled_cvar = REXCVAR_GET(enabled_mods);
+    enabled_ids = SplitCommaList(enabled_cvar);
+    for (auto& id : enabled_ids) {
+      mod_state_at_startup_.push_back(system::ModStateEntry{id, true});
+    }
+  }
+
   // Order is preserved: earlier entries are higher priority (see
   // ModOverlayRoots).
-  for (auto& name : SplitCommaList(enabled_cvar)) {
+  for (auto& name : enabled_ids) {
     auto mod_dir = mods_root / name;
     if (std::filesystem::is_directory(mod_dir)) {
       enabled_mod_roots_.push_back(mod_dir);
@@ -516,6 +440,20 @@ void Runtime::ResolveEnabledMods() {
   for (auto& mod_root : enabled_mod_roots_) {
     enabled_mods_info_.push_back(ParseModInfo(mod_root));
   }
+}
+
+std::vector<system::ModInfo> Runtime::InstalledModsInfo() const {
+  std::vector<system::ModInfo> infos;
+  auto mods_root = system::ModState::ResolveModsRoot();
+  if (!std::filesystem::is_directory(mods_root)) {
+    return infos;
+  }
+  auto entries = system::ModState::LoadReconciled(mods_root);
+  infos.reserve(entries.size());
+  for (const auto& entry : entries) {
+    infos.push_back(ParseModInfo(mods_root / entry.id));
+  }
+  return infos;
 }
 
 std::vector<std::filesystem::path> Runtime::ModOverlayRoots(std::string_view subpath) const {

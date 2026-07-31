@@ -10,17 +10,22 @@
  */
 #include <rex/ui/overlay/mod_manager_overlay.h>
 
+#include <algorithm>
 #include <fstream>
 #include <utility>
 #include <vector>
 
 #include <imgui.h>
 
+#include <rex/net/http.h>
+#include <rex/platform/process.h>
 #include <rex/runtime.h>
 #include <rex/system/mod_conflict_tracker.h>
+#include <rex/system/mod_version.h>
 #include <rex/ui/image_decode.h>
 #include <rex/ui/immediate_drawer.h>
 #include <rex/ui/keybinds.h>
+#include <rex/ui/window.h>
 
 namespace rex::ui {
 
@@ -29,15 +34,11 @@ constexpr ImVec4 kHeaderText{0.60f, 0.85f, 1.00f, 1.00f};     // accent blue
 constexpr ImVec4 kMutedText{0.60f, 0.62f, 0.66f, 1.00f};      // dim grey
 constexpr ImVec4 kCodeBadge{1.00f, 0.82f, 0.30f, 1.00f};      // gold, matches gamerscore badges
 constexpr ImVec4 kConflictBadge{1.00f, 0.55f, 0.35f, 1.00f};  // amber/orange, distinct from gold
+constexpr ImVec4 kErrorBadge{1.00f, 0.35f, 0.35f, 1.00f};
+constexpr ImVec4 kWarnBadge{1.00f, 0.75f, 0.30f, 1.00f};
+constexpr ImVec4 kUpdateBadge{0.45f, 0.85f, 0.55f, 1.00f};
 constexpr float kIconSize = 40.0f;
 
-// Gamepad face buttons ImGui already tracks (via io.AddKeyEvent, fed by
-// whatever gamepad backend is active) paired with the button name
-// rex::ui::GamepadButtonNames()/ParseGamepadButton use, so a captured press
-// round-trips through the same string the keyboard path uses. Limited to the
-// four face buttons deliberately: those are the ones free from ImGui's own
-// menu navigation (D-pad/shoulders/sticks drive nav itself), so capturing
-// them here doesn't fight the future fully-gamepad-navigable overlay.
 constexpr std::pair<ImGuiKey, const char*> kCapturableGamepadButtons[] = {
     {ImGuiKey_GamepadFaceDown, "A"},
     {ImGuiKey_GamepadFaceRight, "B"},
@@ -45,11 +46,6 @@ constexpr std::pair<ImGuiKey, const char*> kCapturableGamepadButtons[] = {
     {ImGuiKey_GamepadFaceUp, "Y"},
 };
 
-// Scans for the next keyboard key or gamepad face-button press while a bind
-// is in "listening" mode. Returns the rex::ui key/button name to apply via
-// SetBindKey, or empty if nothing was pressed this frame yet. Escape cancels
-// (returns "\x1b" as a sentinel the caller checks for) without changing the
-// bind.
 constexpr const char* kCancelSentinel = "\x1b";
 
 std::string PollListeningCapture(ImGuiIO& io) {
@@ -64,9 +60,6 @@ std::string PollListeningCapture(ImGuiIO& io) {
     if (!ImGui::IsKeyPressed(k, false)) {
       continue;
     }
-    // Translate via ImGui's own key name, skipping keys that don't map to a
-    // rex::ui VirtualKey name -- rebinding is limited to keys the bind system
-    // itself recognizes.
     const char* imgui_name = ImGui::GetKeyName(k);
     if (imgui_name && rex::ui::ParseVirtualKey(imgui_name) != rex::ui::VirtualKey::kNone) {
       return imgui_name;
@@ -84,9 +77,8 @@ std::string PollListeningCapture(ImGuiIO& io) {
 std::string JoinCommaList(const std::vector<std::string>& names) {
   std::string joined;
   for (size_t i = 0; i < names.size(); ++i) {
-    if (i > 0) {
+    if (i > 0)
       joined += ", ";
-    }
     joined += names[i];
   }
   return joined;
@@ -95,9 +87,8 @@ std::string JoinCommaList(const std::vector<std::string>& names) {
 std::string JoinRequirements(const std::vector<rex::system::ModRequirement>& reqs) {
   std::string joined;
   for (size_t i = 0; i < reqs.size(); ++i) {
-    if (i > 0) {
+    if (i > 0)
       joined += ", ";
-    }
     joined += reqs[i].name;
     if (!reqs[i].min_version.empty()) {
       joined += " >= ";
@@ -106,135 +97,428 @@ std::string JoinRequirements(const std::vector<rex::system::ModRequirement>& req
   }
   return joined;
 }
+
+std::vector<uint8_t> ReadFileBytes(const std::filesystem::path& path) {
+  std::ifstream file(path, std::ios::binary | std::ios::ate);
+  if (!file)
+    return {};
+  std::streamsize length = file.tellg();
+  if (length <= 0)
+    return {};
+  file.seekg(0);
+  std::vector<uint8_t> bytes(static_cast<size_t>(length));
+  if (!file.read(reinterpret_cast<char*>(bytes.data()), length))
+    return {};
+  return bytes;
+}
+
+std::unique_ptr<ImmediateTexture> UploadRGBA(ImmediateDrawer* drawer,
+                                             const std::vector<uint8_t>& bytes) {
+  if (!drawer || bytes.empty())
+    return nullptr;
+  int width = 0, height = 0;
+  std::vector<uint8_t> rgba = DecodeImageRGBA(bytes.data(), bytes.size(), width, height);
+  if (rgba.empty() || width <= 0 || height <= 0)
+    return nullptr;
+  return drawer->CreateTexture(static_cast<uint32_t>(width), static_cast<uint32_t>(height),
+                               ImmediateTextureFilter::kLinear, false, rgba.data());
+}
+
 }  // namespace
 
 ModManagerDialog::ModManagerDialog(ImGuiDrawer* imgui_drawer, ImmediateDrawer* immediate_drawer,
-                                   rex::Runtime* runtime)
-    : ImGuiDialog(imgui_drawer), immediate_drawer_(immediate_drawer), runtime_(runtime) {}
+                                   rex::Runtime* runtime, Window* window)
+    : ImGuiDialog(imgui_drawer),
+      immediate_drawer_(immediate_drawer),
+      runtime_(runtime),
+      window_(window) {}
 
-ModManagerDialog::~ModManagerDialog() = default;
-
-ImmediateTexture* ModManagerDialog::GetIcon(const rex::system::ModInfo& mod) {
-  if (mod.icon_path.empty()) {
-    return nullptr;
+ModManagerDialog::~ModManagerDialog() {
+  for (auto& [url, thread] : icon_downloads_) {
+    if (thread.joinable())
+      thread.join();
   }
-  const std::string key = mod.icon_path.string();
-  auto it = icon_cache_.find(key);
-  if (it != icon_cache_.end()) {
-    return it->second.get();
-  }
+}
 
-  std::unique_ptr<ImmediateTexture> texture;
-  if (immediate_drawer_) {
-    std::ifstream file(mod.icon_path, std::ios::binary | std::ios::ate);
-    if (file) {
-      std::streamsize length = file.tellg();
-      if (length > 0) {
-        file.seekg(0);
-        std::vector<uint8_t> bytes(static_cast<size_t>(length));
-        if (file.read(reinterpret_cast<char*>(bytes.data()), length)) {
-          int width = 0;
-          int height = 0;
-          std::vector<uint8_t> rgba = DecodeImageRGBA(bytes.data(), bytes.size(), width, height);
-          if (!rgba.empty() && width > 0 && height > 0) {
-            texture = immediate_drawer_->CreateTexture(
-                static_cast<uint32_t>(width), static_cast<uint32_t>(height),
-                ImmediateTextureFilter::kLinear, false, rgba.data());
-          }
-        }
-      }
+void ModManagerDialog::ReloadFromDisk() {
+  mods_root_ = rex::system::ModState::ResolveModsRoot();
+  entries_ = rex::system::ModState::LoadReconciled(mods_root_);
+  manifests_.clear();
+  if (runtime_) {
+    for (const auto& info : runtime_->InstalledModsInfo()) {
+      manifests_.emplace(info.folder_name, info);
     }
   }
+  loaded_ = true;
+  issues_ = rex::system::ModState::Validate(entries_, manifests_,
+                                            runtime_ ? runtime_->game_version() : "",
+                                            rex::system::ModState::HostPlatformId());
+}
 
+void ModManagerDialog::PersistAndRevalidate() {
+  rex::system::ModState::Save(mods_root_, entries_);
+  issues_ = rex::system::ModState::Validate(entries_, manifests_,
+                                            runtime_ ? runtime_->game_version() : "",
+                                            rex::system::ModState::HostPlatformId());
+}
+
+bool ModManagerDialog::StateDiffersFromStartup() const {
+  if (!runtime_)
+    return false;
+  return entries_ != runtime_->ModStateAtStartup();
+}
+
+ImmediateTexture* ModManagerDialog::GetLocalIcon(const rex::system::ModInfo& mod) {
+  if (mod.icon_path.empty())
+    return nullptr;
+  const std::string key = mod.icon_path.string();
+  auto it = icon_cache_.find(key);
+  if (it != icon_cache_.end())
+    return it->second.get();
+
+  auto texture = UploadRGBA(immediate_drawer_, ReadFileBytes(mod.icon_path));
   ImmediateTexture* raw = texture.get();
   icon_cache_.emplace(key, std::move(texture));
   return raw;
 }
 
+ImmediateTexture* ModManagerDialog::GetRemoteIcon(const std::string& url) {
+  if (url.empty())
+    return nullptr;
+  auto cache_it = icon_cache_.find(url);
+  if (cache_it != icon_cache_.end())
+    return cache_it->second.get();
+
+  std::vector<uint8_t> bytes;
+  {
+    std::lock_guard<std::mutex> lock(remote_icon_mutex_);
+    auto bytes_it = remote_icon_bytes_.find(url);
+    if (bytes_it != remote_icon_bytes_.end()) {
+      bytes = bytes_it->second;
+      remote_icon_bytes_.erase(bytes_it);
+    } else if (!icon_downloads_.contains(url)) {
+      icon_downloads_.emplace(url, std::thread([this, url] {
+                                auto response = rex::net::HttpGet(url);
+                                if (response.ok()) {
+                                  std::lock_guard<std::mutex> lock2(remote_icon_mutex_);
+                                  remote_icon_bytes_[url] = std::vector<uint8_t>(
+                                      response.body.begin(), response.body.end());
+                                }
+                              }));
+      return nullptr;
+    } else {
+      return nullptr;
+    }
+  }
+
+  auto texture = UploadRGBA(immediate_drawer_, bytes);
+  ImmediateTexture* raw = texture.get();
+  icon_cache_.emplace(url, std::move(texture));
+  return raw;
+}
+
 void ModManagerDialog::OnDraw(ImGuiIO& io) {
+  if (!loaded_) {
+    ReloadFromDisk();
+    if (runtime_ && !runtime_->catalog_name().empty()) {
+      catalog_.Refresh();
+    }
+  }
+
   ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, 40.0f), ImGuiCond_FirstUseEver,
                           ImVec2(0.5f, 0.0f));
-  ImGui::SetNextWindowSize(ImVec2(560.0f, 480.0f), ImGuiCond_FirstUseEver);
+  ImGui::SetNextWindowSize(ImVec2(640.0f, 560.0f), ImGuiCond_FirstUseEver);
   ImGui::SetNextWindowBgAlpha(0.92f);
 
   ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(14.0f, 12.0f));
   ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(8.0f, 6.0f));
 
   if (ImGui::Begin("Mods##overlay", nullptr, ImGuiWindowFlags_NoCollapse)) {
-    const auto mods = runtime_ ? runtime_->EnabledModsInfo() : std::vector<rex::system::ModInfo>{};
+    DrawRestartBanner();
 
-    ImGui::PushStyleColor(ImGuiCol_Text, kHeaderText);
-    ImGui::Text("%zu mod%s enabled", mods.size(), mods.size() == 1 ? "" : "s");
-    ImGui::PopStyleColor();
-    ImGui::TextColored(kMutedText, "Load order: earlier entries win on conflicting files.");
-    ImGui::Separator();
-    ImGui::Spacing();
-
-    if (mods.empty()) {
-      ImGui::TextDisabled("No mods enabled.");
+    if (ImGui::BeginTabBar("##modtabs")) {
+      if (ImGui::BeginTabItem("Installed")) {
+        DrawInstalledTab();
+        ImGui::EndTabItem();
+      }
+      if (catalog_.state() == rex::system::CatalogState::kReady) {
+        if (ImGui::BeginTabItem("All")) {
+          DrawCatalogTab();
+          ImGui::EndTabItem();
+        }
+      } else if (catalog_.state() == rex::system::CatalogState::kLoading) {
+        if (ImGui::BeginTabItem("All")) {
+          ImGui::TextDisabled("Loading catalog...");
+          ImGui::EndTabItem();
+        }
+      }
+      // kFailed / kIdle (disabled config): no "All" tab at all.
+      ImGui::EndTabBar();
     }
-
-    ImGui::BeginChild("##modlist", ImVec2(0.0f, 0.0f), false);
-    int priority = 1;
-    for (const auto& mod : mods) {
-      ImGui::PushID(mod.folder_name.c_str());
-
-      ImmediateTexture* icon = GetIcon(mod);
-      if (icon) {
-        ImGui::ImageWithBg(reinterpret_cast<ImTextureID>(icon), ImVec2(kIconSize, kIconSize),
-                           ImVec2(0, 0), ImVec2(1, 1), ImVec4(0, 0, 0, 0), ImVec4(1, 1, 1, 1));
-      } else {
-        ImGui::Dummy(ImVec2(kIconSize, kIconSize));
-      }
-      ImGui::SameLine();
-
-      ImGui::BeginGroup();
-      ImGui::TextColored(kHeaderText, "#%d", priority);
-      ImGui::SameLine();
-      ImGui::Text("%s", mod.display_name.c_str());
-      if (!mod.version.empty()) {
-        ImGui::SameLine();
-        ImGui::TextColored(kMutedText, "v%s", mod.version.c_str());
-      }
-      if (!mod.code.empty()) {
-        ImGui::SameLine();
-        ImGui::TextColored(kCodeBadge, "[code]");
-      }
-      ImGui::TextColored(kMutedText, "%s", mod.folder_name.c_str());
-      if (!mod.requires_mods.empty()) {
-        ImGui::TextColored(kMutedText, "requires: %s", JoinRequirements(mod.requires_mods).c_str());
-      }
-      if (!mod.min_game_version.empty()) {
-        ImGui::TextColored(kMutedText, "needs game version: >= %s", mod.min_game_version.c_str());
-      }
-      if (!mod.conflicts_mods.empty()) {
-        ImGui::TextColored(kMutedText, "conflicts: %s", JoinCommaList(mod.conflicts_mods).c_str());
-      }
-      if (!mod.description.empty()) {
-        ImGui::TextWrapped("%s", mod.description.c_str());
-      }
-      DrawKeybindsSection(mod);
-      DrawCvarsSection(mod);
-      ImGui::EndGroup();
-
-      ImGui::Separator();
-      ImGui::PopID();
-      ++priority;
-    }
-    ImGui::EndChild();
   }
   ImGui::End();
 
   ImGui::PopStyleVar(2);
 }
 
+void ModManagerDialog::DrawRestartBanner() {
+  if (!StateDiffersFromStartup())
+    return;
+  ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.85f, 0.2f, 1.0f));
+  ImGui::TextWrapped("Mod changes require a restart to take effect.");
+  ImGui::PopStyleColor();
+  ImGui::SameLine();
+  if (ImGui::SmallButton("Restart Now")) {
+    if (rex::platform::process::Relaunch() && window_) {
+      window_->RequestClose();
+    }
+  }
+  ImGui::Separator();
+}
+
+void ModManagerDialog::DrawInstalledTab() {
+  if (ImGui::SmallButton("Auto-sort")) {
+    entries_ = rex::system::ModState::AutoSort(entries_, manifests_);
+    PersistAndRevalidate();
+  }
+  ImGui::SameLine();
+  if (ImGui::SmallButton("Refresh from disk")) {
+    ReloadFromDisk();
+  }
+  ImGui::SameLine();
+  ImGui::TextColored(kMutedText, "%zu mod%s installed", entries_.size(),
+                     entries_.size() == 1 ? "" : "s");
+  ImGui::TextColored(kMutedText, "Load order: earlier entries win on conflicting files.");
+  ImGui::Separator();
+
+  if (entries_.empty()) {
+    ImGui::TextDisabled("No mods installed.");
+  }
+
+  auto issues_for = [&](const std::string& id) {
+    std::vector<const rex::system::ModIssue*> out;
+    for (const auto& issue : issues_) {
+      if (issue.id == id)
+        out.push_back(&issue);
+    }
+    return out;
+  };
+
+  auto catalog_snapshot = catalog_.state() == rex::system::CatalogState::kReady
+                              ? catalog_.Snapshot()
+                              : std::vector<rex::system::CatalogMod>{};
+  auto find_catalog_entry = [&](const std::string& id) -> const rex::system::CatalogMod* {
+    for (const auto& mod : catalog_snapshot) {
+      if (mod.mod_id == id)
+        return &mod;
+    }
+    return nullptr;
+  };
+
+  ImGui::BeginChild("##modlist", ImVec2(0.0f, 0.0f), false);
+  int priority = 1;
+  for (size_t i = 0; i < entries_.size(); ++i) {
+    auto& entry = entries_[i];
+    auto manifest_it = manifests_.find(entry.id);
+    static const rex::system::ModInfo kEmptyInfo;
+    const rex::system::ModInfo& mod =
+        manifest_it != manifests_.end() ? manifest_it->second : kEmptyInfo;
+
+    ImGui::PushID(entry.id.c_str());
+    if (!entry.enabled) {
+      ImGui::PushStyleColor(ImGuiCol_Text, kMutedText);
+    }
+
+    bool enabled = entry.enabled;
+    if (ImGui::Checkbox("##enabled", &enabled)) {
+      entry.enabled = enabled;
+      PersistAndRevalidate();
+    }
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Up") && i > 0) {
+      std::swap(entries_[i], entries_[i - 1]);
+      PersistAndRevalidate();
+    }
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Down") && i + 1 < entries_.size()) {
+      std::swap(entries_[i], entries_[i + 1]);
+      PersistAndRevalidate();
+    }
+    ImGui::SameLine();
+
+    ImmediateTexture* icon = GetLocalIcon(mod);
+    if (icon) {
+      ImGui::ImageWithBg(reinterpret_cast<ImTextureID>(icon), ImVec2(kIconSize, kIconSize),
+                         ImVec2(0, 0), ImVec2(1, 1), ImVec4(0, 0, 0, 0), ImVec4(1, 1, 1, 1));
+    } else {
+      ImGui::Dummy(ImVec2(kIconSize, kIconSize));
+    }
+    ImGui::SameLine();
+
+    ImGui::BeginGroup();
+    if (entry.enabled) {
+      ImGui::TextColored(kHeaderText, "#%d", priority++);
+      ImGui::SameLine();
+    }
+    ImGui::Text("%s", mod.display_name.empty() ? entry.id.c_str() : mod.display_name.c_str());
+    if (!mod.version.empty()) {
+      ImGui::SameLine();
+      ImGui::TextColored(kMutedText, "v%s", mod.version.c_str());
+    }
+    if (!mod.code.empty()) {
+      ImGui::SameLine();
+      ImGui::TextColored(kCodeBadge, "[code]");
+    }
+
+    if (const auto* catalog_entry = find_catalog_entry(entry.id)) {
+      if (!mod.version.empty() &&
+          rex::system::CompareVersionStrings(catalog_entry->version, mod.version) > 0) {
+        ImGui::SameLine();
+        ImGui::TextColored(kUpdateBadge, "Update available (v%s)", catalog_entry->version.c_str());
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Update")) {
+          catalog_.InstallAsync(*catalog_entry, mods_root_);
+        }
+      }
+    }
+
+    for (const auto* issue : issues_for(entry.id)) {
+      ImGui::SameLine();
+      bool is_error = issue->kind == rex::system::ModIssue::Kind::kError;
+      ImGui::TextColored(is_error ? kErrorBadge : kWarnBadge, is_error ? "[error]" : "[warning]");
+      if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("%s", issue->message.c_str());
+      }
+    }
+
+    ImGui::TextColored(kMutedText, "%s", entry.id.c_str());
+    if (!mod.requires_mods.empty()) {
+      ImGui::TextColored(kMutedText, "requires: %s", JoinRequirements(mod.requires_mods).c_str());
+    }
+    if (!mod.min_game_version.empty()) {
+      ImGui::TextColored(kMutedText, "needs game version: >= %s", mod.min_game_version.c_str());
+    }
+    if (!mod.conflicts_mods.empty()) {
+      ImGui::TextColored(kMutedText, "conflicts: %s", JoinCommaList(mod.conflicts_mods).c_str());
+    }
+    if (!mod.description.empty()) {
+      ImGui::TextWrapped("%s", mod.description.c_str());
+    }
+    DrawKeybindsSection(mod);
+    DrawCvarsSection(mod);
+    ImGui::EndGroup();
+
+    if (!entry.enabled) {
+      ImGui::PopStyleColor();
+    }
+    ImGui::Separator();
+    ImGui::PopID();
+  }
+  ImGui::EndChild();
+}
+
+void ModManagerDialog::DrawCatalogTab() {
+  if (ImGui::SmallButton("Refresh")) {
+    catalog_.Refresh();
+  }
+  ImGui::Separator();
+
+  auto mods = catalog_.Snapshot();
+  auto install_status = catalog_.InstallSnapshot();
+  if (install_status.in_progress) {
+    ImGui::TextColored(kMutedText, "Installing... (%llu / %llu bytes)",
+                       static_cast<unsigned long long>(install_status.downloaded_bytes),
+                       static_cast<unsigned long long>(install_status.total_bytes));
+  } else if (install_status.done) {
+    ImGui::TextColored(install_status.ok ? kUpdateBadge : kErrorBadge, "%s",
+                       install_status.message.c_str());
+    if (install_status.ok) {
+      // A successful install may have changed what's on disk; pick it up so
+      // the Installed tab and restart banner reflect it immediately.
+      ReloadFromDisk();
+    }
+  }
+  ImGui::Separator();
+
+  std::string host_platform = rex::system::ModState::HostPlatformId();
+  std::string host_version = runtime_ ? runtime_->game_version() : "";
+
+  ImGui::BeginChild("##cataloglist", ImVec2(0.0f, 0.0f), false);
+  for (const auto& mod : mods) {
+    ImGui::PushID(mod.mod_id.c_str());
+
+    ImmediateTexture* icon = GetRemoteIcon(mod.icon_url);
+    if (icon) {
+      ImGui::ImageWithBg(reinterpret_cast<ImTextureID>(icon), ImVec2(kIconSize, kIconSize),
+                         ImVec2(0, 0), ImVec2(1, 1), ImVec4(0, 0, 0, 0), ImVec4(1, 1, 1, 1));
+    } else {
+      ImGui::Dummy(ImVec2(kIconSize, kIconSize));
+    }
+    ImGui::SameLine();
+
+    ImGui::BeginGroup();
+    ImGui::Text("%s", mod.name.empty() ? mod.mod_id.c_str() : mod.name.c_str());
+    if (!mod.version.empty()) {
+      ImGui::SameLine();
+      ImGui::TextColored(kMutedText, "v%s", mod.version.c_str());
+    }
+    if (!mod.author.empty()) {
+      ImGui::SameLine();
+      ImGui::TextColored(kMutedText, "by %s", mod.author.c_str());
+    }
+    if (!mod.description.empty()) {
+      ImGui::TextWrapped("%s", mod.description.c_str());
+    }
+
+    auto installed_it = manifests_.find(mod.mod_id);
+    bool already_installed = installed_it != manifests_.end();
+
+    std::string incompatible_reason;
+    if (!mod.game_version.empty() &&
+        rex::system::CompareVersionStrings(host_version, mod.game_version) < 0) {
+      incompatible_reason = "Requires game version >= " + mod.game_version + " (running " +
+                            (host_version.empty() ? "unknown" : host_version) + ")";
+    } else if (!mod.platforms.empty() && std::find(mod.platforms.begin(), mod.platforms.end(),
+                                                   host_platform) == mod.platforms.end()) {
+      incompatible_reason =
+          "No binary for this platform (ships: " + JoinCommaList(mod.platforms) + ")";
+    }
+
+    if (!incompatible_reason.empty()) {
+      ImGui::BeginDisabled();
+      ImGui::SmallButton("Install");
+      ImGui::EndDisabled();
+      if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("%s", incompatible_reason.c_str());
+      }
+    } else if (already_installed) {
+      if (!installed_it->second.version.empty() &&
+          rex::system::CompareVersionStrings(mod.version, installed_it->second.version) > 0) {
+        if (ImGui::SmallButton("Update")) {
+          catalog_.InstallAsync(mod, mods_root_);
+        }
+      } else {
+        ImGui::TextColored(kMutedText, "Installed");
+      }
+    } else {
+      if (ImGui::SmallButton("Install")) {
+        catalog_.InstallAsync(mod, mods_root_);
+      }
+    }
+    ImGui::EndGroup();
+
+    ImGui::Separator();
+    ImGui::PopID();
+  }
+  ImGui::EndChild();
+}
+
 void ModManagerDialog::DrawKeybindsSection(const rex::system::ModInfo& mod) {
   auto binds = rex::ui::SnapshotBinds();
   bool drew_header = false;
   for (const auto& bind : binds) {
-    if (bind.owner != mod.folder_name || !bind.active) {
+    if (bind.owner != mod.folder_name || !bind.active)
       continue;
-    }
     if (!drew_header) {
       ImGui::TextColored(kMutedText, "Keybinds:");
       drew_header = true;
@@ -246,9 +530,8 @@ void ModManagerDialog::DrawKeybindsSection(const rex::system::ModInfo& mod) {
 
     bool listening = listening_bind_ == bind.name;
     std::string label = listening ? "...(press a key)..." : bind.effective_key;
-    if (label.empty()) {
+    if (label.empty())
       label = "(unbound)";
-    }
     if (ImGui::Button(label.c_str())) {
       listening_bind_ = listening ? std::string{} : bind.name;
     }
@@ -283,13 +566,11 @@ void ModManagerDialog::DrawKeybindsSection(const rex::system::ModInfo& mod) {
 
 void ModManagerDialog::DrawCvarsSection(const rex::system::ModInfo& mod) {
   auto* tracker = runtime_ ? runtime_->mod_conflict_tracker() : nullptr;
-  if (!tracker) {
+  if (!tracker)
     return;
-  }
   auto activity = tracker->CvarActivityFor(mod.folder_name);
-  if (activity.empty()) {
+  if (activity.empty())
     return;
-  }
   auto divergent = tracker->DivergentOverrides();
 
   ImGui::TextColored(kMutedText, "Cvars:");

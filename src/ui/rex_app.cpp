@@ -617,8 +617,8 @@ void ReXApp::SetupOverlays(rex::ui::Presenter* presenter, rex::ui::ImmediateDraw
         if (mod_manager_overlay_) {
           mod_manager_overlay_.reset();
         } else {
-          mod_manager_overlay_ =
-              std::make_unique<ui::ModManagerDialog>(imgui_drawer_.get(), drawer, runtime_.get());
+          mod_manager_overlay_ = std::make_unique<ui::ModManagerDialog>(
+              imgui_drawer_.get(), drawer, runtime_.get(), window_.get());
         }
       },
       [this] { return static_cast<bool>(mod_manager_overlay_); }, "Mods##overlay");

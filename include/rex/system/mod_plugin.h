@@ -129,6 +129,14 @@ struct ModInfo {
   std::vector<std::string> conflicts_mods;    // hard error if also enabled,
                                               // regardless of order
 
+  // Platform target(s) this code mod's code/ directory currently ships a
+  // binary for (e.g. "windows-x64", "linux-x64", "linux-arm64"), parsed from
+  // mod.toml's `platform` key (comma-separated). Always empty for asset-only
+  // mods (no `code`), and purely descriptive for the SDK itself -- it does
+  // not gate LoadModPlugin -- but consumed by rex::system::ModState::Validate
+  // to flag a code mod with no binary for the running host.
+  std::vector<std::string> platforms;
+
   // Minimum host application version, parsed from mod.toml's `game_version`
   // key ("1.2.0" or ">= 1.2.0" -- both mean the same thing; no other
   // comparison operators are supported). Empty means unconstrained.

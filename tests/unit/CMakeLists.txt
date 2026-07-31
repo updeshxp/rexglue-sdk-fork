@@ -18,6 +18,8 @@ add_executable(unit_tests
     system/function_dispatcher_test.cpp
     system/mod_registry_test.cpp
     system/mod_dependency_test.cpp
+    system/mod_state_test.cpp
+    system/mod_catalog_test.cpp
     codegen/manifest_test.cpp
     rexglue/migration_scan_test.cpp
     rexglue/ui_test.cpp

@@ -32,6 +32,7 @@
 #include <rex/system/mod_plugin.h>            // ModInfo
 #include <rex/system/mod_conflict_tracker.h>  // ModConflictTracker
 #include <rex/system/mod_registry.h>          // ModRegistry
+#include <rex/system/mod_state.h>             // ModStateEntry
 #include <rex/system/xobject.h>               // object_ref
 
 // Forward declaration for function mapping (defined in rex/ppc/context.h)
@@ -86,6 +87,11 @@ struct RuntimeConfig {
   // this is empty fails Setup() (the constraint can't be verified), same as
   // requiring another mod that has no `version` key.
   std::string game_version;
+  // The project's mod-catalog identity string (the `recompName` a downstream
+  // catalog backend filters on -- see docs/mod-system.md), set in
+  // OnPreSetup(). Empty disables the mod manager overlay's "All" (catalog
+  // browsing) tab entirely -- no requests are ever made.
+  std::string catalog_name;
 };
 
 /// Helper macros for populating RuntimeConfig with concrete backends.
@@ -182,6 +188,11 @@ class Runtime {
   // empty if the project never set one.
   const std::string& game_version() const { return game_version_; }
 
+  // The project's mod-catalog identity string, as set via
+  // RuntimeConfig::catalog_name; empty if the project never set one (catalog
+  // browsing disabled).
+  const std::string& catalog_name() const { return catalog_name_; }
+
   void Shutdown();
 
   // Load XEX image into guest memory
@@ -215,6 +226,19 @@ class Runtime {
   // fields are left empty rather than erroring -- mod.toml is optional.
   std::vector<system::ModInfo> EnabledModsInfo() const;
 
+  // Immutable snapshot of the mods.toml entry list (id + enabled + order) as
+  // it was at the end of ResolveEnabledMods() during this Setup() -- "the
+  // state the game started with". The mod manager overlay compares its live
+  // (possibly just-edited) mods.toml against this to decide whether to show
+  // a "restart to apply" banner.
+  std::vector<system::ModStateEntry> ModStateAtStartup() const { return mod_state_at_startup_; }
+
+  // Descriptive info for every installed mod folder under the mods root
+  // (enabled or not), in mods.toml order -- unlike EnabledModsInfo(), this
+  // includes disabled entries so the "Installed" tab can list and toggle
+  // them. Re-scans disk each call (cheap: one mod.toml parse per folder).
+  std::vector<system::ModInfo> InstalledModsInfo() const;
+
  private:
   // Set up VFS: mounts game_data_root as game:/d:, update_data_root as update:
   bool SetupVfs();
@@ -234,6 +258,14 @@ class Runtime {
   // This host application's own version, from RuntimeConfig::game_version.
   // Set in Setup() before ValidateModDependencies() runs.
   std::string game_version_;
+
+  // This host application's mod-catalog identity, from
+  // RuntimeConfig::catalog_name.
+  std::string catalog_name_;
+
+  // Snapshot of the resolved mods.toml entries at the end of
+  // ResolveEnabledMods(); see ModStateAtStartup().
+  std::vector<system::ModStateEntry> mod_state_at_startup_;
 
   std::filesystem::path game_data_root_;
   std::filesystem::path user_data_root_;

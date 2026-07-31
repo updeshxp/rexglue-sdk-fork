@@ -21,6 +21,7 @@ add_library(rexcore OBJECT
     timer_queue.cpp
     utf8.cpp
     vec128.cpp
+    filesystem_zip.cpp
 )
 add_library(rex::core ALIAS rexcore)
 
@@ -44,8 +45,10 @@ if(WIN32)
         socket_win.cpp
         system_win.cpp
         threading_win.cpp
+        net/http_win.cpp
     )
     target_compile_definitions(rexcore PUBLIC NOMINMAX WIN32_LEAN_AND_MEAN)
+    target_link_libraries(rexcore PUBLIC winhttp)
 elseif(UNIX)
     target_sources(rexcore PRIVATE
         atomic_posix.cpp
@@ -65,7 +68,13 @@ elseif(UNIX)
         socket_posix.cpp
         system_posix.cpp
         threading_posix.cpp
+        net/http_curl.cpp
     )
+    # Linked directly (not vendored) per the mod-catalog HTTP client design:
+    # this fails configure loudly on a Linux box missing libcurl dev headers
+    # rather than silently shipping a build with no catalog support.
+    find_package(CURL REQUIRED)
+    target_link_libraries(rexcore PUBLIC CURL::libcurl)
 endif()
 
 # Xenos data-format layer (stateless; headers under include/rex/graphics/).
@@ -107,6 +116,7 @@ target_link_libraries(rexcore
         xxHash::xxhash
         stb_image
         stb_image_write
+        miniz
 )
 
 if(REXGLUE_USE_D3D12)
