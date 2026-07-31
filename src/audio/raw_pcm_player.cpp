@@ -40,7 +40,10 @@ bool RawPcmPlayer::PlayInt16(std::vector<int16_t> pcm, uint32_t sample_rate, uin
     REXAPU_ERROR("RawPcmPlayer: SDL_OpenAudioDeviceStream failed: {}", SDL_GetError());
     return false;
   }
-  SDL_SetAudioStreamGain(stream_, REXCVAR_GET(audio_mute) ? 0.0f : volume_.load());
+  SDL_SetAudioStreamGain(stream_,
+                         REXCVAR_GET(audio_mute)
+                             ? 0.0f
+                             : volume_.load() * static_cast<float>(REXCVAR_GET(audio_volume)));
   SDL_ResumeAudioStreamDevice(stream_);
 
   bool ok =
@@ -64,7 +67,9 @@ void RawPcmPlayer::Stop() {
 void RawPcmPlayer::SetVolume(float volume) {
   volume_.store(volume);
   if (stream_) {
-    SDL_SetAudioStreamGain(stream_, REXCVAR_GET(audio_mute) ? 0.0f : volume);
+    SDL_SetAudioStreamGain(stream_, REXCVAR_GET(audio_mute)
+                                        ? 0.0f
+                                        : volume * static_cast<float>(REXCVAR_GET(audio_volume)));
   }
 }
 
