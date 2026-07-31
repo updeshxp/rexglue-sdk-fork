@@ -50,6 +50,9 @@ set(REXSYSTEM_SOURCES
     mod_conflict_tracker.cpp
     mod_plugin_loader.cpp
     mod_registry.cpp
+    mod_version.cpp
+    mod_state.cpp
+    mod_catalog.cpp
     thread.cpp
     thread_state.cpp
     xex_module.cpp
@@ -82,6 +85,8 @@ target_link_libraries(rexruntime
         aes128
         mspack
         xxHash::xxhash
+        picosha2
+        nlohmann_json
 )
 
 if(REXGLUE_ENABLE_TRACY)

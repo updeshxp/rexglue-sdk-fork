@@ -134,11 +134,19 @@ std::unique_ptr<IModPlugin> LoadModPlugin(const std::filesystem::path& mod_root,
     return code_dir / ModFileName(code_stem, postfix);
   };
 
+  // Tracks whichever postfix `path` actually ends up resolved to, which may
+  // differ from the host's own `postfix` after the Release-fallback below --
+  // MismatchedRuntimeDependency must be checked against that, not the host's
+  // postfix, or a legitimate fallback file (which correctly imports the
+  // Release runtime it was built against) gets flagged as "wrong config" and
+  // rejected every time, defeating the fallback entirely.
+  std::string_view resolved_postfix = postfix;
   std::filesystem::path path = resolve(postfix);
   if (!postfix.empty() && !std::filesystem::exists(path)) {
     // Distributed mods commonly ship a single Release build; fall back to it
     // rather than refusing to load into a Debug/RelWithDebInfo host.
     path = resolve("");
+    resolved_postfix = "";
   }
   if (!std::filesystem::exists(path)) {
     REXSYS_ERROR("Mod '{}' declares code '{}' but no DLL was found at {}", mod_name, code_stem,
@@ -146,7 +154,8 @@ std::unique_ptr<IModPlugin> LoadModPlugin(const std::filesystem::path& mod_root,
     return nullptr;
   }
 
-  if (std::string mismatched = MismatchedRuntimeDependency(path, postfix); !mismatched.empty()) {
+  if (std::string mismatched = MismatchedRuntimeDependency(path, resolved_postfix);
+      !mismatched.empty()) {
     REXSYS_ERROR(
         "Mod '{}' code plugin was built against a different SDK build configuration (it links {}, "
         "host config is {}); skipping it: {}",

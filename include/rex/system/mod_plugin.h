@@ -136,6 +136,22 @@ struct ModInfo {
   // Runtime::ValidateModDependencies(); a hard error if the host's version is
   // older, or if the host never set RuntimeConfig::game_version at all.
   std::string min_game_version;
+
+  // Appended at the end (rather than grouped with the other manifest fields
+  // above) for the same reason as Runtime's own trailing fields: ModInfo is
+  // returned by value from Runtime::EnabledModsInfo()/InstalledModsInfo(),
+  // both callable by a mod plugin, so a mod DLL prebuilt against an older SDK
+  // header (without this field) still reads every pre-existing field at its
+  // expected offset. Only ever add new ModInfo fields here, never in the
+  // middle.
+  //
+  // Platform target(s) this code mod's code/ directory currently ships a
+  // binary for (e.g. "windows-x64", "linux-x64", "linux-arm64"), parsed from
+  // mod.toml's `platform` key (comma-separated). Always empty for asset-only
+  // mods (no `code`), and purely descriptive for the SDK itself -- it does
+  // not gate LoadModPlugin -- but consumed by rex::system::ModState::Validate
+  // to flag a code mod with no binary for the running host.
+  std::vector<std::string> platforms;
 };
 
 // Loads <mod_root>/code/<code_stem>[<config-postfix>].dll (falling back to
