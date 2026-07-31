@@ -302,6 +302,14 @@ class Window {
   void CaptureMouse();
   void ReleaseMouse();
 
+  // Marks the window as an active text input field (or not) with the OS/
+  // desktop input method. Should be driven by whether a text-entry widget
+  // (e.g. an ImGui InputText) is currently focused, not left on for the
+  // whole session, since that can trigger unwanted IME/input-assist UI
+  // (observed on some desktop environments) while the game just wants
+  // button input. No-op by default.
+  virtual void SetTextInputActive(bool active) { (void)active; }
+
   // Desired state stored by the common Window, externally modifiable, read-only
   // in the implementation.
   CursorVisibility GetCursorVisibility() const { return cursor_visibility_; }

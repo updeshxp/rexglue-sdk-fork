@@ -32,6 +32,7 @@ class WindowSDL final : public Window {
   ~WindowSDL() override;
 
   void* GetNativeWindowHandle() const override;
+  void SetTextInputActive(bool active) override;
 
   // Called by SDLWindowedAppContext on the UI thread.
   void HandleWindowEvent(SDL_Event& event);
@@ -76,6 +77,9 @@ class WindowSDL final : public Window {
   std::atomic<bool> paint_pending_{false};
   // Auto-hide cursor bookkeeping (CursorVisibility::kAutoHidden).
   SDL_TimerID cursor_hide_timer_ = 0;
+  // Tracks whether SDL_StartTextInput has been called, so SetTextInputActive
+  // only calls SDL when the state actually changes. See SetTextInputActive.
+  bool text_input_active_ = false;
 };
 
 }  // namespace rex::ui
