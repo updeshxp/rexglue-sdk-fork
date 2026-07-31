@@ -18,9 +18,19 @@ static_assert(REX_PLATFORM_WIN32, "This file is Windows-only");
 
 #include <rex/logging.h>
 
+#include <cstdlib>
+#include <cwchar>
 #include <vector>
 
 namespace rex::platform::process {
+
+namespace {
+// CreateProcessW's default (lpEnvironment = nullptr) has the child inherit a
+// copy of this process's environment block, so setting this here before
+// spawning is a simple way to hand our own pid to the new instance without
+// touching its command line.
+constexpr wchar_t kRelaunchFromPidEnvVar[] = L"REX_RELAUNCH_FROM_PID";
+}  // namespace
 
 bool Relaunch() {
   // GetCommandLineW() returns the exact command line this process was
@@ -30,6 +40,10 @@ bool Relaunch() {
   std::vector<wchar_t> buffer(cmdline.begin(), cmdline.end());
   buffer.push_back(L'\0');
 
+  wchar_t pid_string[16];
+  swprintf_s(pid_string, L"%lu", GetCurrentProcessId());
+  SetEnvironmentVariableW(kRelaunchFromPidEnvVar, pid_string);
+
   STARTUPINFOW si{};
   si.cb = sizeof(si);
   PROCESS_INFORMATION pi{};
@@ -37,12 +51,37 @@ bool Relaunch() {
   if (!CreateProcessW(nullptr, buffer.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si,
                       &pi)) {
     REXLOG_ERROR("Relaunch: CreateProcessW failed (GetLastError={})", GetLastError());
+    SetEnvironmentVariableW(kRelaunchFromPidEnvVar, nullptr);
     return false;
   }
 
   CloseHandle(pi.hThread);
   CloseHandle(pi.hProcess);
   return true;
+}
+
+void WaitForPreviousInstanceExit() {
+  wchar_t pid_string[16];
+  DWORD length = GetEnvironmentVariableW(kRelaunchFromPidEnvVar, pid_string, 16);
+  if (length == 0 || length >= 16) {
+    return;  // not a relaunch (or an implausibly large value) -- nothing to wait on.
+  }
+  // Consume the handoff so a later, unrelated Relaunch() done by *this*
+  // process (which re-sets the var to its own pid) can't be misread as
+  // still referring to the original one.
+  SetEnvironmentVariableW(kRelaunchFromPidEnvVar, nullptr);
+
+  DWORD pid = wcstoul(pid_string, nullptr, 10);
+  if (pid == 0) {
+    return;
+  }
+  HANDLE process = OpenProcess(SYNCHRONIZE, FALSE, pid);
+  if (!process) {
+    return;  // already exited (or otherwise inaccessible) -- nothing to wait on.
+  }
+  // Bounded: a hung old instance shouldn't block this one's startup forever.
+  WaitForSingleObject(process, 5000);
+  CloseHandle(process);
 }
 
 }  // namespace rex::platform::process

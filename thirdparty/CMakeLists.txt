@@ -82,6 +82,32 @@ target_include_directories(tomlplusplus SYSTEM INTERFACE
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/tomlplusplus/include>
     $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
 
+# picosha2 - single-header SHA-256 (header-only). Used by
+# rex::system::ModCatalog to verify a downloaded mod asset's checksum before
+# extracting it.
+add_library(picosha2 INTERFACE)
+target_include_directories(picosha2 SYSTEM INTERFACE
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/picosha2>
+    $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
+
+# nlohmann/json - single-header JSON (header-only, reuse inja's vendored
+# copy rather than re-vendoring). Used by rex::system::ModCatalog to parse
+# Firestore's typed JSON wire format.
+add_library(nlohmann_json INTERFACE)
+target_include_directories(nlohmann_json SYSTEM INTERFACE
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/inja/third_party/include>
+    $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
+
+# miniz - single-file (.c/.h) ZIP read/write, vendored directly (not a
+# submodule) since it's small and rarely updated -- avoids touching CI's
+# submodule checkout depth for one dependency. Used by
+# rex::filesystem::ExtractZip (catalog mod installs).
+add_library(miniz STATIC miniz/miniz.c)
+target_include_directories(miniz PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/miniz>
+    $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
+set_target_properties(miniz PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
 # stb_image - single-file image loader (header-only, reuse Tracy's vendored copy)
 add_library(stb_image INTERFACE)
 target_include_directories(stb_image INTERFACE

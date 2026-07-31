@@ -316,6 +316,12 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
   void OnLostFocus(ui::UISetupEvent& e) override;
   void OnMinimized(ui::UIEvent& e) override;
   void OnRestored(ui::UIEvent& e) override;
+  // A file was dropped onto the game window. Sideloads it (mod_manager_
+  // overlay.h's ModManagerDialog::SideloadArchive) if it's a .zip; anything
+  // else is ignored. Opens/reuses the mod manager overlay so the drop's
+  // result (success or failure) and the newly (re)installed mod are visible
+  // immediately, exactly as if the player had pressed F1 themselves.
+  void OnFileDrop(ui::FileDropEvent& e) override;
 
   // WindowInputListener overrides
   void OnKeyDown(ui::KeyEvent& e) override;

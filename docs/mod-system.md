@@ -37,16 +37,40 @@ default `<exe folder>/mods`). A folder may contain any mix of:
 
 ## Load order = priority
 
-Which mods are active, and in what order, is entirely driven by one cvar:
+Which mods are active, and in what order, is driven by `<mods_root>/mods.toml`
+-- an ordered list of `{ id, enabled }` entries, read/written directly by
+`rex::system::ModState` (`include/rex/system/mod_state.h`) and by the in-game
+mod manager overlay's "Installed" tab:
+
+```toml
+[[mods]]
+id = "mod_a"
+enabled = true
+
+[[mods]]
+id = "mod_b"
+enabled = false
+```
+
+`ModState::LoadReconciled()` (called from `Runtime::ResolveEnabledMods()`
+during `Setup()`) parses this, then reconciles it against what's actually on
+disk under the mods root: entries whose folder is gone are dropped, and any
+folder not yet recorded is appended at the end as enabled. **List order is
+priority order: index 0 is highest priority**; a disabled entry keeps its
+slot (so re-enabling it later restores its position instead of dropping it
+to the bottom).
+
+If `mods.toml` doesn't exist yet, `Runtime::ResolveEnabledMods()` falls back
+to the older `enabled_mods` cvar instead:
 
 ```toml
 enabled_mods = "mod_a,mod_b,mod_c"
 ```
 
-A comma-separated list of folder names, trimmed of whitespace, resolved once
-by `Runtime::ResolveEnabledMods()` during `Setup()`. **List order is
-priority order: index 0 is highest priority.** This single order drives
-every part of the system:
+A comma-separated list of folder names, trimmed of whitespace. This fallback
+exists so a bare command-line launch (no launcher-managed `mods.toml`) still
+works; once a `mods.toml` is present, `enabled_mods` is ignored entirely.
+Either way, the resolved order drives every part of the system:
 
 - **Asset overlays** (`Runtime::ModOverlayRoots()`): earlier mods win when
   multiple mods ship the same guest-path file, texture hash, or shader.
@@ -242,11 +266,103 @@ A few things worth knowing:
   replacement -- there's no way to override just one caller's view of a
   function.
 
+## The mod manager overlay (F1) and the public mod catalog
+
+`rex::ui::ModManagerDialog` (`src/ui/overlay/mod_manager_overlay.cpp`) is a
+read/write UI over everything above:
+
+- **"Installed" tab** (always present): lists every folder under the mods
+  root in `mods.toml` order, with a checkbox to enable/disable, Up/Down
+  buttons to reorder, an "Auto-sort" button (`ModState::AutoSort` -- a
+  stable topological sort over `requires`/`load_after` edges among enabled
+  mods, pinning disabled entries to their slot), and per-row `[error]`/
+  `[warning]` badges from `ModState::Validate` (the same rules as
+  `Runtime::ValidateModDependencies`, as structured data instead of only
+  logged, plus a check that a code mod actually ships a binary for the
+  running host's `platform` list). Every mutation writes `mods.toml`
+  immediately.
+- **Restart banner**: shown whenever the live `mods.toml` state differs from
+  what `Runtime::ModStateAtStartup()` snapshotted at boot (membership, order,
+  or enabled flags), with a "Restart Now" button
+  (`rex::platform::process::Relaunch()` + `Window::RequestClose()`).
+- **"All" tab**: only rendered once `rex::system::ModCatalog` reaches
+  `kReady` -- browses a public mod catalog over HTTPS (Firestore REST, no
+  auth) and can install/update a mod in place. Entirely optional and
+  game-agnostic:
+  - `RuntimeConfig::catalog_name` (set by the downstream project in
+    `OnPreSetup()`) is the catalog identity string the query filters on.
+    Empty disables the tab outright.
+  - The endpoint itself is fully cvar-driven (`mod_catalog_project`,
+    `mod_catalog_api_key`, `mod_catalog_url` -- a full override that wins
+    over the first two, for a self-hosted/non-Firestore backend serving the
+    same wire shape -- `mod_catalog_games_collection`,
+    `mod_catalog_mods_collection`). Clearing `catalog_name` or both
+    `mod_catalog_project`/`mod_catalog_url` disables the catalog exactly like
+    a network failure would: the tab is simply omitted, nothing throws, and
+    the "Installed" tab keeps working.
+  - Any failure -- DNS, TLS, HTTP error, malformed JSON -- leaves
+    `ModCatalog` in a `kFailed` state with the same "no tab, no crash"
+    behavior.
+  - Installing verifies the downloaded asset's SHA-256 against the
+    catalog's `checksum` and **hard-refuses on mismatch**, never
+    extracting a payload that doesn't match what was approved.
+  - Installing or updating a mod also pulls in the latest published version
+    of each unmet `requires` dependency first (`ModCatalog::InstallWorker`),
+    same as the companion desktop launcher's own install flow -- one level
+    deep (a dependency's own dependencies aren't resolved), skipping any
+    dependency that's already installed at a version meeting its pin. A
+    dependency that isn't in the catalog (no `assetUrl`) is left for the
+    player to find manually; a dependency download/checksum/extract failure
+    aborts the whole install rather than partially applying it.
+- **Sideloading (drag-and-drop)**: dropping a `.zip` onto the game window
+  (`ReXApp::OnFileDrop`, `src/ui/rex_app.cpp`) installs it the same way a
+  catalog install does -- extract, unwrap a single top-level directory if
+  present (otherwise treat the archive as flat and derive the id from the
+  zip's own file stem), rename into `<mods_root>/<id>` -- via
+  `ModState::InstallLocalArchive`. Unlike a catalog install (which trusts the
+  catalog's `modId`), a dropped zip has no other signal to confirm it's
+  actually a mod, so the resolved content root **must contain a `mod.toml`**
+  or the install is refused; anything else dropped onto the window (a
+  non-`.zip` file, or a `.zip` with no manifest) is silently ignored/rejected
+  rather than treated as a mod. If a mod of the same id is already installed,
+  the drop only replaces it when its `mod.toml` `version` is >= the installed
+  one's (same not-older-clobbers-newer rule as a catalog update); otherwise
+  it's refused. This opens (or reuses) the mod manager overlay automatically
+  and scrolls/highlights the (re)installed mod's row in the "Installed" tab,
+  so the result is visible without the player having to press F1 themselves.
+  A mod installed this way carries no persisted "how did this get here"
+  flag -- the overlay marks any installed mod not present in the currently
+  loaded catalog snapshot as `[Sideloaded]`, purely as a derived comparison
+  against `ModCatalog::Snapshot()` (so it only shows once the "All" tab has
+  data; nothing is marked when the catalog is disabled/unreachable).
+
 ## `platform` strings and per-platform `code/` subdirectories (code mods only)
 
-The SDK's own `ModInfo`/`ParseModInfo` does not read or enforce a `platform`
-key; it is a convention for a downstream project's *own* mod-build tooling,
-worth following if that tooling ships prebuilt per-target binaries.
+The SDK's own `ModInfo`/`ParseModInfo` now parses a `platform` key into
+`ModInfo::platforms`, and it **is enforced**, at two different points:
+
+- `ModState::Validate` (used by the mod manager overlay's "Installed" tab,
+  and by `ModCatalog`'s "All" tab compatibility check) treats a code mod
+  (one with a `code` key) that declares no `platform` entries, or whose
+  `platform` list doesn't include the running host's platform id
+  (`windows-x64`/`linux-x64`/`linux-arm64`), as a **hard error** -- same
+  severity as an unmet `requires` version constraint -- surfaced as a
+  per-row `[error]` badge the player has to act on (update, disable, or
+  remove the mod). This is the primary enforcement point, since it runs
+  every time the overlay is open, not just at boot.
+- `Runtime::ValidateModDependencies()` (the boot-time check in
+  `runtime.cpp`, which only fails `Setup()` on a version mismatch) does
+  *not* itself gate on `platform` -- a mod with no binary for the host still
+  reaches `LoadModPlugin`, which resolves `code/<platform>/<stem>.dll`
+  (falling back to the flat `code/<stem>.dll`) and simply fails to find a
+  library file, logging an error and skipping that mod's code plugin rather
+  than blocking the whole game from starting. In practice a mismatched
+  `platform` is caught well before that: `ModState::Validate` flags it as
+  soon as the mod manager overlay is opened, well before `Setup()` runs.
+
+It remains a convention for a downstream project's *own* mod-build tooling
+to populate correctly -- the SDK doesn't build or stamp `platform` itself,
+only reads and enforces what's already there.
 
 The convention: a `platform` key in a code mod's `mod.toml`, holding a
 comma-separated list of target identifiers (e.g.
