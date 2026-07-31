@@ -58,6 +58,7 @@ class MnkInputDriver final : public InputDriver,
 
  private:
   bool IsEnabled() const;
+  void UpdateMouseCapture();
   void SetKeyState(uint16_t vk, bool down);
   void EnqueueKeystroke(uint16_t vk_pad, bool down);
 
@@ -86,7 +87,9 @@ class MnkInputDriver final : public InputDriver,
   int32_t prev_mouse_x_ = 0;
   int32_t prev_mouse_y_ = 0;
   bool mouse_captured_ = false;
-  // Whether the window has the pointer locked and is reporting relative motion.
+  // True while the window has the pointer locked and is reporting relative
+  // motion, in which case MouseEvent::dx/dy are used directly instead of
+  // differencing absolute positions.
   bool relative_mouse_mode_ = false;
   // Cursor visibility to restore on capture release - the window owner may run
   // an auto-hide policy that capture must not permanently override.

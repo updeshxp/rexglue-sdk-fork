@@ -435,6 +435,11 @@ Surface::TypeFlags VulkanPresenter::GetSurfaceTypesSupportedByInstance(
   if (instance_extensions.ext_KHR_xcb_surface) {
     type_flags |= Surface::kTypeFlag_XcbWindow;
   }
+#ifdef VK_USE_PLATFORM_WAYLAND_KHR
+  if (instance_extensions.ext_KHR_wayland_surface) {
+    type_flags |= Surface::kTypeFlag_WaylandSurface;
+  }
+#endif
 #endif
 #if REX_PLATFORM_WIN32
   if (instance_extensions.ext_KHR_win32_surface) {
@@ -821,6 +826,7 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
         vulkan_surface_create_result = ifn.vkCreateXcbSurfaceKHR(
             instance, &surface_create_info, nullptr, &paint_context_.vulkan_surface);
       } break;
+#ifdef VK_USE_PLATFORM_WAYLAND_KHR
       case Surface::kTypeIndex_WaylandSurface: {
         auto& wayland_surface = static_cast<const WaylandSurface&>(new_surface);
         VkWaylandSurfaceCreateInfoKHR surface_create_info;
@@ -832,6 +838,7 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
         vulkan_surface_create_result = ifn.vkCreateWaylandSurfaceKHR(
             instance, &surface_create_info, nullptr, &paint_context_.vulkan_surface);
       } break;
+#endif
 #endif
 #if REX_PLATFORM_WIN32
       case Surface::kTypeIndex_Win32Hwnd: {

@@ -15,8 +15,10 @@
 #include <xcb/xcb.h>
 
 struct SDL_Window;
+#ifdef VK_USE_PLATFORM_WAYLAND_KHR
 struct wl_display;
 struct wl_surface;
+#endif
 
 namespace rex {
 namespace ui {
@@ -37,6 +39,7 @@ class XcbWindowSurface final : public Surface {
   xcb_window_t window_;
 };
 
+#ifdef VK_USE_PLATFORM_WAYLAND_KHR
 class WaylandSurface final : public Surface {
  public:
   explicit WaylandSurface(::wl_display* display, ::wl_surface* surface, SDL_Window* sdl_window)
@@ -53,6 +56,7 @@ class WaylandSurface final : public Surface {
   ::wl_surface* surface_;
   SDL_Window* sdl_window_;
 };
+#endif
 
 }  // namespace ui
 }  // namespace rex

@@ -21,7 +21,6 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
-#include <string_view>
 
 REXCVAR_DEFINE_BOOL(mnk_mode, false, "Input", "Enable keyboard/mouse controller emulation");
 REXCVAR_DEFINE_BOOL(mnk_capture_mouse, true, "Input",
@@ -173,7 +172,18 @@ void MnkInputDriver::OnWindowAvailable(rex::ui::Window* window) {
 }
 
 void MnkInputDriver::OnClosing(rex::ui::UIEvent&) {
-  DetachFromWindow();
+  if (attached_window_) {
+    if (mouse_captured_) {
+      mouse_captured_ = false;
+      attached_window_->SetCursorVisibility(precapture_cursor_visibility_);
+      attached_window_->SetRelativeMouseMode(false);
+      relative_mouse_mode_ = false;
+      attached_window_->ReleaseMouse();
+    }
+    attached_window_->RemoveInputListener(this);
+    attached_window_->RemoveListener(this);
+    attached_window_ = nullptr;
+  }
 }
 
 void MnkInputDriver::DetachFromWindow() {
@@ -396,27 +406,8 @@ void MnkInputDriver::EnqueueKeystroke(uint16_t vk_pad, bool down) {
   keystroke_queue_.push(ks);
 }
 
-void MnkInputDriver::QueueMouseCaptureUpdate(bool should_capture) {
-  mouse_capture_requested_.store(should_capture, std::memory_order_relaxed);
-  bool already_queued = false;
-  if (!mouse_capture_update_queued_.compare_exchange_strong(already_queued, true)) {
-    return;
-  }
-  std::lock_guard lock(state_mutex_);
-  if (!attached_window_) {
-    mouse_capture_update_queued_.store(false, std::memory_order_relaxed);
-    return;
-  }
-  // Deferred, not CallInUIThread: running inline would re-enter state_mutex_.
-  attached_window_->app_context().CallInUIThreadDeferred([this] {
-    mouse_capture_update_queued_.store(false, std::memory_order_relaxed);
-    ApplyMouseCaptureFromUIThread();
-  });
-}
-
-void MnkInputDriver::ApplyMouseCaptureFromUIThread() {
-  rex::ui::Window* window = attached_window_;
-  if (!window) {
+void MnkInputDriver::UpdateMouseCapture() {
+  if (!attached_window_)
     return;
 
   bool should_capture = IsEnabled() && REXCVAR_GET(mnk_capture_mouse) && has_focus_ && is_active();
@@ -426,66 +417,20 @@ void MnkInputDriver::ApplyMouseCaptureFromUIThread() {
     precapture_cursor_visibility_ = attached_window_->GetCursorVisibility();
     attached_window_->SetCursorVisibility(rex::ui::Window::CursorVisibility::kHidden);
     attached_window_->CaptureMouse();
+    // Lock the pointer so mouse-look isn't clamped at the window edge. This
+    // replaces warping the cursor back to the center every frame, which
+    // Wayland compositors reject. If the platform can't lock the pointer we
+    // fall back to absolute-position deltas, as before.
+    relative_mouse_mode_ = attached_window_->SetRelativeMouseMode(true);
     // Reset deltas to avoid a spike on capture start
     mouse_dx_ = 0;
     mouse_dy_ = 0;
   } else if (!should_capture && mouse_captured_) {
     mouse_captured_ = false;
     attached_window_->SetCursorVisibility(precapture_cursor_visibility_);
+    attached_window_->SetRelativeMouseMode(false);
+    relative_mouse_mode_ = false;
     attached_window_->ReleaseMouse();
-  }
-  bool should_capture = mouse_capture_requested_.load(std::memory_order_relaxed);
-  if (should_capture == mouse_captured_) {
-    return;
-  }
-  if (!should_capture) {
-    ReleaseMouseCaptureFromUIThread(window);
-    return;
-  }
-  mouse_captured_ = true;
-  precapture_cursor_visibility_ = window->GetCursorVisibility();
-  window->SetCursorVisibility(rex::ui::Window::CursorVisibility::kHidden);
-  window->CaptureMouse();
-  relative_mouse_mode_ = window->SetRelativeMouseMode(true);
-  if (!relative_mouse_mode_) {
-    REXLOG_WARN("Pointer lock unavailable, mouse look falls back to recentering the cursor");
-  }
-  // Reset deltas to avoid a spike on capture start
-  std::lock_guard lock(state_mutex_);
-  mouse_dx_ = 0.0f;
-  mouse_dy_ = 0.0f;
-}
-
-void MnkInputDriver::ReleaseMouseCaptureFromUIThread(rex::ui::Window* window) {
-  if (!mouse_captured_) {
-    return;
-  }
-  mouse_captured_ = false;
-  window->SetCursorVisibility(precapture_cursor_visibility_);
-  window->SetRelativeMouseMode(false);
-  relative_mouse_mode_ = false;
-  window->ReleaseMouse();
-}
-
-void MnkInputDriver::RecenterCursorFromUIThread(int32_t x, int32_t y) {
-  rex::ui::Window* window = attached_window_;
-  if (!window) {
-    return;
-  }
-  int32_t width = int32_t(window->GetActualPhysicalWidth());
-  int32_t height = int32_t(window->GetActualPhysicalHeight());
-  if (width <= 0 || height <= 0) {
-    return;
-  }
-  // Only once the pointer has drifted well off the middle, to keep warps rare.
-  if (std::abs(x - width / 2) < width / 4 && std::abs(y - height / 2) < height / 4) {
-    return;
-  }
-  int32_t center_x = 0;
-  int32_t center_y = 0;
-  if (window->WarpMouseToCenter(center_x, center_y)) {
-    prev_mouse_x_ = center_x;
-    prev_mouse_y_ = center_y;
   }
 }
 
@@ -554,16 +499,13 @@ void MnkInputDriver::OnMouseMove(rex::ui::MouseEvent& e) {
     return;
   int32_t x = e.x();
   int32_t y = e.y();
-  {
-    std::lock_guard lock(state_mutex_);
-    if (relative_mouse_mode_) {
-      // The pointer is locked, so the absolute position no longer moves.
-      mouse_dx_ += e.dx();
-      mouse_dy_ += e.dy();
-    } else {
-      mouse_dx_ += float(x - prev_mouse_x_);
-      mouse_dy_ += float(y - prev_mouse_y_);
-    }
+  if (relative_mouse_mode_) {
+    // The pointer is locked; absolute positions no longer move.
+    mouse_dx_ += e.dx();
+    mouse_dy_ += e.dy();
+  } else {
+    mouse_dx_ += x - prev_mouse_x_;
+    mouse_dy_ += y - prev_mouse_y_;
   }
   prev_mouse_x_ = x;
   prev_mouse_y_ = y;
@@ -575,17 +517,15 @@ void MnkInputDriver::OnMouseMove(rex::ui::MouseEvent& e) {
 
 void MnkInputDriver::OnLostFocus(rex::ui::UISetupEvent&) {
   has_focus_ = false;
-  // Withdraw the request too, or an update queued before the focus loss grabs
-  // the cursor straight back.
-  mouse_capture_requested_.store(false, std::memory_order_relaxed);
-  {
-    std::lock_guard lock(state_mutex_);
-    std::memset(key_down_, 0, sizeof(key_down_));
-    mouse_dx_ = 0.0f;
-    mouse_dy_ = 0.0f;
-  }
-  if (attached_window_) {
-    ReleaseMouseCaptureFromUIThread(attached_window_);
+  std::memset(key_down_, 0, sizeof(key_down_));
+  mouse_dx_ = 0;
+  mouse_dy_ = 0;
+  if (mouse_captured_ && attached_window_) {
+    mouse_captured_ = false;
+    attached_window_->SetCursorVisibility(precapture_cursor_visibility_);
+    attached_window_->SetRelativeMouseMode(false);
+    relative_mouse_mode_ = false;
+    attached_window_->ReleaseMouse();
   }
 }
 

@@ -161,12 +161,16 @@ if(UNIX AND NOT APPLE)
         ${X11_XCB_LIBRARIES}
         ${WAYLAND_LIBRARIES}
     )
-elseif(APPLE)
-    target_link_libraries(rexui PRIVATE "-framework CoreFoundation")
-endif()
 
-if(WIN32)
-    target_link_libraries(rexui PUBLIC dxgi dxguid)
+    pkg_check_modules(WAYLAND QUIET wayland-client)
+    if(WAYLAND_FOUND)
+        # PUBLIC: VK_USE_PLATFORM_WAYLAND_KHR makes vulkan/api.h include
+        # <wayland-client.h>, so every consumer of that header needs the
+        # include path, not just rexui itself.
+        target_include_directories(rexui PUBLIC ${WAYLAND_INCLUDE_DIRS})
+        target_link_libraries(rexui PUBLIC ${WAYLAND_LIBRARIES})
+        target_compile_definitions(rexui PUBLIC VK_USE_PLATFORM_WAYLAND_KHR=1)
+    endif()
 endif()
 
 # D3D12 backend dependencies

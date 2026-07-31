@@ -251,37 +251,6 @@ bool WindowSDL::SetRelativeMouseMode(bool enable) {
   return enable;
 }
 
-bool WindowSDL::WarpMouseToCenter(int32_t& x_out, int32_t& y_out) {
-  if (!sdl_window_) {
-    return false;
-  }
-  int width = 0;
-  int height = 0;
-  SDL_GetWindowSize(sdl_window_, &width, &height);
-  if (width <= 0 || height <= 0) {
-    return false;
-  }
-  float center_x = float(width) * 0.5f;
-  float center_y = float(height) * 0.5f;
-  SDL_WarpMouseInWindow(sdl_window_, center_x, center_y);
-  // The warp reports nothing back and compositors may drop it, so confirm.
-  float actual_x = 0.0f;
-  float actual_y = 0.0f;
-  SDL_GetMouseState(&actual_x, &actual_y);
-  if (std::fabs(actual_x - center_x) > 1.0f || std::fabs(actual_y - center_y) > 1.0f) {
-    return false;
-  }
-  float density = GetPixelDensity();
-  x_out = int32_t(center_x * density);
-  y_out = int32_t(center_y * density);
-  return true;
-}
-
-float WindowSDL::GetPixelDensity() const {
-  float density = sdl_window_ ? SDL_GetWindowPixelDensity(sdl_window_) : 1.0f;
-  return density > 0.0f ? density : 1.0f;
-}
-
 uint32_t WindowSDL::GetLatestDpiImpl() const {
   float scale = sdl_window_ ? SDL_GetWindowDisplayScale(sdl_window_)
                             : SDL_GetDisplayContentScale(SDL_GetPrimaryDisplay());
@@ -399,7 +368,7 @@ std::unique_ptr<Surface> WindowSDL::CreateSurfaceImpl(Surface::TypeFlags allowed
     }
   }
 #else
-  SDL_PropertiesID props = SDL_GetWindowProperties(sdl_window_);
+#ifdef VK_USE_PLATFORM_WAYLAND_KHR
   if (allowed_types & Surface::kTypeFlag_WaylandSurface) {
     auto* wl_display_ptr = static_cast<struct wl_display*>(
         SDL_GetPointerProperty(props, SDL_PROP_WINDOW_WAYLAND_DISPLAY_POINTER, nullptr));
@@ -409,6 +378,7 @@ std::unique_ptr<Surface> WindowSDL::CreateSurfaceImpl(Surface::TypeFlags allowed
       return std::make_unique<WaylandSurface>(wl_display_ptr, wl_surface_ptr, sdl_window_);
     }
   }
+#endif
   if (allowed_types & Surface::kTypeFlag_XcbWindow) {
     auto* display = static_cast<Display*>(
         SDL_GetPointerProperty(props, SDL_PROP_WINDOW_X11_DISPLAY_POINTER, nullptr));
@@ -559,8 +529,8 @@ void WindowSDL::HandleMouseEvent(SDL_Event& event) {
         RearmCursorAutoHideTimer();
       }
       MouseEvent e(this, MouseEvent::Button::kNone, int32_t(event.motion.x * density),
-                   int32_t(event.motion.y * density), 0, 0, event.motion.xrel * density,
-                   event.motion.yrel * density);
+                   int32_t(event.motion.y * density), 0, 0, int32_t(event.motion.xrel * density),
+                   int32_t(event.motion.yrel * density));
       OnMouseMove(e, destruction_receiver);
       break;
     }

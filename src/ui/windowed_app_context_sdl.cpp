@@ -38,14 +38,8 @@ SDLWindowedAppContext::~SDLWindowedAppContext() {
 }
 
 bool SDLWindowedAppContext::Initialize() {
-  // Picked before SDL_InitSubSystem, long before a graphics instance can say
-  // which surface extensions it has, so the cvar is the escape hatch.
-  std::string requested_driver = REXCVAR_GET(video_driver);
-#if REX_PLATFORM_MAC
-  // macOS presents via a CAMetalLayer surface obtained from the Cocoa driver.
-  if (requested_driver.empty()) {
-    requested_driver = "cocoa";
-  }
+#if !REX_PLATFORM_WIN32 && !defined(VK_USE_PLATFORM_WAYLAND_KHR)
+  SDL_SetHint(SDL_HINT_VIDEO_DRIVER, "x11");
 #endif
   if (!requested_driver.empty()) {
     SDL_SetHint(SDL_HINT_VIDEO_DRIVER, requested_driver.c_str());

@@ -11,7 +11,9 @@
 
 #include <cstdlib>
 
+#ifdef VK_USE_PLATFORM_WAYLAND_KHR
 #include <SDL3/SDL.h>
+#endif
 
 #include <rex/ui/surface_gnulinux.h>
 
@@ -30,6 +32,7 @@ bool XcbWindowSurface::GetSizeImpl(uint32_t& width_out, uint32_t& height_out) co
   return true;
 }
 
+#ifdef VK_USE_PLATFORM_WAYLAND_KHR
 bool WaylandSurface::GetSizeImpl(uint32_t& width_out, uint32_t& height_out) const {
   int w = 0, h = 0;
   if (!SDL_GetWindowSizeInPixels(sdl_window_, &w, &h) || w <= 0 || h <= 0) {
@@ -39,6 +42,7 @@ bool WaylandSurface::GetSizeImpl(uint32_t& width_out, uint32_t& height_out) cons
   height_out = uint32_t(h);
   return true;
 }
+#endif
 
 }  // namespace ui
 }  // namespace rex
