@@ -151,6 +151,11 @@ system::AchievementManager& ReXApp::achievements() const {
 bool ReXApp::OnInitialize() {
   if (!SetupEnvironment())
     return false;
+  // A subclass override of SetupEnvironment may have set path cvars after the
+  // base class read them (GameDataSelector does exactly this when the user
+  // points at an existing game directory). Pick those up now, so the choice
+  // takes effect on this run rather than only on the next launch.
+  RefreshPathDefaultsIfCvarsChanged();
   if (!SetupPresentation())
     return false;
 
@@ -167,14 +172,8 @@ bool ReXApp::OnInitialize() {
   return true;
 }
 
-bool ReXApp::SetupEnvironment() {
-  auto exe_dir = rex::filesystem::GetExecutableFolder();
-  config_path_ = exe_dir / (std::string(GetName()) + ".toml");
-
-  // Load config FIRST so path and log cvars have final values
-  if (std::filesystem::exists(config_path_))
-    rex::cvar::LoadConfig(config_path_);
-
+PathConfig ReXApp::ResolvePathDefaults() {
+  // Game data: cvar override, or empty (the wizard / CLI must supply one)
   std::filesystem::path game_dir;
   std::string game_data_cvar = REXCVAR_GET(game_data_root);
   if (!game_data_cvar.empty()) {
@@ -212,15 +211,54 @@ bool ReXApp::SetupEnvironment() {
     metadata_dir = metadata_root_cvar;
   }
 
+  path_cvar_snapshot_ = {game_data_cvar, user_data_cvar, update_data_cvar, cache_root_cvar,
+                         metadata_root_cvar};
+
   PathConfig path_config{game_dir, user_dir, update_dir, cache_dir, metadata_dir, config_path_};
   OnConfigurePaths(path_config);
-  game_data_root_ = path_config.game_data_root;
-  user_data_root_ = path_config.user_data_root;
-  update_data_root_ = path_config.update_data_root;
-  cache_root_ = path_config.cache_root;
-  metadata_root_ = path_config.metadata_root;
-  config_path_ = path_config.config_path;
-  resolved_defaults_ = std::move(path_config);
+  return path_config;
+}
+
+void ReXApp::RefreshPathDefaultsIfCvarsChanged() {
+  const std::vector<std::string> current = {
+      REXCVAR_GET(game_data_root), REXCVAR_GET(user_data_root), REXCVAR_GET(update_data_root),
+      REXCVAR_GET(cache_root), REXCVAR_GET(metadata_root)};
+  if (current == path_cvar_snapshot_) {
+    return;
+  }
+
+  resolved_defaults_ = ResolvePathDefaults();
+  game_data_root_ = resolved_defaults_.game_data_root;
+  user_data_root_ = resolved_defaults_.user_data_root;
+  update_data_root_ = resolved_defaults_.update_data_root;
+  cache_root_ = resolved_defaults_.cache_root;
+  metadata_root_ = resolved_defaults_.metadata_root;
+  config_path_ = resolved_defaults_.config_path;
+
+  REXLOG_INFO("Path cvars changed during setup; re-resolved paths");
+  if (!game_data_root_.empty()) {
+    REXLOG_INFO("  Game directory: {}", game_data_root_.string());
+  }
+  if (!update_data_root_.empty()) {
+    REXLOG_INFO("  Update data:    {}", update_data_root_.string());
+  }
+}
+
+bool ReXApp::SetupEnvironment() {
+  auto exe_dir = rex::filesystem::GetExecutableFolder();
+  config_path_ = exe_dir / (std::string(GetName()) + ".toml");
+
+  // Load config FIRST so path and log cvars have final values
+  if (std::filesystem::exists(config_path_))
+    rex::cvar::LoadConfig(config_path_);
+
+  resolved_defaults_ = ResolvePathDefaults();
+  game_data_root_ = resolved_defaults_.game_data_root;
+  user_data_root_ = resolved_defaults_.user_data_root;
+  update_data_root_ = resolved_defaults_.update_data_root;
+  cache_root_ = resolved_defaults_.cache_root;
+  metadata_root_ = resolved_defaults_.metadata_root;
+  config_path_ = resolved_defaults_.config_path;
 
   // Late-phase logging
   std::string log_file_cvar = REXCVAR_GET(log_file);
