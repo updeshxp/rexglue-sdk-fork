@@ -243,6 +243,14 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
   /// OnConfigurePaths.
   virtual bool SetupEnvironment();
 
+  /// Re-resolve `resolved_defaults_` if any of the path cvars changed after
+  /// SetupEnvironment computed them. A subclass override of SetupEnvironment
+  /// (or a wizard it runs, such as GameDataSelector) commonly sets
+  /// game_data_root/update_data_root *after* the base class has already
+  /// snapshotted them; without this the run would keep using the stale
+  /// defaults and only pick up the new ones on the next launch.
+  void RefreshPathDefaultsIfCvarsChanged();
+
   /// Construct Runtime with the given paths, call runtime_->Setup, load the
   /// XEX image, initialize the rexcrt heap. Runs OnPostSetup at the end.
   virtual bool ConstructRuntime(const PathConfig& paths);
@@ -312,8 +320,13 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
   // WindowInputListener overrides
   void OnKeyDown(ui::KeyEvent& e) override;
 
+  // Resolve the five path cvars into a PathConfig and run OnConfigurePaths.
+  PathConfig ResolvePathDefaults();
+
   PPCImageInfo ppc_info_;
   PathConfig resolved_defaults_;
+  // Values the path cvars had when resolved_defaults_ was last computed.
+  std::vector<std::string> path_cvar_snapshot_;
   RuntimeConfig config_;
   std::filesystem::path game_data_root_;
   std::filesystem::path user_data_root_;
