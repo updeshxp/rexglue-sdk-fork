@@ -24,6 +24,7 @@
 #include <SDL3/SDL.h>
 
 REXCVAR_DEFINE_BOOL(audio_mute, false, "Audio", "Mute audio output");
+REXCVAR_DEFINE_DOUBLE(audio_volume, 1.0, "Audio", "Master volume (0.0 - 1.0)").range(0.0, 1.0);
 
 namespace rex::audio::sdl {
 
@@ -196,6 +197,16 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
           default:
             assert_unhandled_case(driver->sdl_device_channels_);
             break;
+        }
+        double volume = REXCVAR_GET(audio_volume);
+        // Bypass the multiply at unity gain -- the common case, and floating
+        // point rounding from a redundant *1.0 isn't free across this many
+        // samples every callback.
+        if (volume < 1.0) {
+          float scale = static_cast<float>(std::clamp(volume, 0.0, 1.0));
+          for (int i = 0; i < sample_count; ++i) {
+            data[i] *= scale;
+          }
         }
       }
       if (!SDL_PutAudioStreamData(stream, data, len)) {
