@@ -175,14 +175,12 @@ bool WindowSDL::OpenImpl() {
     // Borderless desktop fullscreen (a NULL display mode is SDL3's default).
     SDL_SetWindowFullscreen(sdl_window_, true);
   }
-#if REX_PLATFORM_MAC
-  CFPreferencesSetAppValue(CFSTR("ApplePressAndHoldEnabled"), kCFBooleanFalse,
-                           kCFPreferencesCurrentApplication);
-  CFPreferencesAppSynchronize(kCFPreferencesCurrentApplication);
-#endif
-  // SDL3 requires explicit opt in for text input events. Reapplied from the
-  // desired state so a reopened window comes back with the state it had.
-  ApplyTextInputActiveNow();
+  // SDL3 requires explicit opt-in for text input events, but it is not
+  // enabled here: leaving it on for the whole session flags the window as an
+  // active text field, which makes the desktop's input assist (on-screen
+  // keyboard on SteamOS/gamescope, IME candidate windows, autocomplete) show
+  // up during normal button-only gameplay. It is turned on by
+  // SetTextInputActive only while a text-entry widget is focused.
   ApplyCursorVisibilityNow();
   ApplyIconNow();
   SDL_ShowWindow(sdl_window_);
@@ -322,15 +320,12 @@ void WindowSDL::ApplyNewMouseRelease() {
   SDL_CaptureMouse(false);
 }
 
-void WindowSDL::ApplyNewTextInputActive() {
-  ApplyTextInputActiveNow();
-}
-
-void WindowSDL::ApplyTextInputActiveNow() {
-  if (!sdl_window_) {
+void WindowSDL::SetTextInputActive(bool active) {
+  if (!sdl_window_ || text_input_active_ == active) {
     return;
   }
-  if (IsTextInputActive()) {
+  text_input_active_ = active;
+  if (active) {
     SDL_StartTextInput(sdl_window_);
   } else {
     SDL_StopTextInput(sdl_window_);

@@ -314,26 +314,13 @@ class Window {
     return false;
   }
 
-  // Locks the pointer and switches motion events to relative deltas
-  // (MouseEvent::dx/dy), for mouse look. Returns whether it took.
-  virtual bool SetRelativeMouseMode(bool enable) {
-    (void)enable;
-    return false;
-  }
-  // Fallback when relative mode isn't available. Returns false, leaving the
-  // outputs untouched, unless the pointer verifiably reached the center.
-  virtual bool WarpMouseToCenter(int32_t& x_out, int32_t& y_out) {
-    (void)x_out;
-    (void)y_out;
-    return false;
-  }
-
-  // Desired state stored by the common Window, externally modifiable, read-only
-  // in the implementation. Whether the window is an active text input field for
-  // the OS input method. Leaving it on for the session pulls in IME candidate
-  // windows and the on screen keyboard during button-only gameplay.
-  bool IsTextInputActive() const { return text_input_active_; }
-  void SetTextInputActive(bool active);
+  // Marks the window as an active text input field (or not) with the OS/
+  // desktop input method. Should be driven by whether a text-entry widget
+  // (e.g. an ImGui InputText) is currently focused, not left on for the
+  // whole session, since that can trigger unwanted IME/input-assist UI
+  // (observed on some desktop environments) while the game just wants
+  // button input. No-op by default.
+  virtual void SetTextInputActive(bool active) { (void)active; }
 
   // Desired state stored by the common Window, externally modifiable, read-only
   // in the implementation.

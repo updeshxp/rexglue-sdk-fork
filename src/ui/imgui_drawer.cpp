@@ -384,6 +384,12 @@ void ImGuiDrawer::Draw(UIDrawContext& ui_draw_context) {
     RenderDrawLists(draw_data, ui_draw_context);
   }
 
+  // Only mark the window as an active text input field while an ImGui
+  // text-entry widget is actually focused, so the OS/desktop input-assist
+  // UI (IME, autocomplete) doesn't kick in during normal button gameplay.
+  text_input_active_ = io.WantTextInput;
+  window_->SetTextInputActive(text_input_active_);
+
   if (reset_mouse_position_after_next_frame_) {
     reset_mouse_position_after_next_frame_ = false;
     io.MousePos = ImVec2(-FLT_MAX, -FLT_MAX);
@@ -646,9 +652,13 @@ void ImGuiDrawer::DetachIfLastDialogRemoved() {
   if (!dialogs_.empty() || IsDrawingDialogs()) {
     return;
   }
-  // Detaching stops Draw, so there is no later frame to notice that the
-  // removed dialog took a focused InputText with it.
-  SetWindowTextInputActive(false);
+  // Detaching stops Draw from being called, so the text input state has to be
+  // cleared here: the dialog being removed may have had a focused InputText,
+  // and there is no later frame in which to notice that it's gone.
+  if (text_input_active_) {
+    text_input_active_ = false;
+    window_->SetTextInputActive(false);
+  }
   if (presenter_) {
     presenter_->RemoveUIDrawerFromUIThread(this);
   }
