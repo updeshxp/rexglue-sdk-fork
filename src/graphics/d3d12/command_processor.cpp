@@ -3544,7 +3544,13 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
     if (renderdoc_capturing_) {
       const ui::RenderDocAPI* renderdoc_api = GetD3D12Provider().GetRenderDocAPI();
       if (renderdoc_api != nullptr) {
-        renderdoc_api->api_1_0_0()->StartFrameCapture(nullptr, nullptr);
+        // Pass the guest device explicitly with a NULL (headless) window handle.
+        // A wildcard (NULL, NULL) call matches any (device, window) pair, and the
+        // host presenter also submits to this same ID3D12Device on its own
+        // swapchain-bound window - RenderDoc is free to pick either match, and in
+        // practice binds to the presenter's window, capturing the host blit/imgui
+        // pass instead of the guest's offscreen frame.
+        renderdoc_api->api_1_0_0()->StartFrameCapture(GetD3D12Provider().GetDevice(), nullptr);
       } else {
         renderdoc_capturing_ = false;
       }
@@ -3657,7 +3663,7 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
     if (renderdoc_capturing_) {
       const ui::RenderDocAPI* renderdoc_api = provider.GetRenderDocAPI();
       if (renderdoc_api != nullptr) {
-        renderdoc_api->api_1_0_0()->EndFrameCapture(nullptr, nullptr);
+        renderdoc_api->api_1_0_0()->EndFrameCapture(provider.GetDevice(), nullptr);
       }
       renderdoc_capturing_ = false;
     }
