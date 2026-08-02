@@ -19,12 +19,14 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
 #include <chrono>
 #include <cerrno>
 #include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <string>
 #include <thread>
 #include <vector>
 
 #include <signal.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 namespace rex::platform::process {
@@ -117,6 +119,30 @@ void WaitForPreviousInstanceExit() {
     std::this_thread::sleep_for(kPollInterval);
   }
 #endif
+}
+
+bool OpenFolder(const std::filesystem::path& path) {
+#if REX_PLATFORM_MAC
+  const char* opener = "open";
+#else
+  const char* opener = "xdg-open";
+#endif
+  pid_t pid = fork();
+  if (pid < 0) {
+    REXLOG_ERROR("OpenFolder: fork failed");
+    return false;
+  }
+  if (pid == 0) {
+    execlp(opener, opener, path.c_str(), static_cast<char*>(nullptr));
+    _exit(127);  // execlp only returns on failure.
+  }
+  // Reap immediately rather than leaving a zombie -- this is a fire-and-
+  // forget launch (the opener re-execs/daemonizes the actual file manager),
+  // so there's nothing useful to wait for beyond "did the launch itself
+  // succeed."
+  int status = 0;
+  waitpid(pid, &status, 0);
+  return WIFEXITED(status) && WEXITSTATUS(status) == 0;
 }
 
 }  // namespace rex::platform::process
