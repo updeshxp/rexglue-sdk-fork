@@ -20,7 +20,10 @@ static_assert(REX_PLATFORM_WIN32, "This file is Windows-only");
 
 #include <cstdlib>
 #include <cwchar>
+#include <filesystem>
 #include <vector>
+
+#include <shellapi.h>
 
 namespace rex::platform::process {
 
@@ -82,6 +85,18 @@ void WaitForPreviousInstanceExit() {
   // Bounded: a hung old instance shouldn't block this one's startup forever.
   WaitForSingleObject(process, 5000);
   CloseHandle(process);
+}
+
+bool OpenFolder(const std::filesystem::path& path) {
+  // ShellExecuteW's return value is a HINSTANCE by API signature, but per
+  // Win32 docs only the numeric value matters: > 32 means success.
+  auto result = reinterpret_cast<INT_PTR>(
+      ShellExecuteW(nullptr, L"open", path.c_str(), nullptr, nullptr, SW_SHOWNORMAL));
+  if (result <= 32) {
+    REXLOG_ERROR("OpenFolder: ShellExecuteW failed (result={})", result);
+    return false;
+  }
+  return true;
 }
 
 }  // namespace rex::platform::process
