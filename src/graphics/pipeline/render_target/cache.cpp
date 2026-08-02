@@ -37,6 +37,11 @@ REXCVAR_DEFINE_BOOL(execute_unclipped_draw_vs_on_cpu_for_psi_render_backend, tru
 REXCVAR_DEFINE_BOOL(snorm16_render_target_full_range, true, "GPU",
                     "Use full range for SNORM16 render targets");
 
+REXCVAR_DEFINE_BOOL(no_edram_wrap_claim, false, "GPU",
+                    "Don't let a render target claim EDRAM tiles past the end of the EDRAM by "
+                    "wrapping around to tile 0")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_BOOL(direct_host_resolve, true, "GPU",
                     "Resolve from host render targets directly to shared memory when possible")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
@@ -656,6 +661,16 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
                                         ? edram_bases_sorted[i + 1].first
                                         : (xenos::kEdramTileCount + edram_bases_sorted[0].first)) -
                                        rt_base);
+    if (REXCVAR_GET(no_edram_wrap_claim)) {
+      // The clamp above lets a lone render target claim the EDRAM up to its own
+      // base, which wraps past the end and takes ownership of every tile below
+      // it. A title that binds a narrow target high in the EDRAM with no usable
+      // height estimate therefore claims everything: Eternal Sonata's 8-tile
+      // wide target at tile 1720 claims all 2048 tiles and takes the scene color
+      // target's range at tile 0, after which resolves of that range dump from
+      // the wrong surface and write zeros.
+      rt_lengths_tiles[i] = std::min(rt_lengths_tiles[i], xenos::kEdramTileCount - rt_base);
+    }
   }
 
   if (interlock_barrier_only) {
