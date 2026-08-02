@@ -11,7 +11,11 @@
 #include <rex/ui/overlay/mod_manager_overlay.h>
 
 #include <algorithm>
+#include <cctype>
 #include <fstream>
+#include <functional>
+#include <string_view>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -73,6 +77,25 @@ std::string PollListeningCapture(ImGuiIO& io) {
   }
   (void)io;
   return {};
+}
+
+std::string ToLower(std::string s) {
+  for (auto& c : s)
+    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  return s;
+}
+
+// Case-insensitive substring match against any of `haystacks`; an empty
+// filter matches everything.
+bool MatchesFilter(const std::string& filter, std::initializer_list<std::string_view> haystacks) {
+  if (filter.empty())
+    return true;
+  std::string needle = ToLower(filter);
+  for (std::string_view haystack : haystacks) {
+    if (ToLower(std::string(haystack)).find(needle) != std::string::npos)
+      return true;
+  }
+  return false;
 }
 
 std::string JoinCommaList(const std::vector<std::string>& names) {
@@ -362,9 +385,66 @@ void ModManagerDialog::DrawInstalledTab() {
     ReloadFromDisk();
   }
   ImGui::SameLine();
-  ImGui::TextColored(kMutedText, "%zu mod%s installed", entries_.size(),
-                     entries_.size() == 1 ? "" : "s");
-  ImGui::TextColored(kMutedText, "Load order: earlier entries win on conflicting files.");
+  if (ImGui::SmallButton("Open Mods Folder")) {
+    rex::platform::process::OpenFolder(mods_root_);
+  }
+  // Same visibility condition as DrawRestartBanner -- only worth offering a
+  // reset once there's actually something to reset back to what's running.
+  if (runtime_ && (StateDiffersFromStartup() || has_pending_updates_)) {
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Reset")) {
+      // Restore by id rather than replacing entries_ wholesale: a mod
+      // installed (or updated in place -- same id, so this still finds it)
+      // since startup has no entry in ModStateAtStartup() at all, and a
+      // flat overwrite would silently drop it from mods.toml -- disappearing
+      // now but reappearing enabled the next "Refresh from disk" reconciles
+      // against its still-on-disk folder. Keep it instead, just disabled,
+      // same as any other mod that isn't part of what's currently running.
+      auto startup = runtime_->ModStateAtStartup();
+      std::unordered_set<std::string> startup_ids;
+      for (const auto& e : startup) {
+        startup_ids.insert(e.id);
+      }
+
+      std::vector<rex::system::ModStateEntry> reset_entries;
+      reset_entries.reserve(entries_.size());
+      for (const auto& startup_entry : startup) {
+        // Drop ids no longer installed at all (shouldn't normally happen --
+        // removal is deferred to the next restart -- but don't resurrect a
+        // toml entry for a folder that's actually gone).
+        if (std::any_of(entries_.begin(), entries_.end(),
+                        [&](const auto& e) { return e.id == startup_entry.id; })) {
+          reset_entries.push_back(startup_entry);
+        }
+      }
+      for (const auto& entry : entries_) {
+        if (!startup_ids.contains(entry.id)) {
+          reset_entries.push_back({entry.id, /*enabled=*/false});
+        }
+      }
+      entries_ = std::move(reset_entries);
+      PersistAndRevalidate();
+
+      // A pending removal is also a deviation from what's currently
+      // running (its mod is still loaded this session) -- undo those too,
+      // the same as clicking "Restore" on each.
+      for (const auto& id : pending_removal_ids_) {
+        rex::system::ModState::UnmarkPendingRemoval(mods_root_, id);
+      }
+      ReloadFromDisk();
+    }
+    if (ImGui::IsItemHovered()) {
+      ImGui::SetTooltip("Restore enable/disable state and load order to what's currently running.");
+    }
+  }
+  ImGui::SameLine();
+  ImGui::TextColored(kMutedText, "%zu mod%s installed; earlier entries win conflicts",
+                     entries_.size(), entries_.size() == 1 ? "" : "s");
+
+  ImGui::SetNextItemWidth(-1.0f);
+  ImGui::InputTextWithHint("##installedfilter", "Filter mods...", installed_filter_buf_,
+                           sizeof(installed_filter_buf_));
+  const std::string installed_filter(installed_filter_buf_);
   ImGui::Separator();
 
   if (entries_.empty()) {
@@ -380,6 +460,93 @@ void ModManagerDialog::DrawInstalledTab() {
     return out;
   };
 
+  // Whether entries_[i]'s `requires` list is fully met for *display*
+  // purposes: each named mod is enabled and, if a min_version was given, at
+  // least that version. Deliberately ignores load order here -- the ordering
+  // requirement (mirrored in Runtime::ValidateModDependencies' hard-fail
+  // checks, surfaced separately via the [error]/[warning] issue badges) only
+  // bites once the mod is actually enabled, so a disabled Available-pane
+  // entry with its dependency already enabled shouldn't still read as
+  // "requires: X" just because of where X happens to sit in entries_.
+  auto requirements_satisfied = [&](size_t i) {
+    auto manifest_it = manifests_.find(entries_[i].id);
+    if (manifest_it == manifests_.end())
+      return true;
+    for (const auto& req : manifest_it->second.requires_mods) {
+      auto target = std::find_if(entries_.begin(), entries_.end(),
+                                 [&](const auto& e) { return e.id == req.name; });
+      if (target == entries_.end() || !target->enabled)
+        return false;
+      if (!req.min_version.empty()) {
+        auto target_manifest = manifests_.find(req.name);
+        if (target_manifest == manifests_.end() ||
+            rex::system::CompareVersionStrings(target_manifest->second.version, req.min_version) <
+                0)
+          return false;
+      }
+    }
+    return true;
+  };
+
+  auto game_version_satisfied = [&](const rex::system::ModInfo& mod) {
+    if (mod.min_game_version.empty())
+      return true;
+    std::string host_version = runtime_ ? runtime_->game_version() : "";
+    return !host_version.empty() &&
+           rex::system::CompareVersionStrings(host_version, mod.min_game_version) >= 0;
+  };
+
+  // Enabling a mod pulls in everything it (transitively) requires, so it
+  // never lands on screen already broken by a missing dependency.
+  auto enable_with_requirements = [&](const std::string& id) {
+    std::unordered_set<std::string> visited;
+    std::function<void(const std::string&)> recurse = [&](const std::string& mod_id) {
+      if (!visited.insert(mod_id).second)
+        return;
+      auto it = std::find_if(entries_.begin(), entries_.end(),
+                             [&](const auto& e) { return e.id == mod_id; });
+      if (it == entries_.end())
+        return;
+      it->enabled = true;
+      auto manifest_it = manifests_.find(mod_id);
+      if (manifest_it == manifests_.end())
+        return;
+      for (const auto& req : manifest_it->second.requires_mods) {
+        recurse(req.name);
+      }
+    };
+    recurse(id);
+  };
+
+  // Disabling a mod that other enabled mods require would leave them broken,
+  // so cascade the disable to those (transitive) dependents too.
+  auto disable_with_dependents = [&](const std::string& id) {
+    std::unordered_set<std::string> visited;
+    std::function<void(const std::string&)> recurse = [&](const std::string& mod_id) {
+      if (!visited.insert(mod_id).second)
+        return;
+      auto it = std::find_if(entries_.begin(), entries_.end(),
+                             [&](const auto& e) { return e.id == mod_id; });
+      if (it == entries_.end())
+        return;
+      it->enabled = false;
+      for (auto& other : entries_) {
+        if (!other.enabled)
+          continue;
+        auto manifest_it = manifests_.find(other.id);
+        if (manifest_it == manifests_.end())
+          continue;
+        for (const auto& req : manifest_it->second.requires_mods) {
+          if (req.name == mod_id) {
+            recurse(other.id);
+            break;
+          }
+        }
+      }
+    };
+    recurse(id);
+  };
+
   auto catalog_snapshot = catalog_.state() == rex::system::CatalogState::kReady
                               ? catalog_.Snapshot()
                               : std::vector<rex::system::CatalogMod>{};
@@ -391,13 +558,21 @@ void ModManagerDialog::DrawInstalledTab() {
     return nullptr;
   };
 
-  ImGui::BeginChild("##modlist", ImVec2(0.0f, 0.0f), false);
-  if (pending_scroll_restore_ >= 0.0f) {
-    ImGui::SetScrollY(pending_scroll_restore_);
-    pending_scroll_restore_ = -1.0f;
-  }
-  int priority = 1;
+  // Enabled mods' indices into entries_, in load-order. Reorder arrows in the
+  // Enabled pane swap against these neighbors (rather than adjacent entries_
+  // slots) so interleaved Available mods don't affect enabled load order.
+  std::vector<size_t> enabled_indices;
   for (size_t i = 0; i < entries_.size(); ++i) {
+    if (entries_[i].enabled)
+      enabled_indices.push_back(i);
+  }
+
+  bool list_changed = false;
+
+  // Draws one mod's row. `enabled_rank` is this mod's position within
+  // enabled_indices (used for the up/down reorder neighbors) and is only
+  // meaningful when in_enabled_pane is true.
+  auto draw_row = [&](size_t i, bool in_enabled_pane, size_t enabled_rank) {
     auto& entry = entries_[i];
     auto manifest_it = manifests_.find(entry.id);
     static const rex::system::ModInfo kEmptyInfo;
@@ -417,34 +592,45 @@ void ModManagerDialog::DrawInstalledTab() {
       ImGui::PushStyleColor(ImGuiCol_Text, kMutedText);
     }
 
-    // Row controls stacked in their own vertical column (checkbox, reorder
+    // Row controls stacked in their own vertical column (move arrow, reorder
     // arrows, remove/restore) so they don't crowd the title/icon on one line.
-    bool list_changed = false;
     ImGui::BeginGroup();
-    bool enabled = entry.enabled;
     ImGui::BeginDisabled(pending_removal);
-    if (ImGui::Checkbox("##enabled", &enabled)) {
-      entry.enabled = enabled;
-      PersistAndRevalidate();
+    if (in_enabled_pane) {
+      if (ImGui::ArrowButton("##moveleft", ImGuiDir_Left)) {
+        disable_with_dependents(entry.id);
+        PersistAndRevalidate();
+        list_changed = true;
+      }
+    } else {
+      if (ImGui::ArrowButton("##moveright", ImGuiDir_Right)) {
+        enable_with_requirements(entry.id);
+        PersistAndRevalidate();
+        list_changed = true;
+      }
     }
-    ImGui::BeginDisabled(i == 0);
-    if (ImGui::ArrowButton("##up", ImGuiDir_Up) && i > 0) {
-      pending_scroll_restore_ = ImGui::GetScrollY();
-      std::swap(entries_[i], entries_[i - 1]);
-      PersistAndRevalidate();
+    if (in_enabled_pane) {
+      ImGui::BeginDisabled(enabled_rank == 0);
+      if (ImGui::ArrowButton("##up", ImGuiDir_Up) && enabled_rank > 0) {
+        pending_scroll_restore_ = ImGui::GetScrollY();
+        std::swap(entries_[i], entries_[enabled_indices[enabled_rank - 1]]);
+        PersistAndRevalidate();
+        list_changed = true;
+      }
+      ImGui::EndDisabled();
+      ImGui::BeginDisabled(enabled_rank + 1 >= enabled_indices.size());
+      if (ImGui::ArrowButton("##down", ImGuiDir_Down) &&
+          enabled_rank + 1 < enabled_indices.size()) {
+        pending_scroll_restore_ = ImGui::GetScrollY();
+        std::swap(entries_[i], entries_[enabled_indices[enabled_rank + 1]]);
+        PersistAndRevalidate();
+        list_changed = true;
+      }
+      ImGui::EndDisabled();
     }
-    ImGui::EndDisabled();
-    ImGui::BeginDisabled(i + 1 >= entries_.size());
-    if (ImGui::ArrowButton("##down", ImGuiDir_Down) && i + 1 < entries_.size()) {
-      pending_scroll_restore_ = ImGui::GetScrollY();
-      std::swap(entries_[i], entries_[i + 1]);
-      PersistAndRevalidate();
-    }
-    ImGui::EndDisabled();
     ImGui::EndDisabled();  // pending_removal
     if (pending_removal) {
       if (ImGui::SmallButton("Restore")) {
-        pending_scroll_restore_ = ImGui::GetScrollY();
         rex::system::ModState::UnmarkPendingRemoval(mods_root_, entry.id);
         ReloadFromDisk();
         list_changed = true;
@@ -456,7 +642,6 @@ void ModManagerDialog::DrawInstalledTab() {
       // (ApplyPendingRemovals), by which point this process (and whatever it
       // had loaded) has exited.
       if (ImGui::SmallButton("Remove")) {
-        pending_scroll_restore_ = ImGui::GetScrollY();
         rex::system::ModState::MarkPendingRemoval(mods_root_, entry.id);
         ReloadFromDisk();
         list_changed = true;
@@ -466,15 +651,16 @@ void ModManagerDialog::DrawInstalledTab() {
     ImGui::SameLine();
 
     if (list_changed) {
-      if (!enabled || pending_removal) {
+      if (!entry.enabled || pending_removal) {
         ImGui::PopStyleColor();  // balance the push above before bailing out
       }
       ImGui::PopID();
-      // ReloadFromDisk() just replaced entries_/pending_removal_ids_
-      // wholesale; bail out of this frame's iteration rather than continuing
-      // to index into them with a stale i, or re-touching a row that's now a
-      // different mod. The next frame redraws the updated list from scratch.
-      break;
+      // Any of the branches above may have replaced entries_/
+      // pending_removal_ids_ wholesale (ReloadFromDisk) or invalidated
+      // enabled_indices (reorder/move); the caller bails out of both pane
+      // loops this frame rather than continuing to index into stale state.
+      // The next frame redraws both panes from scratch.
+      return;
     }
 
     ImmediateTexture* icon = GetLocalIcon(mod);
@@ -487,8 +673,8 @@ void ModManagerDialog::DrawInstalledTab() {
     ImGui::SameLine();
 
     ImGui::BeginGroup();
-    if (entry.enabled) {
-      ImGui::TextColored(kHeaderText, "#%d", priority++);
+    if (in_enabled_pane) {
+      ImGui::TextColored(kHeaderText, "#%d", static_cast<int>(enabled_rank) + 1);
       ImGui::SameLine();
     }
     if (is_focused) {
@@ -546,10 +732,10 @@ void ModManagerDialog::DrawInstalledTab() {
     }
 
     ImGui::TextColored(kMutedText, "%s", entry.id.c_str());
-    if (!mod.requires_mods.empty()) {
+    if (!mod.requires_mods.empty() && !requirements_satisfied(i)) {
       ImGui::TextColored(kMutedText, "requires: %s", JoinRequirements(mod.requires_mods).c_str());
     }
-    if (!mod.min_game_version.empty()) {
+    if (!mod.min_game_version.empty() && !game_version_satisfied(mod)) {
       ImGui::TextColored(kMutedText, "needs game version: >= %s", mod.min_game_version.c_str());
     }
     if (!mod.conflicts_mods.empty()) {
@@ -567,6 +753,45 @@ void ModManagerDialog::DrawInstalledTab() {
     }
     ImGui::Separator();
     ImGui::PopID();
+  };
+
+  // Reserve the pane header labels' row up front, computed before the two
+  // panes so they get exactly what's left and the window never needs its
+  // own scrollbar.
+  float header_row_height = ImGui::GetTextLineHeightWithSpacing();
+  float panes_height = ImGui::GetContentRegionAvail().y - header_row_height;
+  float pane_width = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x) * 0.5f;
+
+  ImGui::TextColored(kHeaderText, "Available");
+  ImGui::SameLine(pane_width + ImGui::GetStyle().ItemSpacing.x);
+  ImGui::TextColored(kHeaderText, "Enabled");
+
+  auto entry_matches_filter = [&](const rex::system::ModStateEntry& entry) {
+    auto manifest_it = manifests_.find(entry.id);
+    std::string_view display_name =
+        manifest_it != manifests_.end() ? manifest_it->second.display_name : std::string_view{};
+    return MatchesFilter(installed_filter, {display_name, entry.id});
+  };
+
+  ImGui::BeginChild("##availablepane", ImVec2(pane_width, panes_height), true);
+  for (size_t i = 0; i < entries_.size() && !list_changed; ++i) {
+    if (!entries_[i].enabled && entry_matches_filter(entries_[i])) {
+      draw_row(i, /*in_enabled_pane=*/false, /*enabled_rank=*/0);
+    }
+  }
+  ImGui::EndChild();
+
+  ImGui::SameLine();
+
+  ImGui::BeginChild("##enabledpane", ImVec2(pane_width, panes_height), true);
+  if (pending_scroll_restore_ >= 0.0f) {
+    ImGui::SetScrollY(pending_scroll_restore_);
+    pending_scroll_restore_ = -1.0f;
+  }
+  for (size_t rank = 0; rank < enabled_indices.size() && !list_changed; ++rank) {
+    if (entry_matches_filter(entries_[enabled_indices[rank]])) {
+      draw_row(enabled_indices[rank], /*in_enabled_pane=*/true, rank);
+    }
   }
   ImGui::EndChild();
 }
@@ -594,11 +819,19 @@ void ModManagerDialog::DrawCatalogTab() {
   }
   ImGui::Separator();
 
+  ImGui::SetNextItemWidth(-1.0f);
+  ImGui::InputTextWithHint("##catalogfilter", "Filter mods...", catalog_filter_buf_,
+                           sizeof(catalog_filter_buf_));
+  const std::string catalog_filter(catalog_filter_buf_);
+  ImGui::Separator();
+
   std::string host_platform = rex::system::ModState::HostPlatformId();
   std::string host_version = runtime_ ? runtime_->game_version() : "";
 
   ImGui::BeginChild("##cataloglist", ImVec2(0.0f, 0.0f), false);
   for (const auto& mod : mods) {
+    if (!MatchesFilter(catalog_filter, {mod.name, mod.mod_id}))
+      continue;
     ImGui::PushID(mod.mod_id.c_str());
 
     ImmediateTexture* icon = GetRemoteIcon(mod.icon_url);

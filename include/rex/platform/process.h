@@ -10,6 +10,8 @@
  */
 #pragma once
 
+#include <filesystem>
+
 namespace rex::platform::process {
 
 // Spawns a new instance of the currently running executable with the same
@@ -36,5 +38,10 @@ bool Relaunch();
 // during its own shutdown (e.g. applying a staged mod update onto a folder
 // the old process had a mod DLL loaded from).
 void WaitForPreviousInstanceExit();
+
+// Opens the given directory in the OS's file manager (Explorer/Finder/xdg-
+// open, depending on platform). Fire-and-forget; returns false if the
+// request could not even be dispatched (e.g. the path doesn't exist).
+bool OpenFolder(const std::filesystem::path& path);
 
 }  // namespace rex::platform::process
