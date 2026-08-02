@@ -89,6 +89,12 @@ class ModManagerDialog : public ImGuiDialog {
 
   std::string listening_bind_;
 
+  // Filter text boxes: substring (case-insensitive) match against a mod's
+  // display name/id, applied independently to the Installed tab's two panes
+  // and to the "All" catalog tab.
+  char installed_filter_buf_[128] = {};
+  char catalog_filter_buf_[128] = {};
+
   ImmediateDrawer* immediate_drawer_ = nullptr;
   rex::Runtime* runtime_ = nullptr;
   Window* window_ = nullptr;
