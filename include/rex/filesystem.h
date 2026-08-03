@@ -142,6 +142,14 @@ int OpenAndroidContentFileDescriptor(const std::string_view uri, const char* mod
 bool ExtractZip(const std::filesystem::path& archive, const std::filesystem::path& dest_dir,
                 std::string& error);
 
+// Extracts `archive` (a gzip-compressed ustar .tar.gz file) into `dest_dir`,
+// creating it if needed. Same path-traversal rejection and error-reporting
+// contract as ExtractZip (never throws; false + `error` on any failure).
+// Only regular files and directories are honored; other tar entry types
+// (symlinks, devices, ...) are skipped.
+bool ExtractTarGz(const std::filesystem::path& archive, const std::filesystem::path& dest_dir,
+                  std::string& error);
+
 // Moves (renames) `from` to `to`, falling back to a recursive copy (then
 // removing `from`) if the rename fails, e.g. because `from`/`to` land on
 // different filesystems. Retries both the rename and the copy a few times
