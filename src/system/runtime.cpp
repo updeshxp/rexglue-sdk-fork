@@ -137,6 +137,8 @@ X_STATUS Runtime::Setup(RuntimeConfig config) {
   tool_mode_ = config.tool_mode;
   game_version_ = config.game_version;
   catalog_name_ = config.catalog_name;
+  update_repo_ = config.update_repo;
+  update_asset_format_ = config.update_asset_format;
   startup_hint_ = config.startup_hint;
 
   // Create memory system first

@@ -92,6 +92,22 @@ struct RuntimeConfig {
   // OnPreSetup(). Empty disables the mod manager overlay's "All" (catalog
   // browsing) tab entirely -- no requests are ever made.
   std::string catalog_name;
+  // "owner/repo" GitHub repository whose Releases are checked for
+  // self-updates (see rex::system::AutoUpdater), set in OnPreSetup(). Empty
+  // disables auto-update entirely -- no requests are ever made, independent
+  // of the auto_update_enabled cvar.
+  std::string update_repo;
+  // Template for the release asset's base name (no extension), used to tell
+  // this build apart from other variants a release publishes for the same
+  // platform (e.g. vanilla vs. title-update). Supports the placeholders
+  // "{tag}" (the release's tag_name, e.g. "v1.4.0") and "{platform}" (this
+  // host's platform id, e.g. "windows-x64" -- see
+  // system::ModState::HostPlatformId()). The extension (".zip" on Windows,
+  // ".tar.gz" elsewhere) is appended automatically. Empty disables
+  // auto-update entirely, same as an empty `update_repo`. Example:
+  // "nocturnerecomp-tu-{tag}-{platform}" matches the
+  // "nocturnerecomp-tu-v1.4.0-windows-x64.zip" asset of a title-update build.
+  std::string update_asset_format;
   // One-shot message shown top-left for a few seconds as the game starts
   // (see rex::ui::HintToastDialog), set in OnPreSetup(). Empty (the
   // default) shows nothing. Example: "Press F4 to open settings.".
@@ -196,6 +212,11 @@ class Runtime {
   // RuntimeConfig::catalog_name; empty if the project never set one (catalog
   // browsing disabled).
   const std::string& catalog_name() const { return catalog_name_; }
+
+  // RuntimeConfig::update_repo/update_asset_format, as set by the
+  // downstream project; empty if auto-update was never configured.
+  const std::string& update_repo() const { return update_repo_; }
+  const std::string& update_asset_format() const { return update_asset_format_; }
 
   // RuntimeConfig::startup_hint, as set by the downstream project; empty if
   // never configured (no startup hint toast).
@@ -312,6 +333,8 @@ class Runtime {
   // This host application's mod-catalog identity, from
   // RuntimeConfig::catalog_name.
   std::string catalog_name_;
+  std::string update_repo_;
+  std::string update_asset_format_;
   std::string startup_hint_;
 
   // Snapshot of the resolved mods.toml entries at the end of
