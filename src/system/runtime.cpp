@@ -134,6 +134,7 @@ X_STATUS Runtime::Setup(RuntimeConfig config) {
   tool_mode_ = config.tool_mode;
   game_version_ = config.game_version;
   catalog_name_ = config.catalog_name;
+  startup_hint_ = config.startup_hint;
 
   // Create memory system first
   memory_ = std::make_unique<memory::Memory>();
