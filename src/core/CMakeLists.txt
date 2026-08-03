@@ -22,6 +22,7 @@ add_library(rexcore OBJECT
     utf8.cpp
     vec128.cpp
     filesystem_zip.cpp
+    filesystem_tar.cpp
 )
 add_library(rex::core ALIAS rexcore)
 

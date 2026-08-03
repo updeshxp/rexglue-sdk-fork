@@ -53,6 +53,7 @@ set(REXSYSTEM_SOURCES
     mod_version.cpp
     mod_state.cpp
     mod_catalog.cpp
+    auto_updater.cpp
     thread.cpp
     thread_state.cpp
     xex_module.cpp
@@ -118,9 +119,11 @@ if(REXGLUE_ENABLE_PERF_COUNTERS)
 endif()
 
 if(WIN32)
+    target_sources(rexruntime PRIVATE auto_updater_win.cpp)
     target_link_libraries(rexruntime PRIVATE rexdiscord ws2_32)
     target_compile_definitions(rexruntime PUBLIC NOMINMAX WIN32_LEAN_AND_MEAN)
 elseif(LINUX)
+    target_sources(rexruntime PRIVATE auto_updater_posix.cpp)
     target_link_libraries(rexruntime PRIVATE rexdiscord)
 endif()
 
