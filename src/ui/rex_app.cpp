@@ -21,6 +21,7 @@
 #include <rex/logging/sink.h>
 #include <rex/logging.h>
 #include <rex/ui/overlay/achievement_toast.h>
+#include <rex/ui/overlay/hint_toast.h>
 #include <rex/ui/overlay/achievements_overlay.h>
 #include <rex/ui/overlay/console_overlay.h>
 #include <rex/ui/overlay/debug_overlay.h>
@@ -841,6 +842,15 @@ void ReXApp::LaunchModule() {
               dialog->Push(event);
             }
           });
+    }
+
+    // Same "construct once, lazily" guard as achievement_notification_ above.
+    // imgui_drawer_ is guaranteed live this deep into startup (SetupPresentation
+    // already ran), so this is a safe, uniform place for it regardless of
+    // which phase order a given app subclass uses.
+    if (!hint_toast_ && imgui_drawer_ && runtime_ && !runtime_->startup_hint().empty()) {
+      hint_toast_ = std::make_unique<ui::HintToastDialog>(imgui_drawer_.get());
+      hint_toast_->Show(runtime_->startup_hint());
     }
 
     OnPreLaunchModule();

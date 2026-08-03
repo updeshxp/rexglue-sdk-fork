@@ -92,6 +92,10 @@ struct RuntimeConfig {
   // OnPreSetup(). Empty disables the mod manager overlay's "All" (catalog
   // browsing) tab entirely -- no requests are ever made.
   std::string catalog_name;
+  // One-shot message shown top-left for a few seconds as the game starts
+  // (see rex::ui::HintToastDialog), set in OnPreSetup(). Empty (the
+  // default) shows nothing. Example: "Press F4 to open settings.".
+  std::string startup_hint;
 };
 
 /// Helper macros for populating RuntimeConfig with concrete backends.
@@ -192,6 +196,10 @@ class Runtime {
   // RuntimeConfig::catalog_name; empty if the project never set one (catalog
   // browsing disabled).
   const std::string& catalog_name() const { return catalog_name_; }
+
+  // RuntimeConfig::startup_hint, as set by the downstream project; empty if
+  // never configured (no startup hint toast).
+  const std::string& startup_hint() const { return startup_hint_; }
 
   void Shutdown();
 
@@ -304,6 +312,7 @@ class Runtime {
   // This host application's mod-catalog identity, from
   // RuntimeConfig::catalog_name.
   std::string catalog_name_;
+  std::string startup_hint_;
 
   // Snapshot of the resolved mods.toml entries at the end of
   // ResolveEnabledMods(); see ModStateAtStartup().
