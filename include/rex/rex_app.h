@@ -56,6 +56,7 @@ struct PathConfig {
 namespace ui {
 class AchievementNotificationDialog;
 class ConsoleDialog;
+class HintToastDialog;
 class SettingsDialog;
 class ShaderDebuggerDialog;
 }  // namespace ui
@@ -355,6 +356,9 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
   std::unique_ptr<ui::ImGuiDialog> achievements_overlay_;
   std::shared_ptr<ui::AchievementNotificationDialog> achievement_notification_;
   uint64_t achievement_notification_listener_ = 0;
+  // Shows RuntimeConfig::startup_hint once, as the game starts (see
+  // LaunchModule).
+  std::unique_ptr<ui::HintToastDialog> hint_toast_;
   std::unique_ptr<ui::ShaderDebuggerDialog> shader_debugger_overlay_;
   ui::DebugOverlayDialog::FrameStatsProvider frame_stats_provider_;
   ShaderDebuggerOverride shader_debugger_override_;
