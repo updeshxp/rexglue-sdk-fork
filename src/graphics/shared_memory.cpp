@@ -454,45 +454,15 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
     }
   }
 
-  uint64_t* valid_flags = active_valid_flags_.load(std::memory_order_acquire);
-  if (valid_flags) {
-    bool all_valid = true;
-    for (const std::pair<uint32_t, uint32_t>& range : merged_ranges) {
-      if (!range.second) {
-        continue;
-      }
-      uint32_t page_first = range.first >> page_size_log2_;
-      uint32_t page_last = (range.first + range.second - 1) >> page_size_log2_;
-      uint32_t block_first = page_first >> 6;
-      uint32_t block_last = page_last >> 6;
-      for (uint32_t i = block_first; i <= block_last; ++i) {
-        uint64_t block_valid = valid_flags[i];
-        if (i == block_first) {
-          uint64_t block_before = (uint64_t(1) << (page_first & 63)) - 1;
-          block_valid |= block_before;
-        }
-        if (i == block_last && (page_last & 63) != 63) {
-          uint64_t block_inside = (uint64_t(1) << ((page_last & 63) + 1)) - 1;
-          block_valid |= ~block_inside;
-        }
-        if (block_valid != UINT64_MAX) {
-          all_valid = false;
-          break;
-        }
-      }
-      if (!all_valid) {
-        break;
-      }
-    }
-    if (all_valid) {
-      COUNT_profile_set("gpu/shared_memory/request_ranges_count", uint32_t(count));
-      COUNT_profile_set("gpu/shared_memory/request_ranges_merged_count",
-                        uint32_t(merged_ranges.size()));
-      COUNT_profile_set("gpu/shared_memory/request_ranges_upload_count", 0);
-      return true;
-    }
-  }
-
+  // Note: there must be no "everything is already valid" early-out scan of
+  // active_valid_flags_ outside the global critical region. The validity bits
+  // are cleared by the memory write watch callback on the guest CPU thread
+  // while holding that lock, so an unsynchronized read can observe a stale set
+  // bit for a page that has just been invalidated, skip its upload, and leave
+  // the shared memory buffer holding bytes from whatever previously occupied
+  // that guest page. The locked scan below already returns early when nothing
+  // needs uploading. See xenia's SharedMemory::RequestRange, which likewise
+  // does the whole scan under the lock.
   upload_ranges_.clear();
   auto append_upload_range = [this](uint32_t page_start, uint32_t page_count) {
     if (!page_count) {
@@ -509,7 +479,7 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
   };
   {
     auto global_lock = global_critical_region_.Acquire();
-    valid_flags = active_valid_flags_.load(std::memory_order_relaxed);
+    uint64_t* valid_flags = active_valid_flags_.load(std::memory_order_relaxed);
     for (const std::pair<uint32_t, uint32_t>& range : merged_ranges) {
       uint32_t page_first = range.first >> page_size_log2_;
       uint32_t page_last = (range.first + range.second - 1) >> page_size_log2_;
