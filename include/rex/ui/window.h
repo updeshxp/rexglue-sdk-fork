@@ -211,6 +211,13 @@ class Window {
   // desired state, the `protected` On*Update functions must be used (overall
   // the On* functions are for the implementation's feedback).
 
+  // Height in pixels of the display the window currently resides on (or the
+  // primary display if the window isn't open yet). Used, e.g., to filter
+  // which resolution presets make sense to offer in settings UI. Default
+  // implementation has no platform to query, so it reports 0 (unknown);
+  // callers should treat 0 as "assume everything fits".
+  virtual uint32_t GetDesktopDisplayHeight() const { return 0; }
+
   virtual uint32_t GetMediumDpi() const { return 96; }
   uint32_t GetDpi() const {
     uint32_t dpi = GetLatestDpiImpl();

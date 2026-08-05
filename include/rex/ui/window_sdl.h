@@ -38,6 +38,7 @@ bool WarpMouseToCenter(int32_t& x_out, int32_t& y_out) override;
   void SetTextInputActive(bool active) override;
   std::string GetClipboardText() override;
   void SetClipboardText(const std::string& text) override;
+  uint32_t GetDesktopDisplayHeight() const override;
 
   // Called by SDLWindowedAppContext on the UI thread.
   void HandleWindowEvent(SDL_Event& event);
