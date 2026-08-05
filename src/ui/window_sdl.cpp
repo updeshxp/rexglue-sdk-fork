@@ -238,6 +238,22 @@ bool WindowSDL::SetRelativeMouseMode(bool enable) {
   return enable;
 }
 
+uint32_t WindowSDL::GetDesktopDisplayHeight() const {
+  // SDL_GetDisplayForWindow/SDL_GetDesktopDisplayMode route through SDL's
+  // video backend (Win32, X11, Wayland, ...), so this works cross-platform
+  // without any #ifdef'd platform API calls here.
+  SDL_DisplayID display =
+      sdl_window_ ? SDL_GetDisplayForWindow(sdl_window_) : SDL_GetPrimaryDisplay();
+  if (!display) {
+    return 0;
+  }
+  const SDL_DisplayMode* mode = SDL_GetDesktopDisplayMode(display);
+  if (!mode || mode->h <= 0) {
+    return 0;
+  }
+  return uint32_t(mode->h);
+}
+
 uint32_t WindowSDL::GetLatestDpiImpl() const {
   float scale = sdl_window_ ? SDL_GetWindowDisplayScale(sdl_window_)
                             : SDL_GetDisplayContentScale(SDL_GetPrimaryDisplay());
