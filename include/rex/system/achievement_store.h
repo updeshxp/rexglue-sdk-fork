@@ -14,6 +14,8 @@
 
 namespace rex::system {
 
+constexpr uint32_t kAchievementFlagShowUnachieved = 0x8;
+
 struct AchievementInfo {
   uint32_t id = 0;
   std::string label;

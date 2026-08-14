@@ -10,6 +10,8 @@
  */
 #pragma once
 
+#include <unordered_set>
+
 #include <rex/system/achievement_manager.h>
 #include <rex/ui/imgui_dialog.h>
 #include <rex/ui/overlay/achievement_icon_cache.h>
@@ -38,6 +40,9 @@ class AchievementsOverlayDialog : public ImGuiDialog {
 
   rex::system::AchievementManager* achievements_ = nullptr;
   AchievementIconCache icon_cache_;
+
+  // IDs the player has opted to reveal
+  std::unordered_set<uint32_t> revealed_secrets_;
 };
 
 }  // namespace rex::ui
