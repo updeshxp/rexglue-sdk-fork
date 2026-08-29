@@ -32,8 +32,7 @@ class SettingsDialog : public ImGuiDialog {
   // settings overlay) -- same title means same ImGui window ID, which
   // merges both dialogs' draws into one squeezed window instead of two.
   SettingsDialog(ImGuiDrawer* imgui_drawer, std::filesystem::path config_path,
-                 rex::input::InputSystem* input_system = nullptr,
-                 std::string window_title = "Settings##rex");
+                 rex::input::InputSystem* input_system = nullptr);
   ~SettingsDialog();
 
  protected:
@@ -42,7 +41,6 @@ class SettingsDialog : public ImGuiDialog {
  private:
   std::filesystem::path config_path_;
   rex::input::InputSystem* input_system_ = nullptr;
-  std::string window_title_;
   char search_buf_[128] = {};
   std::string selected_category_;
   std::string capturing_bind_name_;

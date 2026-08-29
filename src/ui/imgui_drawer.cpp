@@ -172,7 +172,6 @@ void ImGuiDrawer::Initialize() {
   // text widgets interoperate with the rest of the desktop. Without this ImGui
   // falls back to an internal-only buffer and pasting external text silently
   // does nothing. The context stores this drawer as the user data.
-  ImGuiPlatformIO& platform_io = ImGui::GetPlatformIO();
   platform_io.Platform_ClipboardUserData = this;
   platform_io.Platform_GetClipboardTextFn = [](ImGuiContext*) -> const char* {
     auto* drawer = static_cast<ImGuiDrawer*>(ImGui::GetPlatformIO().Platform_ClipboardUserData);

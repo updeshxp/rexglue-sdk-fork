@@ -96,18 +96,20 @@ REXCVAR_DEFINE_STRING(remap_left_trigger, "left_trigger", "Input/Remap/Controlle
 REXCVAR_DEFINE_STRING(remap_right_trigger, "right_trigger", "Input/Remap/Controller",
                       "Right trigger")
     .allowed(REMAP_ALLOWED_VALUES);
+
+#undef REMAP_ALLOWED_VALUES
+
 namespace {
 
-// Lookup table mapping original physical inputs to their remapped targets.
-const std::array<RemapEntry, 19>& RemapTable() {
-  static const std::array<RemapEntry, 19> table = {
-      {"dpad_up", static_cast<X_INPUT_GAMEPAD_BUTTON>(X_INPUT_GAMEPAD_DPAD_UP),
+const std::vector<RemapEntry>& RemapTable() {
+  static const std::vector<RemapEntry> table = {
+      {"dpad_up", X_INPUT_GAMEPAD_DPAD_UP,
        []() -> const std::string& { return REXCVAR_GET(remap_dpad_up); }},
-      {"dpad_down", static_cast<X_INPUT_GAMEPAD_BUTTON>(X_INPUT_GAMEPAD_DPAD_DOWN),
+      {"dpad_down", X_INPUT_GAMEPAD_DPAD_DOWN,
        []() -> const std::string& { return REXCVAR_GET(remap_dpad_down); }},
-      {"dpad_left", static_cast<X_INPUT_GAMEPAD_BUTTON>(X_INPUT_GAMEPAD_DPAD_LEFT),
+      {"dpad_left", X_INPUT_GAMEPAD_DPAD_LEFT,
        []() -> const std::string& { return REXCVAR_GET(remap_dpad_left); }},
-      {"dpad_right", static_cast<X_INPUT_GAMEPAD_BUTTON>(X_INPUT_GAMEPAD_DPAD_RIGHT),
+      {"dpad_right", X_INPUT_GAMEPAD_DPAD_RIGHT,
        []() -> const std::string& { return REXCVAR_GET(remap_dpad_right); }},
       {"start", X_INPUT_GAMEPAD_START,
        []() -> const std::string& { return REXCVAR_GET(remap_start); }},
@@ -144,6 +146,8 @@ const RemapEntry* EntryByName(const std::string& name) {
   return nullptr;
 }
 
+// Applies the physical input remap table, allowing any digital button or
+// analog trigger to be reassigned to act as any other button or trigger.
 void ApplyRemap(uint16_t orig_buttons, uint8_t orig_left_trigger, uint8_t orig_right_trigger,
                 uint16_t& out_buttons, uint8_t& out_left_trigger, uint8_t& out_right_trigger) {
   out_buttons = 0;
@@ -179,6 +183,7 @@ void ApplyRemap(uint16_t orig_buttons, uint8_t orig_left_trigger, uint8_t orig_r
 }
 
 }  // namespace
+
 InputSystem::InputSystem(rex::ui::Window* window) : window_(window) {}
 
 InputSystem::~InputSystem() = default;

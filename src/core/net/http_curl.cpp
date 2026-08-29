@@ -80,8 +80,8 @@ HttpResponse HttpGet(std::string_view url, const ProgressFn& progress) {
   curl_easy_setopt(curl, CURLOPT_URL, url_str.c_str());
   curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
   curl_easy_setopt(curl, CURLOPT_MAXREDIRS, kMaxRedirects);
-  curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS_STR, "https");
-  curl_easy_setopt(curl, CURLOPT_PROTOCOLS_STR, "https");
+  curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS, "https");
+  curl_easy_setopt(curl, CURLOPT_PROTOCOLS, "https");
   curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, kConnectTimeoutSec);
   curl_easy_setopt(curl, CURLOPT_TIMEOUT, kTotalTimeoutSec);
   curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
@@ -127,8 +127,8 @@ HttpResponse HttpPostJson(std::string_view url, std::string_view json_body) {
   curl_easy_setopt(curl, CURLOPT_URL, url_str.c_str());
   curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
   curl_easy_setopt(curl, CURLOPT_MAXREDIRS, kMaxRedirects);
-  curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS_STR, "https");
-  curl_easy_setopt(curl, CURLOPT_PROTOCOLS_STR, "https");
+  curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS, "https");
+  curl_easy_setopt(curl, CURLOPT_PROTOCOLS, "https");
   curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, kConnectTimeoutSec);
   curl_easy_setopt(curl, CURLOPT_TIMEOUT, kTotalTimeoutSec);
   curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
@@ -175,8 +175,8 @@ bool HttpDownloadToFile(std::string_view url, const std::filesystem::path& dest,
   curl_easy_setopt(curl, CURLOPT_URL, url_str.c_str());
   curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
   curl_easy_setopt(curl, CURLOPT_MAXREDIRS, kMaxRedirects);
-  curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS_STR, "https");
-  curl_easy_setopt(curl, CURLOPT_PROTOCOLS_STR, "https");
+  curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS, "https");
+  curl_easy_setopt(curl, CURLOPT_PROTOCOLS, "https");
   curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, kConnectTimeoutSec);
   curl_easy_setopt(curl, CURLOPT_TIMEOUT, 300L);  // downloads can be larger than a metadata query
   curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteFileCallback);

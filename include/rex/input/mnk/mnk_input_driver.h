@@ -14,6 +14,7 @@
 #include <rex/ui/window.h>
 #include <rex/ui/window_listener.h>
 
+#include <chrono>
 #include <atomic>
 #include <cstdint>
 #include <mutex>

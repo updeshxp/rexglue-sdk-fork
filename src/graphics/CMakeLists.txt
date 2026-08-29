@@ -18,7 +18,6 @@ set(REXGPU_XENOS_SOURCES
     # GPU system
     graphics_system.cpp
     command_processor.cpp
-trace_writer.cpp
     pipeline/texture/extent.cpp
     pipeline/texture/util.cpp
     pipeline/texture/replacement.cpp
@@ -140,7 +139,7 @@ endif()
 target_link_libraries(rexgpu-xenos PRIVATE
     rexruntime
     xxHash::xxhash
-stb_image
+    stb_image
     stb_image_write
 )
 

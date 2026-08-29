@@ -135,7 +135,7 @@ class VulkanCommandProcessor : public CommandProcessor {
   void InitializeShaderStorage(const std::filesystem::path& cache_root, uint32_t title_id,
                                bool blocking) override;
 
-void InitializeAssetReplacement(const system::AssetReplacementConfig& config) override;
+  void InitializeAssetReplacement(const system::AssetReplacementConfig& config) override;
 
   void TracePlaybackWroteMemory(uint32_t base_ptr, uint32_t length) override;
 

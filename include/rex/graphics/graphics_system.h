@@ -83,7 +83,7 @@ class GraphicsSystem : public system::IGraphicsSystem {
   void InitializeShaderStorage(const std::filesystem::path& cache_root, uint32_t title_id,
                                bool blocking) override;
 
-void InitializeAssetReplacement(const system::AssetReplacementConfig& config) override;
+  void InitializeAssetReplacement(const system::AssetReplacementConfig& config) override;
 
   void SetHostSwapCallback(std::function<void()> callback) override {
     host_swap_callback_ = std::move(callback);

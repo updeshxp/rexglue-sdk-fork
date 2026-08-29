@@ -34,8 +34,7 @@ class WindowSDL final : public Window {
 
   void* GetNativeWindowHandle() const override;
   bool SetRelativeMouseMode(bool enable) override;
-bool WarpMouseToCenter(int32_t& x_out, int32_t& y_out) override;
-  void SetTextInputActive(bool active) override;
+  bool WarpMouseToCenter(int32_t& x_out, int32_t& y_out) override;
   std::string GetClipboardText() override;
   void SetClipboardText(const std::string& text) override;
   uint32_t GetDesktopDisplayHeight() const override;
@@ -83,7 +82,7 @@ bool WarpMouseToCenter(int32_t& x_out, int32_t& y_out) override;
   void ApplyTextInputActiveNow();
   void RearmCursorAutoHideTimer();
 
-// Ratio between SDL window coordinates and the physical pixels listeners
+  // Ratio between SDL window coordinates and the physical pixels listeners
   // expect. Never zero.
   float GetPixelDensity() const;
 

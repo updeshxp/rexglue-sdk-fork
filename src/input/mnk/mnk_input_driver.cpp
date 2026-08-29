@@ -570,12 +570,6 @@ bool MnkInputDriver::TryGetLookVelocity(double* out_vx, double* out_vy) {
     return false;
   }
 
-  // Bring the accumulator current to *now* (applies decay for the time elapsed
-  // since the last OnMouseMove/decay), then read it non-destructively. Unlike
-  // the raw-delta drain, we never zero it here: OnMouseMove keeps updating it
-  // in real time and the decay handles ramp-down, so successive polls see
-  // "recent motion, continuously decayed" rather than "sum since I last asked."
-  DecayMouseAccumulator();
   if (out_vx)
     *out_vx = mouse_dx_;
   if (out_vy)

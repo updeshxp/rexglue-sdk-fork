@@ -348,7 +348,10 @@ ApplyResult SetFlagFromSource(std::string_view name, std::string_view value, Sou
 
 }  // namespace
 
-bool SetFlagByName(std::string_view name, std::string_view value) {
+bool SetFlagByName(std::string_view name, std::string_view value, bool persist) {
+  if (persist) {
+    REXLOG_DEBUG("SetFlagByName persist value: {}", persist);
+  }
   return SetFlagFromSource(name, value, Source::kRuntime) == ApplyResult::kApplied;
 }
 
@@ -699,6 +702,49 @@ bool IsFinalized() {
   return g_finalized;
 }
 
+namespace {
+
+// Returns the key of a `key = value` line, or nullopt if the line is blank,
+// a comment, or otherwise not a recognizable assignment.
+std::optional<std::string> ExtractTomlKey(const std::string& line) {
+  auto first = line.find_first_not_of(" \t");
+  if (first == std::string::npos || line[first] == '#') {
+    return std::nullopt;
+  }
+  auto eq = line.find('=');
+  if (eq == std::string::npos) {
+    return std::nullopt;
+  }
+  auto last = line.find_last_not_of(" \t", eq - 1);
+  if (last == std::string::npos || last < first) {
+    return std::nullopt;
+  }
+  std::string key = line.substr(first, last - first + 1);
+  for (char c : key) {
+    if (!std::isalnum(static_cast<unsigned char>(c)) && c != '_' && c != '.' && c != '-') {
+      return std::nullopt;
+    }
+  }
+  return key;
+}
+
+// Finds the start of a trailing `#` comment, ignoring `#` inside quoted
+// strings. Returns npos if there is no trailing comment.
+size_t FindTomlCommentStart(const std::string& line) {
+  bool in_string = false;
+  for (size_t i = 0; i < line.size(); ++i) {
+    char c = line[i];
+    if (c == '"' && (i == 0 || line[i - 1] != '\\')) {
+      in_string = !in_string;
+    } else if (c == '#' && !in_string) {
+      return i;
+    }
+  }
+  return std::string::npos;
+}
+
+}  // namespace
+
 void SaveConfig(const std::filesystem::path& config_path) {
   std::string content = SerializeToTOML();
   if (content.empty()) {
@@ -717,6 +763,93 @@ void SaveConfig(const std::filesystem::path& config_path) {
     REXLOG_INFO("Saved config to {}", config_path.string());
   } catch (const std::exception& e) {
     REXLOG_ERROR("SaveConfig: {}", e.what());
+  }
+}
+
+void SaveConfigSubset(const std::filesystem::path& config_path,
+                      const std::vector<std::string>& names) {
+  std::lock_guard lock(GetRegistryMutex());
+
+  std::unordered_map<std::string, const FlagEntry*> all_entries;
+  for (const auto& entry : GetRegistryStorage()) {
+    all_entries[entry.name] = &entry;
+  }
+
+  std::unordered_map<std::string, const FlagEntry*> to_write;
+  for (const auto& name : names) {
+    auto it = all_entries.find(name);
+    if (it == all_entries.end()) {
+      continue;
+    }
+    to_write[name] = it->second;
+  }
+
+  auto format_value = [](const FlagEntry& entry) {
+    if (entry.type == FlagType::String) {
+      return "\"" + EscapeTomlString(entry.getter()) + "\"";
+    }
+    return entry.getter();
+  };
+
+  // Same in-place patch strategy as SaveConfig, but scoped to `names`: lines
+  // for cvars outside the subset are preserved verbatim even if they are
+  // known, persisted cvars, since they belong to a different config file.
+  std::vector<std::string> result;
+  if (std::filesystem::exists(config_path)) {
+    std::ifstream in(config_path);
+    std::string line;
+    while (std::getline(in, line)) {
+      auto key = ExtractTomlKey(line);
+      if (!key) {
+        result.push_back(line);
+        continue;
+      }
+
+      auto entry_it = to_write.find(*key);
+      if (entry_it == to_write.end()) {
+        result.push_back(line);
+        continue;
+      }
+
+      std::string new_line = *key + " = " + format_value(*entry_it->second);
+      size_t comment_start = FindTomlCommentStart(line);
+      if (comment_start != std::string::npos) {
+        new_line += "  " + line.substr(comment_start);
+      }
+      result.push_back(std::move(new_line));
+      to_write.erase(entry_it);
+    }
+  } else {
+    result.push_back("# Auto-generated cvar configuration");
+  }
+
+  if (!to_write.empty()) {
+    if (!result.empty() && !result.back().empty()) {
+      result.push_back("");
+    }
+    for (const auto& name : names) {
+      auto it = to_write.find(name);
+      if (it != to_write.end()) {
+        result.push_back(name + " = " + format_value(*it->second));
+      }
+    }
+  }
+
+  try {
+    if (config_path.has_parent_path()) {
+      std::filesystem::create_directories(config_path.parent_path());
+    }
+    std::ofstream file(config_path);
+    if (!file) {
+      REXLOG_ERROR("SaveConfigSubset: failed to open {}", config_path.string());
+      return;
+    }
+    for (const auto& line : result) {
+      file << line << "\n";
+    }
+    REXLOG_INFO("Saved config subset to {}", config_path.string());
+  } catch (const std::exception& e) {
+    REXLOG_ERROR("SaveConfigSubset: {}", e.what());
   }
 }
 

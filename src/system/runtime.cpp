@@ -228,7 +228,7 @@ X_STATUS Runtime::Setup(RuntimeConfig config) {
     if (XFAILED(gpu_status)) {
       return fail(gpu_status, "GPU setup failed");
     }
-// Tick the mod registry once per guest frame (on GPU swap). Graphics
+    // Tick the mod registry once per guest frame (on GPU swap). Graphics
     // systems without a swap concept (SetHostSwapCallback default no-op)
     // simply never tick.
     graphics_system_->SetHostSwapCallback([this] { mod_registry_->DispatchTick(); });

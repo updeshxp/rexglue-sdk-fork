@@ -56,7 +56,7 @@ class D3D12CommandProcessor : public CommandProcessor {
   void InitializeShaderStorage(const std::filesystem::path& cache_root, uint32_t title_id,
                                bool blocking) override;
 
-void InitializeAssetReplacement(const system::AssetReplacementConfig& config) override;
+  void InitializeAssetReplacement(const system::AssetReplacementConfig& config) override;
 
   void RequestFrameTrace(const std::filesystem::path& root_path) override;
 

@@ -314,7 +314,7 @@ class CommandProcessor {
   virtual void InitializeShaderStorage(const std::filesystem::path& cache_root, uint32_t title_id,
                                        bool blocking);
 
-// Texture/shader mod replacement and dumping. Default: no-op. Backends
+  // Texture/shader mod replacement and dumping. Default: no-op. Backends
   // that support content-hash-keyed asset substitution (D3D12/Vulkan Xenos
   // command processors) override this to plumb the config down to their
   // texture cache and pipeline cache.

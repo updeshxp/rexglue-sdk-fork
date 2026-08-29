@@ -15,6 +15,8 @@ add_library(rexaudio OBJECT
     # SDL backend
     sdl/sdl_audio_system.cpp
     sdl/sdl_audio_driver.cpp
+    raw_pcm_player.cpp
+    ducking.cpp
 )
 add_library(rex::audio ALIAS rexaudio)
 
