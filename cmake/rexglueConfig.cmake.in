@@ -14,6 +14,7 @@ list(PREPEND CMAKE_PREFIX_PATH "${PACKAGE_PREFIX_DIR}")
 
 find_dependency(fmt CONFIG)
 find_dependency(spdlog CONFIG)
+find_dependency(Snappy CONFIG)
 find_dependency(utf8cpp CONFIG)
 find_dependency(SDL3 CONFIG)
 

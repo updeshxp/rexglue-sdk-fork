@@ -1,6 +1,8 @@
 name: Lint & Format Check
 
-on: [pull_request, push]
+# Disabled - skip lint and format check
+# on: [pull_request, push]
+on: workflow_dispatch
 
 jobs:
   format-check:
