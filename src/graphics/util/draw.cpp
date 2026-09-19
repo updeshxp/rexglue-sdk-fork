@@ -957,9 +957,16 @@ bool GetResolveInfo(const RegisterFile& regs, const memory::Memory& memory,
   info_out.copy_dest_coordinate_info.height_aligned_div_32 =
       (rb_copy_dest_pitch.copy_dest_height + (xenos::kTextureTileWidthHeight - 1)) >>
       xenos::kTextureTileWidthHeightLog2;
+  info_out.copy_dest_texture_base = rb_copy_dest_base;
+  info_out.copy_dest_x0 = uint32_t(x0);
+  info_out.copy_dest_y0 = uint32_t(y0);
+  info_out.copy_dest_pitch_px = uint32_t(rb_copy_dest_pitch.copy_dest_pitch);
+  info_out.copy_dest_height_px = uint32_t(rb_copy_dest_pitch.copy_dest_height);
+  info_out.copy_dest_bpp_log2 = 2;
   const FormatInfo& dest_format_info = *FormatInfo::Get(dest_format);
   if (is_depth || dest_format_info.type == FormatType::kResolvable) {
     uint32_t bpp_log2 = rex::log2_floor(dest_format_info.bits_per_pixel >> 3);
+    info_out.copy_dest_bpp_log2 = bpp_log2;
     uint32_t dest_base_relative_x_mask = (UINT32_C(1) << xenos::GetTextureTiledXBaseGranularityLog2(
                                               bool(rb_copy_dest_info.copy_dest_array), bpp_log2)) -
                                          1;

@@ -23,6 +23,10 @@ add_executable(unit_tests
     system/mod_dependency_test.cpp
     system/mod_state_test.cpp
     system/mod_catalog_test.cpp
+    graphics/index_expand_test.cpp
+    graphics/draw_classify_test.cpp
+    graphics/phase_model_test.cpp
+    graphics/shader_constants_test.cpp
 )
 
 target_sources(unit_tests PRIVATE
