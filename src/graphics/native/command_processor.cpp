@@ -2046,10 +2046,29 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   }
 
   // --- Viewport / NDC. ---
+  uint32_t viewport_max_x = vulkan_device_->properties().maxViewportDimensions[0];
+  uint32_t viewport_max_y = vulkan_device_->properties().maxViewportDimensions[1];
+  const uint32_t color_edram_base = regs.Get<reg::RB_COLOR_INFO>().color_base;
+  if (regs.Get<reg::PA_CL_CLIP_CNTL>().clip_disable) {
+    const auto surface_extent_it = edram_base_surface_extents_.find(color_edram_base);
+    if (surface_extent_it != edram_base_surface_extents_.end() && surface_extent_it->second.first &&
+        surface_extent_it->second.second) {
+      viewport_max_x = surface_extent_it->second.first;
+      viewport_max_y = surface_extent_it->second.second;
+    }
+    draw_util::Scissor scissor;
+    draw_util::GetScissor(regs, scissor);
+    const uint32_t scissor_right = scissor.offset[0] + scissor.extent[0];
+    const uint32_t scissor_bottom = scissor.offset[1] + scissor.extent[1];
+    if (scissor_right && scissor_right < xenos::kTexture2DCubeMaxWidthHeight) {
+      viewport_max_x = scissor_right;
+    }
+    if (scissor_bottom && scissor_bottom < xenos::kTexture2DCubeMaxWidthHeight) {
+      viewport_max_y = scissor_bottom;
+    }
+  }
   draw_util::ViewportInfo viewport_info;
-  draw_util::GetHostViewportInfo(regs, 1, 1, false,
-                                 vulkan_device_->properties().maxViewportDimensions[0],
-                                 vulkan_device_->properties().maxViewportDimensions[1], true,
+  draw_util::GetHostViewportInfo(regs, 1, 1, false, viewport_max_x, viewport_max_y, true,
                                  normalized_depth_control, false, false,
                                  pixel_shader && pixel_shader->writes_depth(), viewport_info);
 
@@ -2430,7 +2449,7 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   draw.index_offset = index_offset;
   draw.index_type = index_type;
   draw.draw_count = draw_index_count;
-  draw.color_edram_base = regs.Get<reg::RB_COLOR_INFO>().color_base;
+  draw.color_edram_base = color_edram_base;
   draw.depth_only = depth_only;
   {
     const auto rb_depth_info = regs.Get<reg::RB_DEPTH_INFO>();
@@ -3119,6 +3138,7 @@ bool NativeCommandProcessor::IssueCopy() {
   // was last cleared - not just the draws since the previous resolve, because
   // resolving does not clear EDRAM (see RenderPhase).
   const uint32_t src_base = resolve_info.color_edram_info.base_tiles;
+  edram_base_surface_extents_[src_base] = {img_w, img_h};
   const auto clear_it = base_clear_point_.find(src_base);
   const auto last_it = base_last_resolve_.find(src_base);
   RenderPhase phase;

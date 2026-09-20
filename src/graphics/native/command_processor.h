@@ -440,6 +440,14 @@ class NativeCommandProcessor : public CommandProcessor {
     uint32_t img_h = 0;
   };
   std::unordered_map<uint32_t, ResolvedTextureLayout> resolved_texture_layouts_;
+  // Native's no-EDRAM path uses resolves as the only authoritative signal for
+  // the guest surface extent of each EDRAM base. Clip-disabled fullscreen / blit
+  // draws intentionally ask GetHostViewportInfo for the maximum render-target
+  // extent to synthesize a host viewport; passing the Vulkan device maximum
+  // there makes those draws 8192x8192. Keep the last resolved size for each
+  // source base so subsequent draws to that base use the bound guest surface
+  // size instead.
+  std::unordered_map<uint32_t, std::pair<uint32_t, uint32_t>> edram_base_surface_extents_;
   // Resolved rect size per alias key, to compare against the size the guest's
   // fetch constant claims the texture at that address is.
   std::unordered_map<uint32_t, std::pair<uint32_t, uint32_t>> resolved_target_dims_;
