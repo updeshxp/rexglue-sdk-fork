@@ -520,6 +520,7 @@ class NativeCommandProcessor : public CommandProcessor {
   std::vector<DeferredDraw> deferred_draws_;
   bool frame_open_ = false;
   bool draw_resources_ok_ = false;
+  bool log_presentation_diag = false;
 #endif  // REX_HAS_VULKAN
 };
 

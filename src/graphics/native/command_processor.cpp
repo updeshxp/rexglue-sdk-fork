@@ -24,6 +24,7 @@
 
 #include <rex/bit.h>
 #include <rex/cvar.h>
+#include <rex/kernel/xboxkrnl/video.h>
 #include <rex/logging.h>
 #include <rex/string/buffer.h>
 #include <rex/system/kernel_state.h>
@@ -62,6 +63,10 @@ REXCVAR_DEFINE_BOOL(native_log_phases, false, "GPU/Native",
                     "Log render-target phases, their draw ownership and their resolves.\n                    Cheap (a few lines per frame) and periodic, unlike\n                    native_log_draws, whose per-draw flood rotates these very lines\n                    out of the log file before they can be read.");
 REXCVAR_DEFINE_BOOL(native_phase_base_filter, true, "GPU/Native",
                     "Restrict a phase's replay to the draws whose colour render target\n                    matches the resolved EDRAM base. Off = replay every draw in the\n                    phase's range - an A/B switch for titles whose world renders\n                    black, to separate 'draws were filtered out' from 'draws rendered\n                    nothing'.");
+
+// Bump this whenever native present / clip-viewport diagnostics change so a
+// fresh game log can prove that the staged native plugin is the expected build.
+constexpr char kNativeViewportDiagnosticsBuild[] = "present-diag-2026-09-25.1";
 
 namespace rex::graphics::native {
 
@@ -225,8 +230,9 @@ bool NativeCommandProcessor::SetupContext() {
     REXLOG_WARN("rexgpu-native: SetupContext - draw resources unavailable, clear-only fallback");
     DestroyDrawResources();
   }
-  REXLOG_INFO("rexgpu-native: SetupContext ready (device={}, draw_path={})",
-              vulkan_device_->properties().deviceName, draw_resources_ok_ ? "geometry" : "clear-only");
+  REXLOG_INFO("rexgpu-native: SetupContext ready (build={}, device={}, draw_path={})",
+              kNativeViewportDiagnosticsBuild, vulkan_device_->properties().deviceName,
+              draw_resources_ok_ ? "geometry" : "clear-only");
   return true;
 #else
   REXLOG_ERROR("rexgpu-native: SetupContext - built without Vulkan support");
@@ -2050,21 +2056,62 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   uint32_t viewport_max_y = vulkan_device_->properties().maxViewportDimensions[1];
   const uint32_t color_edram_base = regs.Get<reg::RB_COLOR_INFO>().color_base;
   if (regs.Get<reg::PA_CL_CLIP_CNTL>().clip_disable) {
+    const char* viewport_source = "device_max_fallthrough";
     const auto surface_extent_it = edram_base_surface_extents_.find(color_edram_base);
-    if (surface_extent_it != edram_base_surface_extents_.end() && surface_extent_it->second.first &&
-        surface_extent_it->second.second) {
-      viewport_max_x = surface_extent_it->second.first;
-      viewport_max_y = surface_extent_it->second.second;
-    }
+    const bool surface_extent_hit =
+        surface_extent_it != edram_base_surface_extents_.end() && surface_extent_it->second.first &&
+        surface_extent_it->second.second;
+    const uint32_t resolve_extent_x =
+        surface_extent_it != edram_base_surface_extents_.end() ? surface_extent_it->second.first : 0;
+    const uint32_t resolve_extent_y =
+        surface_extent_it != edram_base_surface_extents_.end() ? surface_extent_it->second.second : 0;
     draw_util::Scissor scissor;
     draw_util::GetScissor(regs, scissor);
     const uint32_t scissor_right = scissor.offset[0] + scissor.extent[0];
     const uint32_t scissor_bottom = scissor.offset[1] + scissor.extent[1];
-    if (scissor_right && scissor_right < xenos::kTexture2DCubeMaxWidthHeight) {
-      viewport_max_x = scissor_right;
+    const bool scissor_x_valid =
+        scissor_right && scissor_right < xenos::kTexture2DCubeMaxWidthHeight;
+    const bool scissor_y_valid =
+        scissor_bottom && scissor_bottom < xenos::kTexture2DCubeMaxWidthHeight;
+    if (surface_extent_hit) {
+      viewport_max_x = surface_extent_it->second.first;
+      viewport_max_y = surface_extent_it->second.second;
+      viewport_source = "resolve_extent_hit";
+    } else if (scissor_x_valid && scissor_y_valid) {
+      if (scissor_x_valid) {
+        viewport_max_x = scissor_right;
+      }
+      if (scissor_y_valid) {
+        viewport_max_y = scissor_bottom;
+      }
+      viewport_source = "scissor_fallback";
+    } else {
+      // Before the first resolve there is no authoritative per-EDRAM-base
+      // extent yet. PA_SC_WINDOW_SCISSOR commonly carries the 8192 sentinel on
+      // one axis at startup; accepting the other axis used to synthesize a
+      // bogus 1280x8192 viewport for the first few clip-disabled draws. The
+      // configured guest output is the only complete, bounded extent available
+      // until the first resolve establishes the surface size.
+      system::X_VIDEO_MODE video_mode;
+      kernel::xboxkrnl::VdQueryVideoMode(&video_mode);
+      viewport_max_x = std::max(uint32_t(1), uint32_t(video_mode.display_width));
+      viewport_max_y = std::max(uint32_t(1), uint32_t(video_mode.display_height));
+      viewport_source = "video_mode_fallback";
     }
-    if (scissor_bottom && scissor_bottom < xenos::kTexture2DCubeMaxWidthHeight) {
-      viewport_max_y = scissor_bottom;
+    if (REXCVAR_GET(native_log_draws)) {
+      const auto scissor_tl = regs.Get<reg::PA_SC_WINDOW_SCISSOR_TL>();
+      const auto scissor_br = regs.Get<reg::PA_SC_WINDOW_SCISSOR_BR>();
+      REXLOG_INFO(
+          "rexgpu-native: viewport_clip_disable draw=#{} base=0x{:X} source={} "
+          "resolve_extent={}x{} raw_scissor=tl=0x{:08X}[{},{} off_disable={}] "
+          "br=0x{:08X}[{},{}] decoded_scissor=off={}+{} extent={}x{} right_bottom={}x{} "
+          "valid={}x{} device_max={}x{} final_max={}x{}",
+          draw_count_, color_edram_base, viewport_source, resolve_extent_x, resolve_extent_y,
+          scissor_tl.value, scissor_tl.tl_x, scissor_tl.tl_y, scissor_tl.window_offset_disable,
+          scissor_br.value, scissor_br.br_x, scissor_br.br_y, scissor.offset[0], scissor.offset[1],
+          scissor.extent[0], scissor.extent[1], scissor_right, scissor_bottom, scissor_x_valid,
+          scissor_y_valid, vulkan_device_->properties().maxViewportDimensions[0],
+          vulkan_device_->properties().maxViewportDimensions[1], viewport_max_x, viewport_max_y);
     }
   }
   draw_util::ViewportInfo viewport_info;
@@ -2208,6 +2255,7 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
 
   // Vertex float constants (tightly packed per the shader's bitmap; base 000).
   const Shader::ConstantRegisterMap& vmap = vertex_shader->constant_register_map();
+  bool log_presentation_diag = false;
   {
     size_t float_size = sizeof(float) * 4 * std::max(vmap.float_count, UINT32_C(1));
     VkBuffer buffer;
@@ -3431,8 +3479,8 @@ void NativeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
     // actually starts.
     static uint64_t entry_n = 0;
     ++entry_n;
-    if ((REXCVAR_GET(native_log_phases) || REXCVAR_GET(native_log_draws)) &&
-        (entry_n <= 4 || (entry_n % 137) == 0)) {
+    log_presentation_diag = entry_n <= 4 || (entry_n % 137) == 0;
+    if (log_presentation_diag) {
       REXLOG_INFO("rexgpu-native: SWAPENTRY #{} swap={} phases={} deferred={} fb=0x{:08X}",
                   entry_n, swap_count_, phases_.size(), deferred_draws_.size(), frontbuffer_ptr);
       // The display decision itself: the frontbuffer key the guest named, what
@@ -3445,8 +3493,15 @@ void NativeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
         dests += fmt::format("{:08X}{} ", p.dest_key,
                              p.end_draw > p.first_draw ? "" : "(empty)");
       }
-      REXLOG_INFO("rexgpu-native: PRESENT fb_key=0x{:08X} present={} ranges={} dests=[{}]", fb_key,
-                  present_index != SIZE_MAX, display_ranges.size(), dests);
+      // This is selection state, not host presentation success. With
+      // native_present_frontbuffer=false (the default), a valid frontbuffer
+      // match deliberately falls back to draw replay because direct resolved
+      // image consumption is not safe yet.
+      REXLOG_INFO(
+          "rexgpu-native: PRESENT_SELECT fb_key=0x{:08X} resolved_selected={} "
+          "frontbuffer_blit_enabled={} ranges={} dests=[{}]",
+          fb_key, present_index != SIZE_MAX, REXCVAR_GET(native_present_frontbuffer),
+          display_ranges.size(), dests);
       // The skip histogram: "were the missing draws rejected, and why?" - the
       // first question for a black world, answerable only from a log the
       // per-draw flood has not rotated away.
@@ -3938,6 +3993,17 @@ void NativeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
         dfn.vkWaitForFences(device, 1, &clear_fence_, VK_TRUE, UINT64_MAX);
         return true;
       });
+
+  if (log_presentation_diag) {
+    // RefreshGuestOutput returning true means the callback submitted a complete
+    // guest-output image and published it to the presenter's mailbox. The
+    // Presenter then performs (or requests) the separate host paint /
+    // vkQueuePresentKHR operation according to its paint mode.
+    REXLOG_INFO("rexgpu-native: PRESENT fb_key=0x{:08X} present={} resolved_selected={} "
+                "frontbuffer_blit_enabled={}",
+                fb_key, presented, present_index != SIZE_MAX,
+                REXCVAR_GET(native_present_frontbuffer));
+  }
 
   // Debug readback of every offscreen phase, before the frame's resources go.
   DumpResolvedTargets();
