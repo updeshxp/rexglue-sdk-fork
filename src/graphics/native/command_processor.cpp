@@ -63,6 +63,10 @@ REXCVAR_DEFINE_BOOL(native_log_phases, false, "GPU/Native",
 REXCVAR_DEFINE_BOOL(native_phase_base_filter, true, "GPU/Native",
                     "Restrict a phase's replay to the draws whose colour render target\n                    matches the resolved EDRAM base. Off = replay every draw in the\n                    phase's range - an A/B switch for titles whose world renders\n                    black, to separate 'draws were filtered out' from 'draws rendered\n                    nothing'.");
 
+// Bump this whenever the clip-disable viewport investigation changes so a fresh
+// game log can prove that the staged native plugin is the expected build.
+constexpr char kNativeViewportDiagnosticsBuild[] = "clip-vp-diag-2026-09-24.1";
+
 namespace rex::graphics::native {
 
 namespace {
@@ -225,8 +229,9 @@ bool NativeCommandProcessor::SetupContext() {
     REXLOG_WARN("rexgpu-native: SetupContext - draw resources unavailable, clear-only fallback");
     DestroyDrawResources();
   }
-  REXLOG_INFO("rexgpu-native: SetupContext ready (device={}, draw_path={})",
-              vulkan_device_->properties().deviceName, draw_resources_ok_ ? "geometry" : "clear-only");
+  REXLOG_INFO("rexgpu-native: SetupContext ready (build={}, device={}, draw_path={})",
+              kNativeViewportDiagnosticsBuild, vulkan_device_->properties().deviceName,
+              draw_resources_ok_ ? "geometry" : "clear-only");
   return true;
 #else
   REXLOG_ERROR("rexgpu-native: SetupContext - built without Vulkan support");
@@ -2050,21 +2055,50 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   uint32_t viewport_max_y = vulkan_device_->properties().maxViewportDimensions[1];
   const uint32_t color_edram_base = regs.Get<reg::RB_COLOR_INFO>().color_base;
   if (regs.Get<reg::PA_CL_CLIP_CNTL>().clip_disable) {
+    const char* viewport_source = "device_max_fallthrough";
     const auto surface_extent_it = edram_base_surface_extents_.find(color_edram_base);
-    if (surface_extent_it != edram_base_surface_extents_.end() && surface_extent_it->second.first &&
-        surface_extent_it->second.second) {
-      viewport_max_x = surface_extent_it->second.first;
-      viewport_max_y = surface_extent_it->second.second;
-    }
+    const bool surface_extent_hit =
+        surface_extent_it != edram_base_surface_extents_.end() && surface_extent_it->second.first &&
+        surface_extent_it->second.second;
+    const uint32_t resolve_extent_x =
+        surface_extent_it != edram_base_surface_extents_.end() ? surface_extent_it->second.first : 0;
+    const uint32_t resolve_extent_y =
+        surface_extent_it != edram_base_surface_extents_.end() ? surface_extent_it->second.second : 0;
     draw_util::Scissor scissor;
     draw_util::GetScissor(regs, scissor);
     const uint32_t scissor_right = scissor.offset[0] + scissor.extent[0];
     const uint32_t scissor_bottom = scissor.offset[1] + scissor.extent[1];
-    if (scissor_right && scissor_right < xenos::kTexture2DCubeMaxWidthHeight) {
-      viewport_max_x = scissor_right;
+    const bool scissor_x_valid =
+        scissor_right && scissor_right < xenos::kTexture2DCubeMaxWidthHeight;
+    const bool scissor_y_valid =
+        scissor_bottom && scissor_bottom < xenos::kTexture2DCubeMaxWidthHeight;
+    if (surface_extent_hit) {
+      viewport_max_x = surface_extent_it->second.first;
+      viewport_max_y = surface_extent_it->second.second;
+      viewport_source = "resolve_extent_hit";
+    } else if (scissor_x_valid || scissor_y_valid) {
+      if (scissor_x_valid) {
+        viewport_max_x = scissor_right;
+      }
+      if (scissor_y_valid) {
+        viewport_max_y = scissor_bottom;
+      }
+      viewport_source = "scissor_fallback";
     }
-    if (scissor_bottom && scissor_bottom < xenos::kTexture2DCubeMaxWidthHeight) {
-      viewport_max_y = scissor_bottom;
+    if (REXCVAR_GET(native_log_draws)) {
+      const auto scissor_tl = regs.Get<reg::PA_SC_WINDOW_SCISSOR_TL>();
+      const auto scissor_br = regs.Get<reg::PA_SC_WINDOW_SCISSOR_BR>();
+      REXLOG_INFO(
+          "rexgpu-native: viewport_clip_disable draw=#{} base=0x{:X} source={} "
+          "resolve_extent={}x{} raw_scissor=tl=0x{:08X}[{},{} off_disable={}] "
+          "br=0x{:08X}[{},{}] decoded_scissor=off={}+{} extent={}x{} right_bottom={}x{} "
+          "valid={}x{} device_max={}x{} final_max={}x{}",
+          draw_count_, color_edram_base, viewport_source, resolve_extent_x, resolve_extent_y,
+          scissor_tl.value, scissor_tl.tl_x, scissor_tl.tl_y, scissor_tl.window_offset_disable,
+          scissor_br.value, scissor_br.br_x, scissor_br.br_y, scissor.offset[0], scissor.offset[1],
+          scissor.extent[0], scissor.extent[1], scissor_right, scissor_bottom, scissor_x_valid,
+          scissor_y_valid, vulkan_device_->properties().maxViewportDimensions[0],
+          vulkan_device_->properties().maxViewportDimensions[1], viewport_max_x, viewport_max_y);
     }
   }
   draw_util::ViewportInfo viewport_info;
