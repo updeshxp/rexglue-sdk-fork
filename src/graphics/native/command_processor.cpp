@@ -61,12 +61,18 @@ REXCVAR_DEFINE_BOOL(native_present_frontbuffer, false, "GPU/Native",
                     "Present the resolved frontbuffer image instead of replaying its\n                    draws. The SELECTION is correct and measured - it is what makes\n                    SoulCalibur II report present=true - but the blit that consumes\n                    it still makes vkQueueSubmit fail, so it is off until that is\n                    found with validation layers enabled.");
 REXCVAR_DEFINE_BOOL(native_log_phases, false, "GPU/Native",
                     "Log render-target phases, their draw ownership and their resolves.\n                    Cheap (a few lines per frame) and periodic, unlike\n                    native_log_draws, whose per-draw flood rotates these very lines\n                    out of the log file before they can be read.");
+REXCVAR_DEFINE_BOOL(native_preserve_edram, false, "GPU/Native",
+                    "Keep the EDRAM surface across a non-clearing resolve, so draws that follow "
+                    "composite onto it instead of onto a cleared target. Correct by the Xenos "
+                    "model, but it does not change GW1's output, so it stays off until a title "
+                    "shows it is needed - an unmeasured default is how a backend accumulates "
+                    "per-title luck instead of a model.");
 REXCVAR_DEFINE_BOOL(native_phase_base_filter, true, "GPU/Native",
                     "Restrict a phase's replay to the draws whose colour render target\n                    matches the resolved EDRAM base. Off = replay every draw in the\n                    phase's range - an A/B switch for titles whose world renders\n                    black, to separate 'draws were filtered out' from 'draws rendered\n                    nothing'.");
 
 // Bump this whenever native present / clip-viewport diagnostics change so a
 // fresh game log can prove that the staged native plugin is the expected build.
-constexpr char kNativeViewportDiagnosticsBuild[] = "present-diag-2026-09-25.1";
+constexpr char kNativeViewportDiagnosticsBuild[] = "present-diag-2026-09-26.1";
 
 namespace rex::graphics::native {
 
@@ -1569,6 +1575,21 @@ VkDescriptorSet NativeCommandProcessor::AllocateTextureSet(SpirvShader* shader,
   const uint32_t texture_count = uint32_t(textures.size());
   const uint32_t sampler_count = uint32_t(samplers.size());
 
+  // TEMP-DIAG: unconditional (no cvar, no alias-plausibility gate) proof that
+  // this function runs at all and what it sees, capped by a raw call count.
+  {
+    static uint64_t call_n = 0;
+    if (!resolved_target_views_.empty() && call_n < 4000) {
+      ++call_n;
+      std::string dims;
+      for (const auto& tb : textures) {
+        dims += fmt::format("{} ", uint32_t(tb.dimension));
+      }
+      REXLOG_INFO("rexgpu-native: DIAG-ATS #{} tex={} samp={} dims=[{}] resolved_aliases={}",
+                  call_n, texture_count, sampler_count, dims, resolved_target_views_.size());
+    }
+  }
+
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device_->functions();
   VkDescriptorSetAllocateInfo alloc = {};
   alloc.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
@@ -1621,7 +1642,7 @@ VkDescriptorSet NativeCommandProcessor::AllocateTextureSet(SpirvShader* shader,
       const bool alias_plausible = !resolved_target_views_.empty() &&
                                    (dimension == xenos::FetchOpDimension::k1D ||
                                     dimension == xenos::FetchOpDimension::k2D);
-      if (swap_ok && alias_plausible && alias_log_count < 60) {
+      if (swap_ok && alias_plausible && alias_log_count < 20000) {
         ++alias_log_count;
         if (alias_log_count == 1) {
           std::string keys;
@@ -1658,7 +1679,7 @@ VkDescriptorSet NativeCommandProcessor::AllocateTextureSet(SpirvShader* shader,
       // (e.g. PGR3's road) rather than assuming it.
       if (REXCVAR_GET(native_log_draws)) {
         static uint64_t miss_log_count = 0;
-        if (!cache_hit && miss_log_count < 60) {
+        if (!cache_hit && miss_log_count < 20000) {
           ++miss_log_count;
           const xenos::xe_gpu_texture_fetch_t fetch =
               register_file_->GetTextureFetch(tb.fetch_constant);
@@ -2255,7 +2276,6 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
 
   // Vertex float constants (tightly packed per the shader's bitmap; base 000).
   const Shader::ConstantRegisterMap& vmap = vertex_shader->constant_register_map();
-  bool log_presentation_diag = false;
   {
     size_t float_size = sizeof(float) * 4 * std::max(vmap.float_count, UINT32_C(1));
     VkBuffer buffer;
@@ -2497,7 +2517,7 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   draw.index_offset = index_offset;
   draw.index_type = index_type;
   draw.draw_count = draw_index_count;
-  draw.color_edram_base = color_edram_base;
+  draw.color_edram_base = regs.Get<reg::RB_COLOR_INFO>().color_base;
   draw.depth_only = depth_only;
   {
     const auto rb_depth_info = regs.Get<reg::RB_DEPTH_INFO>();
@@ -2510,6 +2530,13 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   draw.blend_constants[2] = regs.Get<float>(XE_GPU_REG_RB_BLEND_BLUE);
   draw.blend_constants[3] = regs.Get<float>(XE_GPU_REG_RB_BLEND_ALPHA);
   ++rt_format_counts_[uint32_t(regs.Get<reg::RB_COLOR_INFO>().color_format) & 15];
+  {
+    const uint32_t wm = uint32_t(pipeline_state.color_write_mask) & 0b1111;
+    ++write_mask_counts_[wm];
+    if (regs.Get<reg::RB_BLENDCONTROL>(reg::RB_BLENDCONTROL::rt_register_indices[0]).value != 0) {
+      ++blend_enable_draws_;
+    }
+  }
   // TEMP-DIAG: the frontbuffer-phase draws (base 0) are where the composite goes
   // wrong - log their geometry and viewport.
   if (draw.color_edram_base == 0 && swap_count_ > 3000) {
@@ -2931,7 +2958,13 @@ size_t NativeCommandProcessor::AcquireResolvedTarget(uint32_t dest_key, uint32_t
   VkImageViewCreateInfo view_info = {};
   view_info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
   view_info.image = rt.image;
-  view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
+  // An array view over the one layer, not a plain 2D one. A resolved target is
+  // sampled by the next stage of the guest's own post chain, and the shader
+  // translator declares every 2D sampler arrayed (OpTypeImage Dim=2D
+  // Arrayed=1) because a Xenos 2D texture can be an array. Binding a
+  // VK_IMAGE_VIEW_TYPE_2D view against that is the viewType-07752 the
+  // validation layers report.
+  view_info.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
   view_info.format = resolved_format;
   view_info.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
   if (dfn.vkCreateImageView(device, &view_info, nullptr, &rt.view) != VK_SUCCESS) {
@@ -3191,6 +3224,7 @@ bool NativeCommandProcessor::IssueCopy() {
   const auto last_it = base_last_resolve_.find(src_base);
   RenderPhase phase;
   phase.src_base = src_base;
+  phase.clears_color = resolve_info.IsClearingColor();
   phase.first_draw = std::max(clear_it != base_clear_point_.end() ? clear_it->second : 0u,
                               last_it != base_last_resolve_.end() ? last_it->second : 0u);
   phase.end_draw = uint32_t(deferred_draws_.size());
@@ -3479,8 +3513,8 @@ void NativeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
     // actually starts.
     static uint64_t entry_n = 0;
     ++entry_n;
-    log_presentation_diag = entry_n <= 4 || (entry_n % 137) == 0;
-    if (log_presentation_diag) {
+    if ((REXCVAR_GET(native_log_phases) || REXCVAR_GET(native_log_draws)) &&
+        (entry_n <= 4 || (entry_n % 137) == 0)) {
       REXLOG_INFO("rexgpu-native: SWAPENTRY #{} swap={} phases={} deferred={} fb=0x{:08X}",
                   entry_n, swap_count_, phases_.size(), deferred_draws_.size(), frontbuffer_ptr);
       // The display decision itself: the frontbuffer key the guest named, what
@@ -3493,15 +3527,8 @@ void NativeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
         dests += fmt::format("{:08X}{} ", p.dest_key,
                              p.end_draw > p.first_draw ? "" : "(empty)");
       }
-      // This is selection state, not host presentation success. With
-      // native_present_frontbuffer=false (the default), a valid frontbuffer
-      // match deliberately falls back to draw replay because direct resolved
-      // image consumption is not safe yet.
-      REXLOG_INFO(
-          "rexgpu-native: PRESENT_SELECT fb_key=0x{:08X} resolved_selected={} "
-          "frontbuffer_blit_enabled={} ranges={} dests=[{}]",
-          fb_key, present_index != SIZE_MAX, REXCVAR_GET(native_present_frontbuffer),
-          display_ranges.size(), dests);
+      REXLOG_INFO("rexgpu-native: PRESENT fb_key=0x{:08X} present={} ranges={} dests=[{}]", fb_key,
+                  present_index != SIZE_MAX, display_ranges.size(), dests);
       // The skip histogram: "were the missing draws rejected, and why?" - the
       // first question for a black world, answerable only from a log the
       // per-draw flood has not rotated away.
@@ -3515,11 +3542,17 @@ void NativeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
           rtf += fmt::format("{}={} ", i, rt_format_counts_[i]);
         }
       }
+      std::string wm;
+      for (uint32_t i = 0; i < 16; ++i) {
+        if (write_mask_counts_[i]) {
+          wm += fmt::format("{:X}={} ", i, write_mask_counts_[i]);
+        }
+      }
       REXLOG_INFO(
           "rexgpu-native: SKIPS issued={} skipped={} [{}] tex_binds={} tex_miss={} tex_null={} "
-          "zclear={} rtfmt=[{}]",
+          "zclear={} rtfmt=[{}] wmask=[{}] blendctl={}",
           draw_count_, skipped_draw_total_, hist, texture_bind_total_, texture_miss_total_,
-          texture_null_total_, guest_depth_clear_, rtf);
+          texture_null_total_, guest_depth_clear_, rtf, wm, blend_enable_draws_);
     }
   }
 
@@ -3598,18 +3631,29 @@ void NativeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
             }
           }
         }
+        // A resolve is a COPY OUT of the EDRAM surface, not the end of it. When
+        // the guest resolves without asking for a clear and then keeps drawing
+        // to the same EDRAM base, those later draws composite onto what is
+        // already there. Rendering every phase into a freshly cleared target
+        // throws that away - which is how a scene that is resolved for a bloom
+        // downsample and then drawn over comes back as the bloom alone.
+        uint32_t prev_phase_base = UINT32_MAX;
         for (const RenderPhase& p : phases_) {
           if (p.resolved_index == SIZE_MAX || p.end_draw <= p.first_draw) {
             continue;
           }
+          const bool preserve_surface =
+              REXCVAR_GET(native_preserve_edram) && p.src_base == prev_phase_base && !p.clears_color;
+          prev_phase_base = p.src_base;
           ResolvedTarget& resolved = resolved_target_storage_[p.resolved_index];
 
           VkImageSubresourceRange color_range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
           VkImageMemoryBarrier rt_to_color = {};
           rt_to_color.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-          rt_to_color.srcAccessMask = 0;
+          rt_to_color.srcAccessMask = preserve_surface ? VK_ACCESS_TRANSFER_READ_BIT : 0;
           rt_to_color.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-          rt_to_color.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+          rt_to_color.oldLayout = preserve_surface ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
+                                                   : VK_IMAGE_LAYOUT_UNDEFINED;
           rt_to_color.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
           rt_to_color.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
           rt_to_color.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
@@ -3625,7 +3669,7 @@ void NativeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
           rt_clears[1].depthStencil.depth = guest_depth_clear_;
           VkRenderPassBeginInfo rt_rp_begin = {};
           rt_rp_begin.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
-          rt_rp_begin.renderPass = clear_render_pass_;
+          rt_rp_begin.renderPass = preserve_surface ? load_render_pass_ : clear_render_pass_;
           rt_rp_begin.framebuffer = resolve_rt_framebuffer_;
           rt_rp_begin.renderArea.extent = {resolve_rt_width_, resolve_rt_height_};
           rt_rp_begin.clearValueCount = 2;
@@ -3984,26 +4028,17 @@ void NativeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
         {
           const ui::vulkan::VulkanDevice::Queue::Acquisition queue_acquisition =
               vulkan_device_->AcquireQueue(vulkan_device_->queue_family_graphics_compute(), 0);
-          if (dfn.vkQueueSubmit(queue_acquisition.queue(), 1, &submit_info, clear_fence_) !=
-              VK_SUCCESS) {
-            REXLOG_ERROR("rexgpu-native: vkQueueSubmit failed for guest draw present");
+          const VkResult submit_result =
+              dfn.vkQueueSubmit(queue_acquisition.queue(), 1, &submit_info, clear_fence_);
+          if (submit_result != VK_SUCCESS) {
+            REXLOG_ERROR("rexgpu-native: vkQueueSubmit failed for guest draw present ({})",
+                         int(submit_result));
             return false;
           }
         }
         dfn.vkWaitForFences(device, 1, &clear_fence_, VK_TRUE, UINT64_MAX);
         return true;
       });
-
-  if (log_presentation_diag) {
-    // RefreshGuestOutput returning true means the callback submitted a complete
-    // guest-output image and published it to the presenter's mailbox. The
-    // Presenter then performs (or requests) the separate host paint /
-    // vkQueuePresentKHR operation according to its paint mode.
-    REXLOG_INFO("rexgpu-native: PRESENT fb_key=0x{:08X} present={} resolved_selected={} "
-                "frontbuffer_blit_enabled={}",
-                fb_key, presented, present_index != SIZE_MAX,
-                REXCVAR_GET(native_present_frontbuffer));
-  }
 
   // Debug readback of every offscreen phase, before the frame's resources go.
   DumpResolvedTargets();
@@ -4106,5 +4141,6 @@ void NativeCommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_
       (first - XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0) / 6,
       (last - XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0) / 6);
 }
+
 
 }  // namespace rex::graphics::native
