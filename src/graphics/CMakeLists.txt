@@ -21,6 +21,7 @@ set(REXGPU_XENOS_SOURCES
     pipeline/texture/extent.cpp
     pipeline/texture/util.cpp
     pipeline/texture/replacement.cpp
+    pm4_plume_transpiler.cpp
     util/draw_extent_estimator.cpp
     util/draw.cpp
     packet_disassembler.cpp
