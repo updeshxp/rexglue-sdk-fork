@@ -40,7 +40,9 @@ jobs:
         uses: actions/checkout@v6
         with:
           ref: ${{ steps.branch.outputs.branch }}
-          fetch-depth: 1
+          submodules: recursive
+          fetch-depth: 0
+          fetch-tags: true
 
       - name: Compare dev HEAD to most recent nightly
         id: compare
