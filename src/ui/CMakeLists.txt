@@ -82,6 +82,8 @@ elseif(APPLE)
 elseif(ANDROID)
     set(REXUI_PLATFORM_SOURCES
         surface_android.cpp
+        window_android.cpp
+        windowed_app_context_android.cpp
     )
 else()
     set(REXUI_PLATFORM_SOURCES
