@@ -43,9 +43,9 @@ void PlumeRenderTargetCache::EndFrame() {
   switch (format) {
     case rex::graphics::xenos::ColorRenderTargetFormat::k_8_8_8_8:
     case rex::graphics::xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA:
-      return ::plume::RenderFormat::B8G8R8A8_UNORM;
+      return ::plume::RenderFormat::R8G8B8A8_UNORM;
     default:
-      return ::plume::RenderFormat::B8G8R8A8_UNORM;
+      return ::plume::RenderFormat::R8G8B8A8_UNORM;
   }
 }
 
@@ -72,7 +72,7 @@ PlumeRenderTargetCache::PlumeRenderTarget::PlumeRenderTarget(RenderTargetKey key
   if (key.is_depth) {
     desc = ::plume::RenderTextureDesc::DepthTarget(width, height, ::plume::RenderFormat::D32_FLOAT_S8_UINT);
   } else {
-    desc = ::plume::RenderTextureDesc::ColorTarget(width, height, ::plume::RenderFormat::B8G8R8A8_UNORM);
+    desc = ::plume::RenderTextureDesc::ColorTarget(width, height, ::plume::RenderFormat::R8G8B8A8_UNORM);
   }
 
   texture = device->createTexture(desc);
@@ -125,11 +125,18 @@ bool PlumeRenderTargetCache::Resolve(const rex::memory::Memory& memory, PlumeSha
   auto color_desc = ::plume::RenderTextureDesc::ColorTarget(width, height, color_fmt);
   entry.color_texture = device->createTexture(color_desc);
 
-  auto depth_desc = ::plume::RenderTextureDesc::DepthTarget(width, height, depth_fmt);
-  entry.depth_texture = device->createTexture(depth_desc);
+  if (::plume::RenderFormatIsDepth(depth_fmt)) {
+    auto depth_desc = ::plume::RenderTextureDesc::DepthTarget(width, height, depth_fmt);
+    entry.depth_texture = device->createTexture(depth_desc);
+    if (!entry.depth_texture) {
+      REXLOG_ERROR("PlumeRenderTargetCache: depth texture creation failed ({}x{})", width, height);
+      return nullptr;
+    }
+  }
 
   const ::plume::RenderTexture* color_ptrs[] = { entry.color_texture.get() };
-  ::plume::RenderFramebufferDesc fb_desc(color_ptrs, 1, entry.depth_texture.get());
+  ::plume::RenderFramebufferDesc fb_desc(
+      color_ptrs, 1, entry.depth_texture ? entry.depth_texture.get() : nullptr);
   entry.framebuffer = device->createFramebuffer(fb_desc);
 
   auto* fb_ptr = entry.framebuffer.get();

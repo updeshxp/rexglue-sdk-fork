@@ -77,10 +77,15 @@ bool PlumeCommandProcessor::SetupContext() {
     plume_queue_ = plume_device_->createCommandQueue(::plume::RenderCommandListType::DIRECT);
     if (plume_queue_) {
       for (uint32_t i = 0; i < kMaxFramesInFlight; ++i) {
+        REXLOG_INFO("PlumeCommandProcessor: creating frame {} command list/fence", i);
         frames_[i].cmd_list = plume_queue_->createCommandList();
         frames_[i].fence = plume_device_->createCommandFence();
         frames_[i].in_flight = false;
         frames_[i].garbage.clear();
+        if (!frames_[i].cmd_list || !frames_[i].fence) {
+          REXLOG_ERROR("PlumeCommandProcessor: frame {} command list/fence creation FAILED", i);
+          return false;
+        }
       }
       current_frame_index_ = 0;
       REXLOG_INFO("PlumeCommandProcessor: direct command queue and command lists/fences created");
@@ -88,21 +93,41 @@ bool PlumeCommandProcessor::SetupContext() {
       REXLOG_WARN("PlumeCommandProcessor: could not create direct command queue");
     }
 
-    // Set 0: Shared Memory SSBO (256 MB para acomodar dados de vertices e constantes do guest)
+    // Set 0: Shared Memory SSBO. This buffer is both CPU-updatable and consumed
+    // by shaders, so use Plume's GPU_UPLOAD heap rather than an UPLOAD heap.
+    // On Vulkan this maps to HOST_VISIBLE + DEVICE_LOCAL memory and avoids
+    // forcing a large storage buffer into a host-only allocation.
     constexpr size_t kSharedMemorySize = 256 * 1024 * 1024;
-    shared_memory_buf_ = plume_device_->createBuffer(
-        ::plume::RenderBufferDesc::UploadBuffer(kSharedMemorySize, ::plume::RenderBufferFlag::STORAGE));
-    if (shared_memory_ && shared_memory_buf_) {
-      shared_memory_->SetSharedMemoryBuffer(shared_memory_buf_.get(), kSharedMemorySize);
+    REXLOG_INFO("PlumeCommandProcessor: creating shared memory buffer ({} MiB, GPU_UPLOAD + STORAGE)",
+                kSharedMemorySize / (1024 * 1024));
+    ::plume::RenderBufferDesc shared_desc;
+    shared_desc.size = kSharedMemorySize;
+    shared_desc.heapType = ::plume::RenderHeapType::GPU_UPLOAD;
+    shared_desc.flags = ::plume::RenderBufferFlag::STORAGE;
+    shared_memory_buf_ = plume_device_->createBuffer(shared_desc);
+    if (!shared_memory_buf_) {
+      REXLOG_ERROR("PlumeCommandProcessor: shared memory buffer creation FAILED");
+    } else {
+      REXLOG_INFO("PlumeCommandProcessor: shared memory buffer created successfully");
+      shared_memory_buf_->setName("rexglue_guest_shared_memory");
+      if (shared_memory_) {
+        shared_memory_->SetSharedMemoryBuffer(shared_memory_buf_.get(), kSharedMemorySize);
+      }
     }
+
+    REXLOG_INFO("PlumeCommandProcessor: creating shared memory descriptor set");
     ::plume::RenderDescriptorRange set0_range(
         ::plume::RenderDescriptorRangeType::BYTE_ADDRESS_BUFFER, 0, 1);
     ::plume::RenderDescriptorSetDesc set0_desc(&set0_range, 1);
     shared_memory_descriptor_set_ = plume_device_->createDescriptorSet(set0_desc);
     if (shared_memory_descriptor_set_ && shared_memory_buf_) {
       shared_memory_descriptor_set_->setBuffer(0, shared_memory_buf_.get());
+      REXLOG_INFO("PlumeCommandProcessor: shared memory descriptor set ready");
+    } else {
+      REXLOG_ERROR("PlumeCommandProcessor: shared memory descriptor set creation/binding FAILED");
     }
 
+    REXLOG_INFO("PlumeCommandProcessor: creating dummy texture");
     // Fallback 1x1 Dummy Texture and View
     ::plume::RenderTextureDesc dummy_tex_desc = ::plume::RenderTextureDesc::Texture(
         ::plume::RenderTextureDimension::TEXTURE_2D, 1, 1, 1, 1, 1,
@@ -117,11 +142,16 @@ bool PlumeCommandProcessor::SetupContext() {
       dummy_view_desc.arrayIndex = 0;
       dummy_view_desc.arraySize = 1;
       dummy_texture_view_ = dummy_texture_->createTextureView(dummy_view_desc);
+      REXLOG_INFO("PlumeCommandProcessor: dummy texture/view ready");
+    } else {
+      REXLOG_ERROR("PlumeCommandProcessor: dummy texture creation FAILED");
     }
 
     // Fallback Default Sampler
     ::plume::RenderSamplerDesc default_samp_desc;
     default_sampler_ = plume_device_->createSampler(default_samp_desc);
+    REXLOG_INFO("PlumeCommandProcessor: default sampler {}",
+                default_sampler_ ? "created" : "FAILED");
   }
 
   return true;
@@ -300,8 +330,8 @@ bool PlumeCommandProcessor::IssueDraw(rex::graphics::xenos::PrimitiveType prim_t
   // -------------------------------------------------------------------------
   uint32_t fb_width = 1280u;
   uint32_t fb_height = 720u;
-  ::plume::RenderFormat color_fmt = ::plume::RenderFormat::B8G8R8A8_UNORM;
-  ::plume::RenderFormat depth_fmt = ::plume::RenderFormat::D32_FLOAT_S8_UINT;
+  ::plume::RenderFormat color_fmt = ::plume::RenderFormat::R8G8B8A8_UNORM;
+  ::plume::RenderFormat depth_fmt = ::plume::RenderFormat::UNKNOWN;
 
   {
     auto rb_surface = register_file_->Get<rex::graphics::reg::RB_SURFACE_INFO>();
@@ -334,6 +364,12 @@ bool PlumeCommandProcessor::IssueDraw(rex::graphics::xenos::PrimitiveType prim_t
         color_fmt = ::plume::RenderFormat::R32G32_FLOAT; break;
       default:
         color_fmt = ::plume::RenderFormat::R8G8B8A8_UNORM; break;
+    }
+
+    // Only create/attach a depth-stencil target when the guest actually uses it.
+    auto rb_depthcontrol = register_file_->Get<rex::graphics::reg::RB_DEPTHCONTROL>();
+    if (rb_depthcontrol.z_enable || rb_depthcontrol.stencil_enable) {
+      depth_fmt = ::plume::RenderFormat::D32_FLOAT_S8_UINT;
     }
   }
 
@@ -1052,7 +1088,9 @@ PlumeCommandProcessor::PlumePipeline PlumeCommandProcessor::GetOrCreateGraphicsP
   
   desc.renderTargetCount = 1;
   desc.renderTargetFormat[0] = color_format;
-  desc.depthTargetFormat = ::plume::RenderFormat::D32_FLOAT_S8_UINT;
+  desc.depthTargetFormat = (desc.depthEnabled || desc.stencilEnabled)
+      ? ::plume::RenderFormat::D32_FLOAT_S8_UINT
+      : ::plume::RenderFormat::UNKNOWN;
   
   auto pipeline = plume_device_->createGraphicsPipeline(desc);
   if (!pipeline) {
