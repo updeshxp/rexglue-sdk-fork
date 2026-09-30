@@ -152,8 +152,10 @@ bool PlumeCommandProcessor::SetupContext() {
     default_sampler_ = plume_device_->createSampler(default_samp_desc);
     REXLOG_INFO("PlumeCommandProcessor: default sampler {}",
                 default_sampler_ ? "created" : "FAILED");
+    REXLOG_INFO("PlumeCommandProcessor: SetupContext resource initialization complete");
   }
 
+  REXLOG_INFO("PlumeCommandProcessor::SetupContext complete");
   return true;
 }
 

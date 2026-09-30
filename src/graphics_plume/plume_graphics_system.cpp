@@ -11,6 +11,9 @@
 #include <rex/ui/presenter.h>
 #include <rex/ui/windowed_app_context.h>
 #include <SDL3/SDL.h>
+#if defined(__linux__)
+#include <X11/Xlib.h>
+#endif
 #if defined(__ANDROID__)
 #include <rex/ui/windowed_app_context_android.h>
 #include <rex/ui/window_android.h>
@@ -35,6 +38,9 @@ PlumeGraphicsSystem::~PlumeGraphicsSystem() {
 X_STATUS PlumeGraphicsSystem::SetupPresentation(ui::WindowedAppContext* app_context) {
   REXLOG_INFO("PlumeGraphicsSystem::SetupPresentation");
 
+  // The graphics system can be asked to set up presentation before SDL has
+  // created its desktop window. Create the Plume device once, but retry the
+  // native swapchain bridge on every call until a swapchain exists.
   if (!plume_interface_) {
     plume_interface_ = ::plume::CreateVulkanInterface();
     if (!plume_interface_) {
@@ -48,24 +54,42 @@ X_STATUS PlumeGraphicsSystem::SetupPresentation(ui::WindowedAppContext* app_cont
       REXLOG_ERROR("PlumeGraphicsSystem: failed to create Vulkan RenderDevice");
       return X_STATUS_UNSUCCESSFUL;
     }
-    REXLOG_INFO("PlumeGraphicsSystem: Vulkan RenderDevice created successfully (name: '{}')",
-                plume_device_->getDescription().name);
+    REXLOG_INFO(
+        "PlumeGraphicsSystem: Vulkan RenderDevice created successfully (name: '{}')",
+        plume_device_->getDescription().name);
+  }
 
+  // If presentation was requested before the SDL window existed, the first
+  // call above intentionally only initializes the Vulkan device. The next
+  // SetupPresentation call (after SDL/window creation) must retry this block.
+  if (!plume_swapchain_ && plume_device_) {
 #if defined(__ANDROID__)
     if (app_context) {
       auto* android_app = dynamic_cast<ui::AndroidWindowedAppContext*>(app_context);
       if (android_app && android_app->GetWindow()) {
         ANativeWindow* native_win = android_app->GetWindow()->GetNativeWindow();
         if (native_win) {
+          REXLOG_INFO("PlumeGraphicsSystem: creating Android swapchain");
           ::plume::RenderSwapChainDesc swap_desc(
               native_win, ::plume::RenderFormat::R8G8B8A8_UNORM, 3);
           auto q = plume_device_->createCommandQueue(::plume::RenderCommandListType::DIRECT);
           if (q) {
             plume_swapchain_ = q->createSwapChain(swap_desc);
-            REXLOG_INFO("PlumeGraphicsSystem: SwapChain created for ANativeWindow ({}x{})",
-                        ANativeWindow_getWidth(native_win), ANativeWindow_getHeight(native_win));
+            if (plume_swapchain_) {
+              REXLOG_INFO(
+                  "PlumeGraphicsSystem: SwapChain created for ANativeWindow ({}x{})",
+                  ANativeWindow_getWidth(native_win), ANativeWindow_getHeight(native_win));
+            } else {
+              REXLOG_ERROR("PlumeGraphicsSystem: Android SwapChain creation FAILED");
+            }
+          } else {
+            REXLOG_ERROR("PlumeGraphicsSystem: failed to create DIRECT queue for Android swapchain");
           }
+        } else {
+          REXLOG_WARN("PlumeGraphicsSystem: Android native window not available yet");
         }
+      } else {
+        REXLOG_WARN("PlumeGraphicsSystem: Android app/window not available yet");
       }
     }
 #elif defined(_WIN32)
@@ -73,10 +97,13 @@ X_STATUS PlumeGraphicsSystem::SetupPresentation(ui::WindowedAppContext* app_cont
     // the native HWND, so bridge SDL's window property to RenderWindow here.
     int window_count = 0;
     SDL_Window** windows = SDL_GetWindows(&window_count);
+    REXLOG_INFO("PlumeGraphicsSystem: SDL desktop window count = {}", window_count);
     if (windows && window_count > 0 && windows[0]) {
-      SDL_PropertiesID props = SDL_GetWindowProperties(windows[0]);
+      SDL_Window* window = windows[0];
+      SDL_PropertiesID props = SDL_GetWindowProperties(window);
       void* hwnd = SDL_GetPointerProperty(props, SDL_PROP_WINDOW_WIN32_HWND_POINTER, nullptr);
       if (hwnd) {
+        REXLOG_INFO("PlumeGraphicsSystem: SDL Win32 HWND available; creating swapchain");
         ::plume::RenderSwapChainDesc swap_desc(
             static_cast<HWND>(hwnd), ::plume::RenderFormat::R8G8B8A8_UNORM, 3);
         auto q = plume_device_->createCommandQueue(::plume::RenderCommandListType::DIRECT);
@@ -84,34 +111,40 @@ X_STATUS PlumeGraphicsSystem::SetupPresentation(ui::WindowedAppContext* app_cont
           plume_swapchain_ = q->createSwapChain(swap_desc);
           if (plume_swapchain_) {
             int width = 0, height = 0;
-            SDL_GetWindowSizeInPixels(windows[0], &width, &height);
+            SDL_GetWindowSizeInPixels(window, &width, &height);
             REXLOG_INFO("PlumeGraphicsSystem: Windows SwapChain created ({}x{})", width, height);
           } else {
             REXLOG_ERROR("PlumeGraphicsSystem: Windows SwapChain creation FAILED");
           }
+        } else {
+          REXLOG_ERROR("PlumeGraphicsSystem: failed to create DIRECT queue for Windows swapchain");
         }
       } else {
-        REXLOG_ERROR("PlumeGraphicsSystem: SDL window has no Win32 HWND property");
+        REXLOG_WARN("PlumeGraphicsSystem: SDL window has no Win32 HWND property yet");
       }
     } else {
-      REXLOG_WARN("PlumeGraphicsSystem: no SDL desktop window available for swapchain");
+      REXLOG_WARN("PlumeGraphicsSystem: no SDL desktop window available for swapchain yet");
     }
 #elif defined(__linux__)
     // Plume's non-SDL Linux backend expects an X11 Display + Window pair.
     // ReXGlue exposes the SDL3 window, so retrieve the X11 handles from SDL's
-    // window properties rather than guessing a native handle layout.
+    // window properties. If SDL selected Wayland, leave the swapchain absent
+    // and report that explicitly rather than passing an invalid native handle.
     int window_count = 0;
     SDL_Window** windows = SDL_GetWindows(&window_count);
+    REXLOG_INFO("PlumeGraphicsSystem: SDL desktop window count = {}", window_count);
     if (windows && window_count > 0 && windows[0]) {
-      SDL_PropertiesID props = SDL_GetWindowProperties(windows[0]);
+      SDL_Window* window = windows[0];
+      SDL_PropertiesID props = SDL_GetWindowProperties(window);
       auto* display = static_cast<Display*>(
           SDL_GetPointerProperty(props, SDL_PROP_WINDOW_X11_DISPLAY_POINTER, nullptr));
-      const auto window = static_cast<Window>(
+      const auto native_window = static_cast<Window>(
           SDL_GetNumberProperty(props, SDL_PROP_WINDOW_X11_WINDOW_NUMBER, 0));
-      if (display && window != 0) {
+      if (display && native_window != 0) {
+        REXLOG_INFO("PlumeGraphicsSystem: SDL X11 handles available; creating swapchain");
         ::plume::RenderWindow render_window{};
         render_window.display = display;
-        render_window.window = window;
+        render_window.window = native_window;
         ::plume::RenderSwapChainDesc swap_desc(
             render_window, ::plume::RenderFormat::R8G8B8A8_UNORM, 3);
         auto q = plume_device_->createCommandQueue(::plume::RenderCommandListType::DIRECT);
@@ -119,7 +152,7 @@ X_STATUS PlumeGraphicsSystem::SetupPresentation(ui::WindowedAppContext* app_cont
           plume_swapchain_ = q->createSwapChain(swap_desc);
           if (plume_swapchain_) {
             int width = 0, height = 0;
-            SDL_GetWindowSizeInPixels(windows[0], &width, &height);
+            SDL_GetWindowSizeInPixels(window, &width, &height);
             REXLOG_INFO("PlumeGraphicsSystem: X11 SwapChain created ({}x{})", width, height);
           } else {
             REXLOG_ERROR("PlumeGraphicsSystem: X11 SwapChain creation FAILED");
@@ -128,13 +161,16 @@ X_STATUS PlumeGraphicsSystem::SetupPresentation(ui::WindowedAppContext* app_cont
           REXLOG_ERROR("PlumeGraphicsSystem: failed to create DIRECT queue for swapchain");
         }
       } else {
-        REXLOG_WARN("PlumeGraphicsSystem: SDL window is not exposing X11 handles; "
-                   "Wayland is not supported by the current Plume Linux backend");
+        REXLOG_WARN(
+            "PlumeGraphicsSystem: SDL window is not exposing X11 handles; "
+            "Wayland is not supported by the current Plume Linux backend");
       }
     } else {
-      REXLOG_WARN("PlumeGraphicsSystem: no SDL desktop window available for swapchain");
+      REXLOG_WARN("PlumeGraphicsSystem: no SDL desktop window available for swapchain yet");
     }
 #endif
+  } else if (plume_swapchain_) {
+    REXLOG_DEBUG("PlumeGraphicsSystem: swapchain already exists; skipping recreation");
   }
 
   return X_STATUS_SUCCESS;
