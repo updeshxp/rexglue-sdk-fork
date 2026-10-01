@@ -1,43 +1,35 @@
-# Plume renderer v4
+# Plume renderer v5
 
-Based on the Windows-successful v3 renderer, with the relevant lifecycle pattern from the Xerenge Plume implementation imported.
+Based on the Windows-successful v4 renderer plus the relevant Xerenge Plume upload/lifecycle approach.
 
-## Main change
+## Key fix
 
-PlumeTextureCache and PlumeRenderTargetCache initialization is now deferred until the command processor actually reaches IssueDraw/IssueSwap/IssueCopy.
+The Linux log showed the runtime stall at:
 
-The base ReXGlue CommandProcessor starts its GPU worker thread from Initialize(), and SetupContext runs on that worker thread. Keeping the relatively heavyweight Plume texture uploader/pipeline/staging initialization out of the startup path prevents a stall immediately after `SetupContext complete`.
+    PlumeTextureCache: initializing PlumeTextureCache/uploader
 
-This follows the useful architectural separation visible in Xerenge: presentation/device setup is established first, while draw-side resources are initialized when the guest GPU path needs them.
+The old `PlumeTextureUploader::Initialize()` created a compute pipeline layout even though the current upload implementation does CPU untile + `copyTextureRegion` and never uses those compute pipelines. Xerenge's Plume draw path likewise uses host staging/copy resources rather than this unused startup compute layout.
 
-## Preserved from v3
+v5 therefore:
 
-- 256 MiB shared memory buffer using GPU_UPLOAD + STORAGE
-- X11 SDL swapchain support
-- Desktop BGRA / Android RGBA swapchain format split
-- Conditional depth target handling
-- Primary framebuffer selection
-- Acquire/render semaphores
-- Fence-safe frame reuse
-- `setFramebuffer(nullptr)` before copy barriers
-- EDRAM copy-mode dispatch
-- Windows linker fix for `plume_swapchain()`
-- IssueDraw / IssueSwap diagnostic logging
+- keeps `PlumeTextureCache` deferred until runtime;
+- makes `PlumeTextureCache::Initialize()` a lightweight no-op;
+- initializes the texture uploader on the first actual texture upload;
+- removes the unused compute pipeline-layout creation from uploader initialization;
+- creates/maps only the 16 MiB staging buffer during uploader initialization;
+- preserves all v4 changes: GPU_UPLOAD+STORAGE shared memory, X11 swapchain, BGRA desktop/RGBA Android, frame semaphores/fences, primary framebuffer selection, EDRAM copy path, and draw/swap diagnostics.
 
-## Deliberately not imported from Xerenge
+## Files
 
-Xerenge has a separate direct Plume draw/MMIO architecture. Its direct GPU MMIO mapping, ring consumer, draw context, shader cache and complete presentation worker are not compatible with this rexglue CommandProcessor backend, so they are not copied into this patch.
+Replace these files in `graphics_plume/`:
 
-## Expected next Linux log
-
-The first important new line should be:
-
-    PlumeCommandProcessor: base Initialize returned; deferring texture/render-target caches
-
-If the guest reaches IssueSwap first, the log should then show:
-
-    PlumeCommandProcessor: initializing deferred Plume runtime caches
-    PlumeCommandProcessor: creating PlumeTextureCache
-    PlumeCommandProcessor: initializing PlumeTextureCache/uploader
-
-This will both remove the startup dependency and pinpoint any remaining Plume uploader/resource issue.
+- plume_command_processor.cpp
+- plume_command_processor.h
+- plume_graphics_system.cpp
+- plume_graphics_system.h
+- plume_render_target_cache.cpp
+- plume_render_target_cache.h
+- plume_texture_cache.cpp
+- plume_texture_cache.h
+- plume_texture_uploader.cpp
+- plume_texture_uploader.h

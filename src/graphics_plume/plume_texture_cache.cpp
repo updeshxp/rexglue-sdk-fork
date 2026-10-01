@@ -17,6 +17,11 @@ static ::plume::RenderFormat GetPlumeFormat(rex::graphics::xenos::TextureFormat 
     case rex::graphics::xenos::TextureFormat::k_DXT4_5: return ::plume::RenderFormat::BC3_UNORM;
     case rex::graphics::xenos::TextureFormat::k_8_8_8_8: return ::plume::RenderFormat::R8G8B8A8_UNORM;
     case rex::graphics::xenos::TextureFormat::k_8_8_8_8_AS_16_16_16_16: return ::plume::RenderFormat::R16G16B16A16_FLOAT;
+    case rex::graphics::xenos::TextureFormat::k_CTX1: return ::plume::RenderFormat::R8G8_UNORM;
+    case rex::graphics::xenos::TextureFormat::k_DXT3A: return ::plume::RenderFormat::BC4_UNORM;
+    case rex::graphics::xenos::TextureFormat::k_DXT5A: return ::plume::RenderFormat::BC4_UNORM;
+    case rex::graphics::xenos::TextureFormat::k_16_16: return ::plume::RenderFormat::R16G16_UNORM;
+    case rex::graphics::xenos::TextureFormat::k_16_16_FLOAT: return ::plume::RenderFormat::R16G16_FLOAT;
     default: return ::plume::RenderFormat::R8G8B8A8_UNORM;
   }
 }
@@ -75,9 +80,10 @@ PlumeTextureCache::~PlumeTextureCache() {
 }
 
 bool PlumeTextureCache::Initialize() {
-  if (!texture_uploader_->Initialize()) {
-    return false;
-  }
+  // The uploader is initialized lazily by the first actual texture upload.
+  // Its initialization creates host-side staging resources and does not need
+  // to block CommandProcessor startup.
+  REXLOG_INFO("PlumeTextureCache: initialized (uploader deferred until first texture upload)");
   return true;
 }
 
@@ -197,7 +203,9 @@ PlumeTextureCache::SamplerParameters PlumeTextureCache::GetSamplerParameters(
 }
 
 uint32_t PlumeTextureCache::GetHostFormatSwizzle(TextureKey key) const {
-  // Retornamos R, G, B, A padrão por enquanto
+  if (key.format == rex::graphics::xenos::TextureFormat::k_CTX1) {
+    return rex::graphics::xenos::XE_GPU_TEXTURE_SWIZZLE_RGGG;
+  }
   return (0) | (1 << 3) | (2 << 6) | (3 << 9);
 }
 
@@ -206,6 +214,15 @@ std::unique_ptr<rex::graphics::TextureCache::Texture> PlumeTextureCache::CreateT
 }
 
 bool PlumeTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, bool load_base, bool load_mips) {
+  if (!texture_uploader_) {
+    texture_uploader_ = std::make_unique<PlumeTextureUploader>(device_);
+    if (!texture_uploader_->Initialize()) {
+      REXLOG_ERROR("PlumeTextureCache: lazy texture uploader initialization failed");
+      texture_uploader_.reset();
+      return false;
+    }
+  }
+
   auto& plume_tex = static_cast<PlumeTexture&>(texture);
   if (!plume_tex.plume_texture()) return false;
 

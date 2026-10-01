@@ -37,6 +37,7 @@ class PlumeTextureUploader {
 
   // Buffer de Staging para enviar dados da CPU para a GPU
   std::unique_ptr<::plume::RenderBuffer> staging_buffer_;
+  void* staging_mapped_ptr_ = nullptr;
   size_t current_staging_buffer_size_ = 0;
 
   // Pipeline layout (Descriptor Sets / Push Constants)

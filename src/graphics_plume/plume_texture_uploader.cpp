@@ -25,63 +25,35 @@ PlumeTextureUploader::~PlumeTextureUploader() {
 bool PlumeTextureUploader::Initialize() {
   std::lock_guard<std::mutex> lock(upload_mutex_);
 
-  // 1. Criar RenderPipelineLayout para os Compute Shaders de Textura do Xenia
-  // O Xenia usa:
-  // - Binding 0: Buffer de Origem (Memória Raw do Xbox / Staging Buffer)
-  // - Binding 1: Imagem de Destino (UAV / Storage Image)
-  // E Push Constants para LoadConstants.
-
-  ::plume::RenderPushConstantRange push_range;
-  push_range.offset = 0;
-  push_range.size = 40; // sizeof(TextureCache::LoadConstants), is protected
-
-  ::plume::RenderDescriptorRange ranges[2];
-  
-  // Staging Buffer (Storage Buffer de Leitura)
-  ranges[0] = ::plume::RenderDescriptorRange(::plume::RenderDescriptorRangeType::BYTE_ADDRESS_BUFFER, 0, 1);
-  
-  // Destination Texture (UAV / Storage Texture de Escrita)
-  ranges[1] = ::plume::RenderDescriptorRange(::plume::RenderDescriptorRangeType::READ_WRITE_TEXTURE, 1, 1);
-
-  ::plume::RenderDescriptorSetDesc set_desc(ranges, 2);
-
-  ::plume::RenderPipelineLayoutDesc layout_desc(&push_range, 1, &set_desc, 1, false, false);
-  pipeline_layout_ = device_->createPipelineLayout(layout_desc);
-
-  if (!pipeline_layout_) {
-    REXLOG_ERROR("Falha ao criar o Pipeline Layout para o PlumeTextureUploader.");
+  // The current uploader path performs CPU untile + GPU copyTextureRegion.
+  // The old implementation also created a compute pipeline layout here, but
+  // never used those compute pipelines. That extra pipeline creation can block
+  // on some Vulkan drivers during CommandProcessor initialization. Xerenge's
+  // Plume path likewise keeps its upload resources to staging/copy resources.
+  current_staging_buffer_size_ = 16 * 1024 * 1024;
+  staging_buffer_ = device_->createBuffer(
+      ::plume::RenderBufferDesc::UploadBuffer(current_staging_buffer_size_));
+  if (!staging_buffer_) {
+    REXLOG_ERROR("PlumeTextureUploader: failed to create 16 MiB staging buffer");
     return false;
   }
 
-  // Helper para compilar shader e pipeline
-  auto create_pipeline = [&](const uint32_t* spirv_code, size_t spirv_size) -> std::unique_ptr<::plume::RenderPipeline> {
-    auto shader = device_->createShader(spirv_code, spirv_size, "main", ::plume::RenderShaderFormat::SPIRV);
-    if (!shader) return nullptr;
+  staging_mapped_ptr_ = staging_buffer_->map();
+  if (!staging_mapped_ptr_) {
+    REXLOG_ERROR("PlumeTextureUploader: failed to map staging buffer");
+    staging_buffer_.reset();
+    return false;
+  }
 
-    ::plume::RenderComputePipelineDesc compute_desc(pipeline_layout_.get(), shader.get(), 16, 16, 1);
-    return device_->createComputePipeline(compute_desc);
-  };
-
-  // 2. Criar as Pipelines de Compute para os Formatos Principais (DXT1, DXT5, RGBA8)
-  pipelines_[3] = // kLoadShaderIndex64bpb
-      create_pipeline(shaders::texture_load_64bpb_cs, sizeof(shaders::texture_load_64bpb_cs));
-      
-  pipelines_[4] = // kLoadShaderIndex128bpb
-      create_pipeline(shaders::texture_load_128bpb_cs, sizeof(shaders::texture_load_128bpb_cs));
-      
-  pipelines_[2] = // kLoadShaderIndex32bpb
-      create_pipeline(shaders::texture_load_32bpb_cs, sizeof(shaders::texture_load_32bpb_cs));
-
-  // Staging buffer inicial (16MB para aguentar quase qualquer textura)
-  current_staging_buffer_size_ = 16 * 1024 * 1024;
-  staging_buffer_ = device_->createBuffer(::plume::RenderBufferDesc::UploadBuffer(current_staging_buffer_size_));
-
-  REXLOG_INFO("PlumeTextureUploader inicializado (Compute Pipelines: 3 prontas, Staging: 16MB)");
+  REXLOG_INFO("PlumeTextureUploader initialized (CPU untile + GPU copy, 16 MiB staging)");
   return true;
 }
-
 void PlumeTextureUploader::Shutdown() {
   std::lock_guard<std::mutex> lock(upload_mutex_);
+  if (staging_mapped_ptr_ && staging_buffer_) {
+    staging_buffer_->unmap();
+    staging_mapped_ptr_ = nullptr;
+  }
   staging_buffer_.reset();
   pipelines_.clear();
   pipeline_layout_.reset();
@@ -110,45 +82,61 @@ bool PlumeTextureUploader::UploadTexture(rex::graphics::xenos::DataDimension dim
   const FormatInfo* format_info = FormatInfo::Get(format);
   if (!format_info) return false;
 
-  size_t required_size = guest_layout.base.level_data_extent_bytes; // Tamanho máximo estimado
+  bool is_ctx1 = (format == rex::graphics::xenos::TextureFormat::k_CTX1);
+  const FormatInfo* output_format_info = is_ctx1 ? FormatInfo::Get(rex::graphics::xenos::TextureFormat::k_8_8) : format_info;
+
+  uint32_t block_w = format_info->block_width;
+  uint32_t block_h = format_info->block_height;
+  uint32_t blocks_x = (width + block_w - 1) / block_w;
+  uint32_t blocks_y = (height + block_h - 1) / block_h;
+
+  size_t required_size = is_ctx1 ? (static_cast<size_t>(width) * height * 2) : guest_layout.base.level_data_extent_bytes;
+  if (required_size == 0) {
+    required_size = static_cast<size_t>(blocks_x) * blocks_y * format_info->bytes_per_block();
+  }
 
   // Aumentar o Staging Buffer se necessário
   if (required_size > current_staging_buffer_size_) {
+    if (staging_mapped_ptr_ && staging_buffer_) {
+      staging_buffer_->unmap();
+      staging_mapped_ptr_ = nullptr;
+    }
     current_staging_buffer_size_ = required_size + (4 * 1024 * 1024); // Cresce com folga
     staging_buffer_ = device_->createBuffer(::plume::RenderBufferDesc::UploadBuffer(current_staging_buffer_size_));
+    if (staging_buffer_) {
+      staging_mapped_ptr_ = staging_buffer_->map();
+    }
   }
 
-  // Map Memory
-  void* host_ptr = staging_buffer_->map();
+  void* host_ptr = staging_mapped_ptr_;
+  if (!host_ptr && staging_buffer_) {
+    staging_mapped_ptr_ = staging_buffer_->map();
+    host_ptr = staging_mapped_ptr_;
+  }
   if (!host_ptr) {
     REXLOG_ERROR("Falha ao mapear Plume Staging Buffer!");
     return false;
   }
 
-  // Por agora, para garantir que TUDO renderiza perfeitamente no teste do Android sem falta de shader:
-  // Fazemos Untile via CPU (Rápido) e usamos a via nativa de Upload do Plume (CopyBufferToTexture)
-  // TODO: Habilitar o path GPU quando validarmos o binding de descriptors do Plume.
-  
+  // Executa o Untile acelerado diretamente para o buffer persistente mapeado
   texture_conversion::UntileInfo untile_info;
   untile_info.input_format_info = format_info;
-  untile_info.output_format_info = format_info;
-  untile_info.width = width;
-  untile_info.height = height;
+  untile_info.output_format_info = output_format_info;
+  untile_info.width = blocks_x;
+  untile_info.height = blocks_y;
   untile_info.offset_x = 0;
   untile_info.offset_y = 0;
   untile_info.input_pitch = guest_layout.base.x_extent_blocks;
-  untile_info.output_pitch = guest_layout.base.x_extent_blocks; // Manter pitch
+  untile_info.output_pitch = is_ctx1 ? width : blocks_x;
   untile_info.copy_callback = [](void* dest, const void* src, size_t size) {
     std::memcpy(dest, src, size);
   };
 
   texture_conversion::Untile(static_cast<uint8_t*>(host_ptr), guest_memory, &untile_info);
 
-  staging_buffer_->unmap();
-
   // Enviar comando para GPU copiar o staging buffer descompactado para a Textura real.
   ::plume::RenderTextureCopyLocation src_loc = ::plume::RenderTextureCopyLocation::PlacedFootprint(
-      staging_buffer_.get(), dest_format, width, height, 1, untile_info.output_pitch * format_info->bytes_per_block());
+      staging_buffer_.get(), dest_format, width, height, 1, width);
       
   ::plume::RenderTextureCopyLocation dst_loc = ::plume::RenderTextureCopyLocation::Subresource(destination_texture, 0, 0);
 
