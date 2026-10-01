@@ -3556,8 +3556,23 @@ void NativeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
     }
   }
 
+  // The 3rd/4th args to RefreshGuestOutput are the intended DISPLAY aspect
+  // ratio, not a destination size to scale into (RefreshGuestOutput just
+  // fills a fixed frontbuffer_width x frontbuffer_height mailbox image -
+  // actual window-fit scaling happens later, in the presenter's own paint
+  // pass). Passing `width, height` again here means "use the raw framebuffer
+  // pixel dimensions as the aspect ratio", which silently breaks any title
+  // whose intended display aspect differs from its internal render target's
+  // pixel dimensions. The emulated Vulkan backend (src/graphics/vulkan/
+  // command_processor.cpp) queries the guest's actual configured video mode
+  // for this instead - match that here rather than reusing width/height.
+  system::X_VIDEO_MODE video_mode;
+  kernel::xboxkrnl::VdQueryVideoMode(&video_mode);
+  const uint32_t display_width = std::max(uint32_t(1), uint32_t(video_mode.display_width));
+  const uint32_t display_height = std::max(uint32_t(1), uint32_t(video_mode.display_height));
+
   const bool presented = presenter->RefreshGuestOutput(
-      width, height, width, height,
+      width, height, display_width, display_height,
       [this, width, height, clear_rgba, &display_ranges, present_index](
           ui::Presenter::GuestOutputRefreshContext& context) mutable -> bool {
         auto& vk_ctx =
