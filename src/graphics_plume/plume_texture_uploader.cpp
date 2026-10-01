@@ -25,12 +25,15 @@ PlumeTextureUploader::~PlumeTextureUploader() {
 bool PlumeTextureUploader::Initialize() {
   std::lock_guard<std::mutex> lock(upload_mutex_);
 
+  REXLOG_INFO("PlumeTextureUploader: Initialize ENTER (lazy upload path)");
+
   // The current uploader path performs CPU untile + GPU copyTextureRegion.
   // The old implementation also created a compute pipeline layout here, but
   // never used those compute pipelines. That extra pipeline creation can block
   // on some Vulkan drivers during CommandProcessor initialization. Xerenge's
   // Plume path likewise keeps its upload resources to staging/copy resources.
   current_staging_buffer_size_ = 16 * 1024 * 1024;
+  REXLOG_INFO("PlumeTextureUploader: creating 16 MiB staging buffer");
   staging_buffer_ = device_->createBuffer(
       ::plume::RenderBufferDesc::UploadBuffer(current_staging_buffer_size_));
   if (!staging_buffer_) {
@@ -38,6 +41,7 @@ bool PlumeTextureUploader::Initialize() {
     return false;
   }
 
+  REXLOG_INFO("PlumeTextureUploader: staging buffer created; mapping buffer");
   staging_mapped_ptr_ = staging_buffer_->map();
   if (!staging_mapped_ptr_) {
     REXLOG_ERROR("PlumeTextureUploader: failed to map staging buffer");
@@ -45,6 +49,7 @@ bool PlumeTextureUploader::Initialize() {
     return false;
   }
 
+  REXLOG_INFO("PlumeTextureUploader: staging buffer mapped successfully");
   REXLOG_INFO("PlumeTextureUploader initialized (CPU untile + GPU copy, 16 MiB staging)");
   return true;
 }

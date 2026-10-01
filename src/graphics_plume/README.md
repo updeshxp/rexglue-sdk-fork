@@ -33,3 +33,11 @@ Replace these files in `graphics_plume/`:
 - plume_texture_cache.h
 - plume_texture_uploader.cpp
 - plume_texture_uploader.h
+
+
+## v6 changes
+
+- Runtime texture/render-target cache objects are initialized from `PlumeCommandProcessor::Initialize()` on the caller/main graphics-system thread instead of lazily from `IssueSwap()` on the GPU worker thread.
+- `PlumeTextureUploader` remains lazy and is initialized only when the first resident texture upload is actually required.
+- Added fine-grained uploader logs around staging-buffer creation and mapping so the next runtime test can identify an upload-resource stall precisely.
+- `EnsureRuntimeCaches()` is now a validation guard only; it no longer performs potentially blocking cache construction on the command-processor worker thread.
