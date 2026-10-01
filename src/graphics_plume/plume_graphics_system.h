@@ -15,6 +15,7 @@
 namespace plume {
 struct RenderInterface;
 struct RenderDevice;
+struct RenderCommandQueue;
 struct RenderSwapChain;
 }
 
@@ -34,15 +35,18 @@ class REX_GPU_PLUGIN_EXPORT PlumeGraphicsSystem final : public ::rex::graphics::
   void Present();
 
   ::plume::RenderDevice*    plume_device()    const { return plume_device_.get(); }
-  ::plume::RenderSwapChain* plume_swapchain() const { return plume_swapchain_.get(); }
+  ::plume::RenderCommandQueue* plume_queue() const { return plume_queue_.get(); }
+  ::plume::RenderSwapChain* plume_swapchain();
 
  protected:
   void CreateProvider(bool with_presentation) override;
   std::unique_ptr<rex::graphics::CommandProcessor> CreateCommandProcessor() override;
 
  private:
+  ui::WindowedAppContext* app_context_ = nullptr;
   std::unique_ptr<::plume::RenderInterface> plume_interface_;
   std::unique_ptr<::plume::RenderDevice> plume_device_;
+  std::unique_ptr<::plume::RenderCommandQueue> plume_queue_;
   std::unique_ptr<::plume::RenderSwapChain> plume_swapchain_;
 };
 

@@ -105,7 +105,7 @@ X_STATUS PlumeGraphicsSystem::SetupPresentation(ui::WindowedAppContext* app_cont
       if (hwnd) {
         REXLOG_INFO("PlumeGraphicsSystem: SDL Win32 HWND available; creating swapchain");
         ::plume::RenderSwapChainDesc swap_desc(
-            static_cast<HWND>(hwnd), ::plume::RenderFormat::R8G8B8A8_UNORM, 3);
+            static_cast<HWND>(hwnd), ::plume::RenderFormat::B8G8R8A8_UNORM, 3);
         auto q = plume_device_->createCommandQueue(::plume::RenderCommandListType::DIRECT);
         if (q) {
           plume_swapchain_ = q->createSwapChain(swap_desc);
@@ -146,7 +146,7 @@ X_STATUS PlumeGraphicsSystem::SetupPresentation(ui::WindowedAppContext* app_cont
         render_window.display = display;
         render_window.window = native_window;
         ::plume::RenderSwapChainDesc swap_desc(
-            render_window, ::plume::RenderFormat::R8G8B8A8_UNORM, 3);
+            render_window, ::plume::RenderFormat::B8G8R8A8_UNORM, 3);
         auto q = plume_device_->createCommandQueue(::plume::RenderCommandListType::DIRECT);
         if (q) {
           plume_swapchain_ = q->createSwapChain(swap_desc);
@@ -182,6 +182,10 @@ void PlumeGraphicsSystem::CreateProvider(bool with_presentation) {
   // by this MVP backend; desktop presentation is bridged to Plume's swapchain in
   // SetupPresentation above. Keep this method side-effect free for headless GPU
   // initialization.
+}
+
+::plume::RenderSwapChain* PlumeGraphicsSystem::plume_swapchain() {
+  return plume_swapchain_.get();
 }
 
 std::unique_ptr<rex::graphics::CommandProcessor> PlumeGraphicsSystem::CreateCommandProcessor() {

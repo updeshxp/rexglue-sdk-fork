@@ -44,7 +44,8 @@ class PlumeRenderTargetCache final : public rex::graphics::RenderTargetCache {
 
   // MVP
   ::plume::RenderFramebuffer* MVP_GetOrCreateFramebuffer(::plume::RenderDevice* device, uint32_t width, uint32_t height, ::plume::RenderFormat color_fmt, ::plume::RenderFormat depth_fmt);
-  ::plume::RenderTexture* MVP_GetColorTexture();
+  ::plume::RenderTexture* MVP_GetColorTexture();          // retorna o último framebuffer ativo
+  ::plume::RenderTexture* MVP_GetPrimaryColorTexture(uint32_t frontbuffer_width = 0, uint32_t frontbuffer_height = 0);   // retorna o framebuffer da cena principal
   
   void EndFrame();
 
@@ -63,9 +64,13 @@ class PlumeRenderTargetCache final : public rex::graphics::RenderTargetCache {
     std::unique_ptr<::plume::RenderTexture> color_texture;
     std::unique_ptr<::plume::RenderTexture> depth_texture;
     std::unique_ptr<::plume::RenderFramebuffer> framebuffer;
+    uint32_t width = 0;
+    uint32_t height = 0;
   };
   std::unordered_map<uint64_t, FramebufferEntry> framebuffers_;
   uint64_t mvp_current_key_ = 0;
+  uint64_t mvp_primary_key_ = 0;  // framebuffer da cena principal
+  uint32_t mvp_primary_area_ = 0; // área em pixels do framebuffer principal
 
   ::plume::RenderFormat GetPlumeColorFormat(rex::graphics::xenos::ColorRenderTargetFormat format);
   ::plume::RenderFormat GetPlumeDepthFormat(rex::graphics::xenos::DepthRenderTargetFormat format);

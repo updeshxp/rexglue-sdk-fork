@@ -80,6 +80,8 @@ bool PlumeCommandProcessor::SetupContext() {
         REXLOG_INFO("PlumeCommandProcessor: creating frame {} command list/fence", i);
         frames_[i].cmd_list = plume_queue_->createCommandList();
         frames_[i].fence = plume_device_->createCommandFence();
+        frames_[i].acquire_semaphore = plume_device_->createCommandSemaphore();
+        frames_[i].render_semaphore = plume_device_->createCommandSemaphore();
         frames_[i].in_flight = false;
         frames_[i].garbage.clear();
         if (!frames_[i].cmd_list || !frames_[i].fence) {
@@ -168,6 +170,8 @@ void PlumeCommandProcessor::ShutdownContext() {
       }
       frames_[i].cmd_list.reset();
       frames_[i].fence.reset();
+      frames_[i].acquire_semaphore.reset();
+      frames_[i].render_semaphore.reset();
       frames_[i].garbage.clear();
     }
   }
@@ -187,96 +191,81 @@ void PlumeCommandProcessor::ShutdownContext() {
 
 void PlumeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                                       uint32_t frontbuffer_height) {
-  (void)frontbuffer_ptr;
-  (void)frontbuffer_width;
-  (void)frontbuffer_height;
-  REXLOG_DEBUG("PlumeCommandProcessor::IssueSwap: ptr=0x{:08X}, {}x{}",
+  REXLOG_DEBUG("PlumeCommandProcessor::IssueSwap ENTER: ptr=0x{:08X}, {}x{}",
                frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
-
+  cleared_fbs_this_frame_.clear();
   auto& frame = frames_[current_frame_index_];
   if (!frame.cmd_list || !plume_queue_) {
+    REXLOG_WARN("PlumeCommandProcessor::IssueSwap: no command list/queue");
     plume_graphics_system_->Present();
     return;
   }
-
-  // -------------------------------------------------------------------------
-  // Fase D: blit do color render target -> swapchain texture
-  // -------------------------------------------------------------------------
-  // Se o command list não estiver aberto (nenhum draw ocorreu neste frame),
-  // abre-o agora para a operação de copia.
+  if (frame.in_flight && frame.fence) {
+    plume_queue_->waitForCommandFence(frame.fence.get());
+    frame.in_flight = false;
+    frame.garbage.clear();
+  }
   if (!cmd_list_open_) {
     frame.cmd_list->begin();
     cmd_list_open_ = true;
+    if (texture_cache_) texture_cache_->BeginFrame();
   }
-
   auto* swapchain = plume_graphics_system_->plume_swapchain();
   if (swapchain) {
     uint32_t texture_index = 0;
-    if (swapchain->acquireTexture(nullptr, &texture_index)) {
-      ::plume::RenderTexture* swap_tex = swapchain->getTexture(texture_index);
-      ::plume::RenderTexture* color_rt = render_target_cache_ ? render_target_cache_->MVP_GetColorTexture() : nullptr;
-      
+    const bool acquired = swapchain->acquireTexture(frame.acquire_semaphore.get(), &texture_index);
+    if (acquired) {
+      auto* swap_tex = swapchain->getTexture(texture_index);
+      auto* color_rt = render_target_cache_ ? render_target_cache_->MVP_GetPrimaryColorTexture(frontbuffer_width, frontbuffer_height) : nullptr;
+      REXLOG_DEBUG("PlumeCommandProcessor::IssueSwap acquired: idx={}, color_rt={}, swap_tex={}",
+                   texture_index, static_cast<void*>(color_rt), static_cast<void*>(swap_tex));
       if (swap_tex && color_rt) {
-        ::plume::RenderTextureBarrier barriers_pre[2];
-        barriers_pre[0] = ::plume::RenderTextureBarrier(color_rt, ::plume::RenderTextureLayout::COPY_SOURCE);
-        barriers_pre[1] = ::plume::RenderTextureBarrier(swap_tex, ::plume::RenderTextureLayout::COPY_DEST);
+        frame.cmd_list->setFramebuffer(nullptr);
+        ::plume::RenderTextureBarrier barriers_pre[2] = {
+            ::plume::RenderTextureBarrier(color_rt, ::plume::RenderTextureLayout::COPY_SOURCE),
+            ::plume::RenderTextureBarrier(swap_tex, ::plume::RenderTextureLayout::COPY_DEST)};
         frame.cmd_list->barriers(::plume::RenderBarrierStage::ALL, nullptr, 0, barriers_pre, 2);
-
         frame.cmd_list->copyTexture(swap_tex, color_rt);
-
-        ::plume::RenderTextureBarrier barriers_post[2];
-        barriers_post[0] = ::plume::RenderTextureBarrier(swap_tex, ::plume::RenderTextureLayout::PRESENT);
-        barriers_post[1] = ::plume::RenderTextureBarrier(color_rt, ::plume::RenderTextureLayout::COLOR_WRITE);
+        ::plume::RenderTextureBarrier barriers_post[2] = {
+            ::plume::RenderTextureBarrier(swap_tex, ::plume::RenderTextureLayout::PRESENT),
+            ::plume::RenderTextureBarrier(color_rt, ::plume::RenderTextureLayout::COLOR_WRITE)};
         frame.cmd_list->barriers(::plume::RenderBarrierStage::ALL, nullptr, 0, barriers_post, 2);
       } else if (swap_tex) {
-        // Fallback
-        ::plume::RenderTextureBarrier barriers_post[1];
-        barriers_post[0] = ::plume::RenderTextureBarrier(swap_tex, ::plume::RenderTextureLayout::PRESENT);
-        frame.cmd_list->barriers(::plume::RenderBarrierStage::ALL, nullptr, 0, barriers_post, 1);
+        ::plume::RenderTextureBarrier barrier(swap_tex, ::plume::RenderTextureLayout::PRESENT);
+        frame.cmd_list->barriers(::plume::RenderBarrierStage::ALL, nullptr, 0, &barrier, 1);
       }
-    }
-
-    frame.cmd_list->end();
-    cmd_list_open_ = false;
-    const ::plume::RenderCommandList* lists[] = { frame.cmd_list.get() };
-    plume_queue_->executeCommandLists(lists, 1, nullptr, 0, nullptr, 0, frame.fence.get());
-    frame.in_flight = true;
-
-    // Present
-    if (swapchain) {
-      swapchain->present(texture_index, nullptr, 0);
+      frame.cmd_list->end(); cmd_list_open_ = false;
+      const ::plume::RenderCommandList* lists[] = {frame.cmd_list.get()};
+      ::plume::RenderCommandSemaphore* wait_sems[] = {frame.acquire_semaphore.get()};
+      ::plume::RenderCommandSemaphore* signal_sems[] = {frame.render_semaphore.get()};
+      plume_queue_->executeCommandLists(lists, 1, wait_sems, 1, signal_sems, 1, frame.fence.get());
+      frame.in_flight = true;
+      ::plume::RenderCommandSemaphore* present_wait[] = {frame.render_semaphore.get()};
+      swapchain->present(texture_index, present_wait, 1);
+    } else {
+      REXLOG_DEBUG("PlumeCommandProcessor::IssueSwap: acquireTexture failed");
+      frame.cmd_list->end(); cmd_list_open_ = false;
+      const ::plume::RenderCommandList* lists[] = {frame.cmd_list.get()};
+      plume_queue_->executeCommandLists(lists, 1, nullptr, 0, nullptr, 0, frame.fence.get());
+      frame.in_flight = true;
     }
   } else {
-    // Sem swapchain ou sem framebuffer ainda: apenas fecha e submete vazio
-    frame.cmd_list->end();
-    cmd_list_open_ = false;
-    const ::plume::RenderCommandList* lists[] = { frame.cmd_list.get() };
+    frame.cmd_list->end(); cmd_list_open_ = false;
+    const ::plume::RenderCommandList* lists[] = {frame.cmd_list.get()};
     plume_queue_->executeCommandLists(lists, 1, nullptr, 0, nullptr, 0, frame.fence.get());
     frame.in_flight = true;
     plume_graphics_system_->Present();
   }
-  
-  // Mover para o próximo frame
   current_frame_index_ = (current_frame_index_ + 1) % kMaxFramesInFlight;
   auto& next_frame = frames_[current_frame_index_];
-  
-  // Esperar a GPU terminar de renderizar o "next_frame" anterior, se estiver em voo
   if (next_frame.in_flight && next_frame.fence) {
     plume_queue_->waitForCommandFence(next_frame.fence.get());
     next_frame.in_flight = false;
   }
-  
-  // Agora podemos limpar o lixo do próximo frame em segurança
   next_frame.garbage.clear();
-  if (render_target_cache_) {
-    render_target_cache_->EndFrame();
-  }
-  
-  if (texture_cache_) {
-    texture_cache_->EndFrame();
-    texture_cache_->BeginSubmission(0); // Dummy sub index
-  }
-
+  if (render_target_cache_) render_target_cache_->EndFrame();
+  if (texture_cache_) { texture_cache_->EndFrame(); texture_cache_->BeginSubmission(0); }
+  REXLOG_DEBUG("PlumeCommandProcessor::IssueSwap EXIT");
 }
 
 rex::graphics::Shader* PlumeCommandProcessor::LoadShader(rex::graphics::xenos::ShaderType shader_type,
@@ -309,7 +298,14 @@ bool PlumeCommandProcessor::IssueDraw(rex::graphics::xenos::PrimitiveType prim_t
                                       IndexBufferInfo* index_buffer_info,
                                       bool major_mode_explicit) {
   (void)major_mode_explicit;
+  REXLOG_DEBUG("PlumeCommandProcessor::IssueDraw ENTER: prim={}, indices={}, indexed={}",
+               static_cast<uint32_t>(prim_type), index_count, index_buffer_info != nullptr);
   transpiler_.ObserveDraw("DRAW", static_cast<uint32_t>(prim_type), index_count, index_buffer_info != nullptr);
+  auto edram_mode = register_file_->Get<rex::graphics::reg::RB_MODECONTROL>().edram_mode;
+  if (edram_mode == rex::graphics::xenos::EdramMode::kCopy) {
+    REXLOG_DEBUG("PlumeCommandProcessor::IssueDraw: EDRAM copy mode -> IssueCopy");
+    return IssueCopy();
+  }
 
   ::plume::RenderPrimitiveTopology topology = ::plume::RenderPrimitiveTopology::TRIANGLE_LIST;
   switch (prim_type) {
@@ -332,7 +328,7 @@ bool PlumeCommandProcessor::IssueDraw(rex::graphics::xenos::PrimitiveType prim_t
   // -------------------------------------------------------------------------
   uint32_t fb_width = 1280u;
   uint32_t fb_height = 720u;
-  ::plume::RenderFormat color_fmt = ::plume::RenderFormat::R8G8B8A8_UNORM;
+  ::plume::RenderFormat color_fmt = ::plume::RenderFormat::B8G8R8A8_UNORM;
   ::plume::RenderFormat depth_fmt = ::plume::RenderFormat::UNKNOWN;
 
   {
@@ -350,7 +346,7 @@ bool PlumeCommandProcessor::IssueDraw(rex::graphics::xenos::PrimitiveType prim_t
     switch (xenos_color_fmt) {
       case rex::graphics::xenos::ColorRenderTargetFormat::k_8_8_8_8:
       case rex::graphics::xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA:
-        color_fmt = ::plume::RenderFormat::R8G8B8A8_UNORM; break;
+        color_fmt = ::plume::RenderFormat::B8G8R8A8_UNORM; break;
       case rex::graphics::xenos::ColorRenderTargetFormat::k_2_10_10_10:
       case rex::graphics::xenos::ColorRenderTargetFormat::k_2_10_10_10_AS_10_10_10_10:
         color_fmt = ::plume::RenderFormat::R16G16B16A16_UNORM; break;
@@ -365,7 +361,7 @@ bool PlumeCommandProcessor::IssueDraw(rex::graphics::xenos::PrimitiveType prim_t
       case rex::graphics::xenos::ColorRenderTargetFormat::k_32_32_FLOAT:
         color_fmt = ::plume::RenderFormat::R32G32_FLOAT; break;
       default:
-        color_fmt = ::plume::RenderFormat::R8G8B8A8_UNORM; break;
+        color_fmt = ::plume::RenderFormat::B8G8R8A8_UNORM; break;
     }
 
     // Only create/attach a depth-stencil target when the guest actually uses it.
@@ -384,6 +380,13 @@ bool PlumeCommandProcessor::IssueDraw(rex::graphics::xenos::PrimitiveType prim_t
   // Fase D.1: Begin lazy do command list (uma vez por frame)
   // -------------------------------------------------------------------------
   if (!cmd_list_open_) {
+    auto& cur_frame = frames_[current_frame_index_];
+    if (cur_frame.in_flight && cur_frame.fence && plume_queue_) {
+      REXLOG_DEBUG("PlumeCommandProcessor::IssueDraw: waiting for frame {} fence", current_frame_index_);
+      plume_queue_->waitForCommandFence(cur_frame.fence.get());
+      cur_frame.in_flight = false;
+      cur_frame.garbage.clear();
+    }
     GetActiveCommandList()->begin();
     cmd_list_open_ = true;
     if (texture_cache_) {

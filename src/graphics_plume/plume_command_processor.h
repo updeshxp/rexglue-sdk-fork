@@ -8,6 +8,7 @@
 #include <memory>
 #include <vector>
 #include <unordered_map>
+#include <unordered_set>
 
 #include <rex/graphics/command_processor.h>
 #include <rex/graphics/pm4_plume_transpiler.h>
@@ -23,7 +24,13 @@ class PlumeGraphicsSystem;
 class PlumeSharedMemory final : public rex::graphics::SharedMemory {
  public:
   PlumeSharedMemory(rex::memory::Memory& memory)
-      : rex::graphics::SharedMemory(memory) {}
+      : rex::graphics::SharedMemory(memory) {
+    InitializeCommon();
+  }
+
+  ~PlumeSharedMemory() override {
+    ShutdownCommon();
+  }
   
   void SetSharedMemoryBuffer(::plume::RenderBuffer* buffer, size_t buffer_size) {
     gpu_buffer_ = buffer;
@@ -114,6 +121,8 @@ class PlumeCommandProcessor final : public rex::graphics::CommandProcessor {
   struct PlumeFrameContext {
     std::unique_ptr<::plume::RenderCommandList> cmd_list;
     std::unique_ptr<::plume::RenderCommandFence> fence;
+    std::unique_ptr<::plume::RenderCommandSemaphore> acquire_semaphore;
+    std::unique_ptr<::plume::RenderCommandSemaphore> render_semaphore;
     bool in_flight = false;
     
     struct FrameGarbage {
@@ -125,6 +134,8 @@ class PlumeCommandProcessor final : public rex::graphics::CommandProcessor {
       std::unique_ptr<::plume::RenderBuffer> ps_float_buf;
       std::unique_ptr<::plume::RenderBuffer> bool_buf;
       std::unique_ptr<::plume::RenderBuffer> fetch_buf;
+      std::vector<std::unique_ptr<::plume::RenderBuffer>> vb_buffers;
+      std::unique_ptr<::plume::RenderBuffer> ib_buffer;
     };
     std::vector<FrameGarbage> garbage;
   };
@@ -137,7 +148,8 @@ class PlumeCommandProcessor final : public rex::graphics::CommandProcessor {
 
   PlumePipeline GetOrCreateGraphicsPipeline(::plume::RenderPrimitiveTopology topology, ::plume::RenderFormat color_format);
   ::plume::RenderPipelineLayout* GetOrCreatePipelineLayout(uint32_t t_vs, uint32_t s_vs, uint32_t t_ps, uint32_t s_ps);
-  bool cmd_list_open_ = false;  // true entre begin() e end() do command list
+  bool cmd_list_open_ = false;   // true entre begin() e end() do command list
+  std::unordered_set<::plume::RenderFramebuffer*> cleared_fbs_this_frame_; // framebuffers já limpos neste frame
 
   // Set 0: Shared Memory
   std::unique_ptr<::plume::RenderBuffer> shared_memory_buf_;
@@ -154,6 +166,11 @@ class PlumeCommandProcessor final : public rex::graphics::CommandProcessor {
   std::unique_ptr<PlumeSharedMemory> shared_memory_;
   std::unique_ptr<PlumeTextureCache> texture_cache_;
   std::unique_ptr<PlumeRenderTargetCache> render_target_cache_;
+
+  std::string hw_pipeline_cache_path_;
+  size_t last_saved_pipeline_count_ = 0;
+  uint32_t frames_since_last_pipeline_save_ = 0;
+  void SaveHardwarePipelineCache();
 };
 
 }  // namespace rex::graphics_plume

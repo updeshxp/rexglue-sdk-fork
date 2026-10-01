@@ -43,9 +43,9 @@ void PlumeRenderTargetCache::EndFrame() {
   switch (format) {
     case rex::graphics::xenos::ColorRenderTargetFormat::k_8_8_8_8:
     case rex::graphics::xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA:
-      return ::plume::RenderFormat::R8G8B8A8_UNORM;
+      return ::plume::RenderFormat::B8G8R8A8_UNORM;
     default:
-      return ::plume::RenderFormat::R8G8B8A8_UNORM;
+      return ::plume::RenderFormat::B8G8R8A8_UNORM;
   }
 }
 
@@ -72,7 +72,7 @@ PlumeRenderTargetCache::PlumeRenderTarget::PlumeRenderTarget(RenderTargetKey key
   if (key.is_depth) {
     desc = ::plume::RenderTextureDesc::DepthTarget(width, height, ::plume::RenderFormat::D32_FLOAT_S8_UINT);
   } else {
-    desc = ::plume::RenderTextureDesc::ColorTarget(width, height, ::plume::RenderFormat::R8G8B8A8_UNORM);
+    desc = ::plume::RenderTextureDesc::ColorTarget(width, height, ::plume::RenderFormat::B8G8R8A8_UNORM);
   }
 
   texture = device->createTexture(desc);
@@ -116,32 +116,45 @@ bool PlumeRenderTargetCache::Resolve(const rex::memory::Memory& memory, PlumeSha
   auto it = framebuffers_.find(key);
   if (it != framebuffers_.end()) {
     mvp_current_key_ = key;
+    // Atualizar o framebuffer primario apenas se for widescreen (ignora shadow maps quadrados como 1600x1600)
+    if (width > height && (float(width) / float(height) >= 1.25f)) {
+      uint32_t area = width * height;
+      if (area > mvp_primary_area_) {
+        mvp_primary_area_ = area;
+        mvp_primary_key_  = key;
+      }
+    }
     return it->second.framebuffer.get();
   }
 
   if (!device) return nullptr;
 
   FramebufferEntry entry;
+  entry.width = width;
+  entry.height = height;
   auto color_desc = ::plume::RenderTextureDesc::ColorTarget(width, height, color_fmt);
   entry.color_texture = device->createTexture(color_desc);
 
-  if (::plume::RenderFormatIsDepth(depth_fmt)) {
-    auto depth_desc = ::plume::RenderTextureDesc::DepthTarget(width, height, depth_fmt);
-    entry.depth_texture = device->createTexture(depth_desc);
-    if (!entry.depth_texture) {
-      REXLOG_ERROR("PlumeRenderTargetCache: depth texture creation failed ({}x{})", width, height);
-      return nullptr;
-    }
-  }
+  auto depth_desc = ::plume::RenderTextureDesc::DepthTarget(width, height, depth_fmt);
+  entry.depth_texture = device->createTexture(depth_desc);
 
   const ::plume::RenderTexture* color_ptrs[] = { entry.color_texture.get() };
-  ::plume::RenderFramebufferDesc fb_desc(
-      color_ptrs, 1, entry.depth_texture ? entry.depth_texture.get() : nullptr);
+  ::plume::RenderFramebufferDesc fb_desc(color_ptrs, 1, entry.depth_texture.get());
   entry.framebuffer = device->createFramebuffer(fb_desc);
 
   auto* fb_ptr = entry.framebuffer.get();
   framebuffers_[key] = std::move(entry);
   mvp_current_key_ = key;
+
+  // Rastrear o maior framebuffer widescreen como primario (cena principal)
+  if (width > height && (float(width) / float(height) >= 1.25f)) {
+    uint32_t area = width * height;
+    if (area > mvp_primary_area_) {
+      mvp_primary_area_ = area;
+      mvp_primary_key_  = key;
+    }
+  }
+
   return fb_ptr;
 }
 
@@ -151,6 +164,49 @@ bool PlumeRenderTargetCache::Resolve(const rex::memory::Memory& memory, PlumeSha
     return it->second.color_texture.get();
   }
   return nullptr;
+}
+
+::plume::RenderTexture* PlumeRenderTargetCache::MVP_GetPrimaryColorTexture(uint32_t frontbuffer_width, uint32_t frontbuffer_height) {
+  // Se o jogo forneceu dimensões do frontbuffer (ex: 1024x576), procura correspondência exata de altura
+  // e largura suficiente para conter o frontbuffer.
+  if (frontbuffer_height > 0) {
+    for (const auto& [k, entry] : framebuffers_) {
+      if (entry.height == frontbuffer_height && entry.width >= frontbuffer_width) {
+        return entry.color_texture.get();
+      }
+    }
+    for (const auto& [k, entry] : framebuffers_) {
+      if (entry.height == frontbuffer_height) {
+        return entry.color_texture.get();
+      }
+    }
+  }
+
+  // Fallback: procura o maior framebuffer widescreen (aspect ratio >= 1.25, excluindo mapas quadrados)
+  ::plume::RenderTexture* best_tex = nullptr;
+  uint32_t best_area = 0;
+  for (const auto& [k, entry] : framebuffers_) {
+    if (entry.height > 0 && entry.width > entry.height) {
+      float aspect = float(entry.width) / float(entry.height);
+      if (aspect >= 1.25f) {
+        uint32_t area = entry.width * entry.height;
+        if (area > best_area) {
+          best_area = area;
+          best_tex = entry.color_texture.get();
+        }
+      }
+    }
+  }
+  if (best_tex) {
+    return best_tex;
+  }
+
+  // Fallback para a chave primária rastreada
+  auto it = framebuffers_.find(mvp_primary_key_);
+  if (it != framebuffers_.end()) {
+    return it->second.color_texture.get();
+  }
+  return MVP_GetColorTexture();
 }
 
 }  // namespace rex::graphics_plume
