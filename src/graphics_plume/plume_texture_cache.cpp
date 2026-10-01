@@ -43,8 +43,17 @@ PlumeTextureCache::PlumeTexture::PlumeTexture(PlumeTextureCache& texture_cache, 
   desc.flags = ::plume::RenderTextureFlag::NONE;
   
   if (desc.width > 0 && desc.height > 0) {
+    REXLOG_DEBUG("PlumeTexture: creating texture {}x{} depth={} array={} mips={} format={}",
+                 desc.width, desc.height, desc.depth, desc.arraySize, desc.mipLevels,
+                 static_cast<uint32_t>(desc.format));
     texture_ = device->createTexture(desc);
-    
+    if (!texture_) {
+      REXLOG_ERROR("PlumeTexture: createTexture FAILED for {}x{} depth={} array={} mips={} format={}",
+                   desc.width, desc.height, desc.depth, desc.arraySize, desc.mipLevels,
+                   static_cast<uint32_t>(desc.format));
+      return;
+    }
+    REXLOG_DEBUG("PlumeTexture: texture created");
     if (texture_) {
       ::plume::RenderTextureViewDesc srv_desc;
       srv_desc.dimension = desc.dimension == ::plume::RenderTextureDimension::TEXTURE_3D 
@@ -56,6 +65,11 @@ PlumeTextureCache::PlumeTexture::PlumeTexture(PlumeTextureCache& texture_cache, 
       srv_desc.arrayIndex = 0;
       srv_desc.arraySize = desc.arraySize;
       srv_ = texture_->createTextureView(srv_desc);
+      if (!srv_) {
+        REXLOG_ERROR("PlumeTexture: createTextureView FAILED");
+      } else {
+        REXLOG_DEBUG("PlumeTexture: texture view created");
+      }
     }
   }
 }

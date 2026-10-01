@@ -411,10 +411,14 @@ bool PlumeCommandProcessor::IssueDraw(rex::graphics::xenos::PrimitiveType prim_t
     }
   }
 
+  REXLOG_DEBUG("PlumeCommandProcessor::IssueDraw: creating/getting graphics pipeline");
   auto pipe = GetOrCreateGraphicsPipeline(topology, color_fmt);
   if (!pipe.pipeline || !pipe.layout || !GetActiveCommandList()) {
+    REXLOG_ERROR("PlumeCommandProcessor::IssueDraw: pipeline/command-list unavailable (pipeline={}, layout={}, cmd={})",
+                 pipe.pipeline != nullptr, pipe.layout != nullptr, GetActiveCommandList() != nullptr);
     return false;
   }
+  REXLOG_DEBUG("PlumeCommandProcessor::IssueDraw: graphics pipeline ready");
 
   // -------------------------------------------------------------------------
   // Fase D.1: Begin lazy do command list (uma vez por frame)
@@ -436,8 +440,15 @@ bool PlumeCommandProcessor::IssueDraw(rex::graphics::xenos::PrimitiveType prim_t
 
   if (render_target_cache_) {
     // Para MVP, o framebuffer eh resolvido pelo PlumeRenderTargetCache.
+    REXLOG_DEBUG("PlumeCommandProcessor::IssueDraw: resolving framebuffer {}x{} color={} depth={}",
+                 fb_width, fb_height, static_cast<uint32_t>(color_fmt), static_cast<uint32_t>(depth_fmt));
     ::plume::RenderFramebuffer* fb = render_target_cache_->MVP_GetOrCreateFramebuffer(plume_device_, fb_width, fb_height, color_fmt, depth_fmt);
-    if (fb) GetActiveCommandList()->setFramebuffer(fb);
+    if (!fb) {
+      REXLOG_ERROR("PlumeCommandProcessor::IssueDraw: framebuffer creation/lookup FAILED");
+      return false;
+    }
+    GetActiveCommandList()->setFramebuffer(fb);
+    REXLOG_DEBUG("PlumeCommandProcessor::IssueDraw: framebuffer bound");
   }
 
   // -------------------------------------------------------------------------
@@ -640,7 +651,9 @@ bool PlumeCommandProcessor::IssueDraw(rex::graphics::xenos::PrimitiveType prim_t
       auto* vs = static_cast<PlumeShader*>(active_vertex_shader_);
       used_textures |= vs->GetUsedTextureMaskAfterTranslation();
     }
+    REXLOG_DEBUG("PlumeCommandProcessor::IssueDraw: requesting textures mask=0x{:08X}", used_textures);
     texture_cache_->RequestTextures(used_textures);
+    REXLOG_DEBUG("PlumeCommandProcessor::IssueDraw: texture request complete");
   }
 
   rex::graphics::draw_util::ViewportInfo viewport_info;
@@ -683,6 +696,7 @@ bool PlumeCommandProcessor::IssueDraw(rex::graphics::xenos::PrimitiveType prim_t
   system_constants_.ndc_offset[1] = viewport_info.ndc_offset[1];
   system_constants_.ndc_offset[2] = viewport_info.ndc_offset[2];
 
+  REXLOG_DEBUG("PlumeCommandProcessor::IssueDraw: creating system constant buffer");
   garbage.sys_buf = plume_device_->createBuffer(
       ::plume::RenderBufferDesc::UploadBuffer(sizeof(system_constants_), ::plume::RenderBufferFlag::CONSTANT));
   void* sys_ptr = garbage.sys_buf->map();
@@ -691,10 +705,16 @@ bool PlumeCommandProcessor::IssueDraw(rex::graphics::xenos::PrimitiveType prim_t
       garbage.sys_buf->unmap();
   }
 
+  if (!garbage.sys_buf) {
+    REXLOG_ERROR("PlumeCommandProcessor::IssueDraw: system constant buffer creation FAILED");
+    return false;
+  }
+
   // Float Constants (512 vec4s)
   size_t float_size = 512 * 4 * sizeof(float);
   const void* float_src = &register_file_->values[rex::graphics::XE_GPU_REG_SHADER_CONSTANT_000_X];
   
+  REXLOG_DEBUG("PlumeCommandProcessor::IssueDraw: creating VS float constant buffer");
   garbage.vs_float_buf = plume_device_->createBuffer(
       ::plume::RenderBufferDesc::UploadBuffer(float_size, ::plume::RenderBufferFlag::CONSTANT));
   void* vs_ptr = garbage.vs_float_buf->map();
@@ -703,6 +723,7 @@ bool PlumeCommandProcessor::IssueDraw(rex::graphics::xenos::PrimitiveType prim_t
       garbage.vs_float_buf->unmap();
   }
   
+  REXLOG_DEBUG("PlumeCommandProcessor::IssueDraw: creating PS float constant buffer");
   garbage.ps_float_buf = plume_device_->createBuffer(
       ::plume::RenderBufferDesc::UploadBuffer(float_size, ::plume::RenderBufferFlag::CONSTANT));
   void* ps_ptr = garbage.ps_float_buf->map();
@@ -712,12 +733,18 @@ bool PlumeCommandProcessor::IssueDraw(rex::graphics::xenos::PrimitiveType prim_t
   }
 
   // Bool/Loop Constants (256 bytes)
+  REXLOG_DEBUG("PlumeCommandProcessor::IssueDraw: creating bool/fetch constant buffers");
   garbage.bool_buf = plume_device_->createBuffer(
       ::plume::RenderBufferDesc::UploadBuffer(256, ::plume::RenderBufferFlag::CONSTANT));
   
   // Fetch Constants (32 * 6 dwords = 768 bytes)
   garbage.fetch_buf = plume_device_->createBuffer(
       ::plume::RenderBufferDesc::UploadBuffer(768, ::plume::RenderBufferFlag::CONSTANT));
+
+  if (!garbage.vs_float_buf || !garbage.ps_float_buf || !garbage.bool_buf || !garbage.fetch_buf) {
+    REXLOG_ERROR("PlumeCommandProcessor::IssueDraw: constant buffer allocation FAILED");
+    return false;
+  }
 
   // Cria e Preenche o Descriptor Set (set 1 = kDescriptorSetConstants)
   ::plume::RenderDescriptorRange ranges[5];
@@ -727,8 +754,13 @@ bool PlumeCommandProcessor::IssueDraw(rex::graphics::xenos::PrimitiveType prim_t
       ranges[i].binding = i;
   }
   ::plume::RenderDescriptorSetDesc set_desc(ranges, 5);
+  REXLOG_DEBUG("PlumeCommandProcessor::IssueDraw: creating constants descriptor set");
   garbage.descriptor_set = plume_device_->createDescriptorSet(set_desc);
   
+  if (!garbage.descriptor_set) {
+    REXLOG_ERROR("PlumeCommandProcessor::IssueDraw: constants descriptor set creation FAILED");
+    return false;
+  }
   if (garbage.descriptor_set) {
       garbage.descriptor_set->setBuffer(0, garbage.sys_buf.get());
       garbage.descriptor_set->setBuffer(1, garbage.vs_float_buf.get());
@@ -827,6 +859,7 @@ bool PlumeCommandProcessor::IssueDraw(rex::graphics::xenos::PrimitiveType prim_t
     }
   }
 
+  REXLOG_DEBUG("PlumeCommandProcessor::IssueDraw: binding pipeline/descriptors complete; issuing draw");
   frames_[current_frame_index_].garbage.push_back(std::move(garbage));
 
   if (ib_buffer && index_buffer_info != nullptr && index_buffer_info->count > 0) {

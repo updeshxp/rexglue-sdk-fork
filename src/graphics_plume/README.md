@@ -41,3 +41,10 @@ Replace these files in `graphics_plume/`:
 - `PlumeTextureUploader` remains lazy and is initialized only when the first resident texture upload is actually required.
 - Added fine-grained uploader logs around staging-buffer creation and mapping so the next runtime test can identify an upload-resource stall precisely.
 - `EnsureRuntimeCaches()` is now a validation guard only; it no longer performs potentially blocking cache construction on the command-processor worker thread.
+
+
+## v7 diagnostic changes
+- Treat VMA `0xFFFFFFFD` as Vulkan `VK_ERROR_INITIALIZATION_FAILED`, not out-of-device-memory.
+- Do not create a depth image when the draw has depth/stencil disabled (`RenderFormat::UNKNOWN`).
+- Added detailed IssueDraw, framebuffer, constant-buffer, descriptor-set, and texture allocation logging.
+- Texture/framebuffer creation failures now return cleanly instead of continuing with null resources.

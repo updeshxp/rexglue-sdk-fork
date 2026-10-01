@@ -132,15 +132,46 @@ bool PlumeRenderTargetCache::Resolve(const rex::memory::Memory& memory, PlumeSha
   FramebufferEntry entry;
   entry.width = width;
   entry.height = height;
-  auto color_desc = ::plume::RenderTextureDesc::ColorTarget(width, height, color_fmt);
-  entry.color_texture = device->createTexture(color_desc);
+  REXLOG_INFO("PlumeRenderTargetCache: creating framebuffer {}x{} color_fmt={} depth_fmt={}",
+              width, height, static_cast<uint32_t>(color_fmt), static_cast<uint32_t>(depth_fmt));
 
-  auto depth_desc = ::plume::RenderTextureDesc::DepthTarget(width, height, depth_fmt);
-  entry.depth_texture = device->createTexture(depth_desc);
+  auto color_desc = ::plume::RenderTextureDesc::ColorTarget(width, height, color_fmt);
+  REXLOG_DEBUG("PlumeRenderTargetCache: creating color texture");
+  entry.color_texture = device->createTexture(color_desc);
+  if (!entry.color_texture) {
+    REXLOG_ERROR("PlumeRenderTargetCache: color texture creation FAILED ({}x{}, format={})",
+                 width, height, static_cast<uint32_t>(color_fmt));
+    return nullptr;
+  }
+  REXLOG_DEBUG("PlumeRenderTargetCache: color texture created");
+
+  // Do not create a depth image when the Xenos draw has depth/stencil disabled.
+  // Passing UNKNOWN into DepthTarget can produce an invalid Vulkan image create
+  // request on the Intel driver (VMA reports VK_ERROR_INITIALIZATION_FAILED).
+  if (depth_fmt != ::plume::RenderFormat::UNKNOWN) {
+    auto depth_desc = ::plume::RenderTextureDesc::DepthTarget(width, height, depth_fmt);
+    REXLOG_DEBUG("PlumeRenderTargetCache: creating depth texture");
+    entry.depth_texture = device->createTexture(depth_desc);
+    if (!entry.depth_texture) {
+      REXLOG_ERROR("PlumeRenderTargetCache: depth texture creation FAILED ({}x{}, format={})",
+                   width, height, static_cast<uint32_t>(depth_fmt));
+      framebuffers_.erase(key);
+      return nullptr;
+    }
+    REXLOG_DEBUG("PlumeRenderTargetCache: depth texture created");
+  } else {
+    REXLOG_DEBUG("PlumeRenderTargetCache: depth disabled; no depth image created");
+  }
 
   const ::plume::RenderTexture* color_ptrs[] = { entry.color_texture.get() };
   ::plume::RenderFramebufferDesc fb_desc(color_ptrs, 1, entry.depth_texture.get());
+  REXLOG_DEBUG("PlumeRenderTargetCache: creating framebuffer object");
   entry.framebuffer = device->createFramebuffer(fb_desc);
+  if (!entry.framebuffer) {
+    REXLOG_ERROR("PlumeRenderTargetCache: framebuffer creation FAILED");
+    return nullptr;
+  }
+  REXLOG_INFO("PlumeRenderTargetCache: framebuffer created successfully");
 
   auto* fb_ptr = entry.framebuffer.get();
   framebuffers_[key] = std::move(entry);
