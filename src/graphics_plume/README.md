@@ -1,46 +1,43 @@
-# Plume renderer v3 changes
+# Plume renderer v4
 
-Applied on top of the previously validated v2 renderer changes.
+Based on the Windows-successful v3 renderer, with the relevant lifecycle pattern from the Xerenge Plume implementation imported.
 
-## Changes
+## Main change
 
-### Command processor
-- Restored two-frame synchronization from the upstream renderer:
-  - per-frame acquire semaphore
-  - per-frame render semaphore
-  - per-frame fence/in-flight state
-- `IssueDraw` waits for the current frame fence before reusing/resetting its command list.
-- `IssueSwap`:
-  - acquires the swapchain image with the acquire semaphore
-  - ends the active framebuffer/render pass before image barriers
-  - selects the primary guest color target using frontbuffer dimensions
-  - copies guest color target -> swapchain
-  - signals a render semaphore
-  - presents waiting on that render semaphore
-- Restored EDRAM copy-mode dispatch from `IssueDraw` to `IssueCopy`.
-- Added `IssueDraw ENTER/EXIT` and `IssueSwap ENTER/EXIT` diagnostics using REX logging, so the next run can show whether the guest reaches draw/present execution.
-- Preserved the known-good 256 MiB `GPU_UPLOAD + STORAGE` shared-memory allocation.
-- Preserved conditional depth-target creation.
-- Desktop 8:8:8:8 render targets use `B8G8R8A8_UNORM`.
+PlumeTextureCache and PlumeRenderTargetCache initialization is now deferred until the command processor actually reaches IssueDraw/IssueSwap/IssueCopy.
 
-### Render-target cache
-- Restored primary framebuffer tracking.
-- Primary presentation selection prefers a framebuffer matching the guest frontbuffer height and sufficient width, then falls back to the largest widescreen framebuffer.
-- Depth textures are only created when a depth format is actually requested.
-- Desktop color targets use BGRA.
+The base ReXGlue CommandProcessor starts its GPU worker thread from Initialize(), and SetupContext runs on that worker thread. Keeping the relatively heavyweight Plume texture uploader/pipeline/staging initialization out of the startup path prevents a stall immediately after `SetupContext complete`.
 
-### Graphics system
-- Preserved SDL3 -> X11 native-window bridge used successfully on Linux.
-- Preserved retry behavior when presentation setup happens before the SDL window exists.
-- Swapchain format is platform-specific:
-  - Android: `R8G8B8A8_UNORM`
-  - Windows/Linux desktop: `B8G8R8A8_UNORM`
+This follows the useful architectural separation visible in Xerenge: presentation/device setup is established first, while draw-side resources are initialized when the guest GPU path needs them.
 
-## Test environment
-The v2 initialization path was already validated on Intel Iris Xe with:
+## Preserved from v3
 
-```bash
-SDL_VIDEODRIVER=x11 ./your-game
-```
+- 256 MiB shared memory buffer using GPU_UPLOAD + STORAGE
+- X11 SDL swapchain support
+- Desktop BGRA / Android RGBA swapchain format split
+- Conditional depth target handling
+- Primary framebuffer selection
+- Acquire/render semaphores
+- Fence-safe frame reuse
+- `setFramebuffer(nullptr)` before copy barriers
+- EDRAM copy-mode dispatch
+- Windows linker fix for `plume_swapchain()`
+- IssueDraw / IssueSwap diagnostic logging
 
-The next run should specifically reveal whether `IssueDraw` and `IssueSwap` are reached after `SetupContext complete`.
+## Deliberately not imported from Xerenge
+
+Xerenge has a separate direct Plume draw/MMIO architecture. Its direct GPU MMIO mapping, ring consumer, draw context, shader cache and complete presentation worker are not compatible with this rexglue CommandProcessor backend, so they are not copied into this patch.
+
+## Expected next Linux log
+
+The first important new line should be:
+
+    PlumeCommandProcessor: base Initialize returned; deferring texture/render-target caches
+
+If the guest reaches IssueSwap first, the log should then show:
+
+    PlumeCommandProcessor: initializing deferred Plume runtime caches
+    PlumeCommandProcessor: creating PlumeTextureCache
+    PlumeCommandProcessor: initializing PlumeTextureCache/uploader
+
+This will both remove the startup dependency and pinpoint any remaining Plume uploader/resource issue.

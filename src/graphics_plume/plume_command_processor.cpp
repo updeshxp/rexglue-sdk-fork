@@ -41,21 +41,59 @@ bool PlumeCommandProcessor::Initialize() {
     return false;
   }
   
-  // PlumeTextureCache precisa que o registrador base e memoria sejam acessiveis
+  // Keep the worker-thread startup path lightweight. Xerenge's Plume backend
+  // follows the same separation: device/presentation setup happens first and
+  // draw resources are created when the guest GPU actually needs them.
+  // PlumeTextureCache::Initialize() creates its uploader, pipeline layout and
+  // staging resources, so doing that here can block CommandProcessor startup
+  // after SetupContext has already completed.
+  REXLOG_INFO("PlumeCommandProcessor: base Initialize returned; deferring texture/render-target caches");
   shared_memory_ = std::make_unique<PlumeSharedMemory>(*memory_);
-  texture_cache_ = std::make_unique<PlumeTextureCache>(*register_file_, *shared_memory_, 1, 1, *this, plume_device_);
-  if (!texture_cache_->Initialize()) {
-    REXLOG_ERROR("PlumeTextureCache::Initialize failed");
-    return false;
+  REXLOG_INFO("PlumeCommandProcessor: shared memory wrapper ready");
+  return true;
+}
+
+bool PlumeCommandProcessor::EnsureRuntimeCaches() {
+  if (texture_cache_ && render_target_cache_) {
+    return true;
   }
-  
-  render_target_cache_ = std::make_unique<PlumeRenderTargetCache>(
-      *register_file_, *memory_, plume_device_, 1, 1);
-  if (!render_target_cache_->Initialize()) {
-    REXLOG_ERROR("PlumeRenderTargetCache::Initialize failed");
-    return false;
+
+  REXLOG_INFO("PlumeCommandProcessor: initializing deferred Plume runtime caches");
+
+  if (!shared_memory_) {
+    if (!memory_) {
+      REXLOG_ERROR("PlumeCommandProcessor: no guest memory for deferred caches");
+      return false;
+    }
+    shared_memory_ = std::make_unique<PlumeSharedMemory>(*memory_);
   }
-  
+
+  if (!texture_cache_) {
+    REXLOG_INFO("PlumeCommandProcessor: creating PlumeTextureCache");
+    texture_cache_ = std::make_unique<PlumeTextureCache>(
+        *register_file_, *shared_memory_, 1, 1, *this, plume_device_);
+    REXLOG_INFO("PlumeCommandProcessor: initializing PlumeTextureCache/uploader");
+    if (!texture_cache_->Initialize()) {
+      REXLOG_ERROR("PlumeTextureCache::Initialize failed");
+      texture_cache_.reset();
+      return false;
+    }
+    REXLOG_INFO("PlumeCommandProcessor: PlumeTextureCache initialized");
+  }
+
+  if (!render_target_cache_) {
+    REXLOG_INFO("PlumeCommandProcessor: creating PlumeRenderTargetCache");
+    render_target_cache_ = std::make_unique<PlumeRenderTargetCache>(
+        *register_file_, *memory_, plume_device_, 1, 1);
+    REXLOG_INFO("PlumeCommandProcessor: initializing PlumeRenderTargetCache");
+    if (!render_target_cache_->Initialize()) {
+      REXLOG_ERROR("PlumeRenderTargetCache::Initialize failed");
+      render_target_cache_.reset();
+      return false;
+    }
+    REXLOG_INFO("PlumeCommandProcessor: PlumeRenderTargetCache initialized");
+  }
+
   return true;
 }
 
@@ -194,6 +232,11 @@ void PlumeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   REXLOG_DEBUG("PlumeCommandProcessor::IssueSwap ENTER: ptr=0x{:08X}, {}x{}",
                frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
   cleared_fbs_this_frame_.clear();
+  if (!EnsureRuntimeCaches()) {
+    REXLOG_ERROR("PlumeCommandProcessor::IssueSwap: runtime caches unavailable");
+    plume_graphics_system_->Present();
+    return;
+  }
   auto& frame = frames_[current_frame_index_];
   if (!frame.cmd_list || !plume_queue_) {
     REXLOG_WARN("PlumeCommandProcessor::IssueSwap: no command list/queue");
@@ -297,6 +340,10 @@ bool PlumeCommandProcessor::IssueDraw(rex::graphics::xenos::PrimitiveType prim_t
                                       uint32_t index_count,
                                       IndexBufferInfo* index_buffer_info,
                                       bool major_mode_explicit) {
+  if (!EnsureRuntimeCaches()) {
+    REXLOG_ERROR("PlumeCommandProcessor::IssueDraw: runtime caches unavailable");
+    return false;
+  }
   (void)major_mode_explicit;
   REXLOG_DEBUG("PlumeCommandProcessor::IssueDraw ENTER: prim={}, indices={}, indexed={}",
                static_cast<uint32_t>(prim_type), index_count, index_buffer_info != nullptr);
@@ -799,6 +846,10 @@ bool PlumeCommandProcessor::IssueDraw(rex::graphics::xenos::PrimitiveType prim_t
 }
 
 bool PlumeCommandProcessor::IssueCopy() {
+  if (!EnsureRuntimeCaches()) {
+    REXLOG_ERROR("PlumeCommandProcessor::IssueCopy: runtime caches unavailable");
+    return false;
+  }
   if (!render_target_cache_) return false;
 
   uint32_t written_address = 0;

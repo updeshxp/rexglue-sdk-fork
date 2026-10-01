@@ -102,6 +102,8 @@ class PlumeCommandProcessor final : public rex::graphics::CommandProcessor {
   bool IssueCopy() override;
 
  private:
+  bool EnsureRuntimeCaches();
+
   PlumeGraphicsSystem* plume_graphics_system_ = nullptr;
   ::plume::RenderDevice* plume_device_ = nullptr;
   std::unique_ptr<::plume::RenderCommandQueue> plume_queue_;
