@@ -56,7 +56,7 @@ void PlumeRenderTargetCache::EndFrame() {
 rex::graphics::RenderTargetCache::RenderTarget* PlumeRenderTargetCache::CreateRenderTarget(RenderTargetKey key) {
   uint32_t width = key.GetWidth() * draw_resolution_scale_x();
   // Xenos height is generally dynamic based on EDRAM layout, but typically ~720 scaled
-  uint32_t height = 720 * draw_resolution_scale_y(); // Simplified for MVP
+  uint32_t height = key.GetHeight() * draw_resolution_scale_y();
   
   auto rt = new PlumeRenderTarget(key, device_, width, height);
   if (!rt->texture) {
@@ -79,7 +79,8 @@ PlumeRenderTargetCache::PlumeRenderTarget::PlumeRenderTarget(RenderTargetKey key
 }
 
 ::plume::RenderFramebuffer* PlumeRenderTargetCache::GetCurrentFramebuffer() {
-  return nullptr; // Stub
+  auto it = framebuffers_.find(mvp_current_key_);
+  return it != framebuffers_.end() ? it->second.framebuffer.get() : nullptr;
 }
 
 #include "rex/graphics/util/draw.h"
@@ -93,8 +94,19 @@ bool PlumeRenderTargetCache::Resolve(const rex::memory::Memory& memory, PlumeSha
   rex::graphics::draw_util::ResolveInfo resolve_info;
   if (!rex::graphics::draw_util::GetResolveInfo(register_file(), memory, draw_resolution_scale_x(),
                                                 draw_resolution_scale_y(), false, false, resolve_info)) {
+    REXLOG_ERROR("PlumeRenderTargetCache::Resolve: GetResolveInfo failed");
     return false;
   }
+
+  const uint32_t resolve_width =
+      resolve_info.coordinate_info.width_div_8 * rex::graphics::xenos::kResolveAlignmentPixels;
+  const uint32_t resolve_height =
+      resolve_info.height_div_8 * rex::graphics::xenos::kResolveAlignmentPixels;
+  REXLOG_DEBUG(
+      "PlumeRenderTargetCache::Resolve: rect={}x{} dest_base=0x{:08X} extent_start=0x{:08X} extent_len=0x{:X} depth={}",
+      resolve_width, resolve_height, resolve_info.copy_dest_base,
+      resolve_info.copy_dest_extent_start, resolve_info.copy_dest_extent_length,
+      resolve_info.IsCopyingDepth());
 
   if (resolve_info.copy_dest_extent_length > 0) {
     written_address_out = resolve_info.copy_dest_extent_start;
@@ -200,17 +212,41 @@ bool PlumeRenderTargetCache::Resolve(const rex::memory::Memory& memory, PlumeSha
 ::plume::RenderTexture* PlumeRenderTargetCache::MVP_GetPrimaryColorTexture(uint32_t frontbuffer_width, uint32_t frontbuffer_height) {
   // Se o jogo forneceu dimensões do frontbuffer (ex: 1024x576), procura correspondência exata de altura
   // e largura suficiente para conter o frontbuffer.
-  if (frontbuffer_height > 0) {
+  if (frontbuffer_width > 0 && frontbuffer_height > 0) {
+    // Prefer an exact-size render target. The Xenos resolve trace for SF3
+    // resolves a 1280x720 rectangle to the frontbuffer, so selecting an
+    // arbitrary larger widescreen target can present the wrong surface.
     for (const auto& [k, entry] : framebuffers_) {
-      if (entry.height == frontbuffer_height && entry.width >= frontbuffer_width) {
+      if (entry.width == frontbuffer_width && entry.height == frontbuffer_height) {
         return entry.color_texture.get();
       }
     }
+
+    // Otherwise choose the smallest target that fully contains the requested
+    // frontbuffer dimensions. Do not depend on unordered_map iteration order.
+    ::plume::RenderTexture* best_tex = nullptr;
+    uint64_t best_area = UINT64_MAX;
     for (const auto& [k, entry] : framebuffers_) {
-      if (entry.height == frontbuffer_height) {
-        return entry.color_texture.get();
+      if (entry.width >= frontbuffer_width && entry.height >= frontbuffer_height) {
+        const uint64_t area = uint64_t(entry.width) * entry.height;
+        if (area < best_area) {
+          best_area = area;
+          best_tex = entry.color_texture.get();
+        }
       }
     }
+    if (best_tex) return best_tex;
+
+    // Last dimension-based fallback: matching height, then closest width.
+    uint32_t best_width = UINT32_MAX;
+    for (const auto& [k, entry] : framebuffers_) {
+      if (entry.height == frontbuffer_height && entry.width >= frontbuffer_width &&
+          entry.width < best_width) {
+        best_width = entry.width;
+        best_tex = entry.color_texture.get();
+      }
+    }
+    if (best_tex) return best_tex;
   }
 
   // Fallback: procura o maior framebuffer widescreen (aspect ratio >= 1.25, excluindo mapas quadrados)
