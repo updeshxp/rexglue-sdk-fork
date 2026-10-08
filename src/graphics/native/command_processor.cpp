@@ -9,6 +9,7 @@
 #include "native/command_processor.h"
 
 #include "native/index_expand.h"
+#include "native/clip_viewport.h"
 #include "native/draw_classify.h"
 #include "native/phase_model.h"
 #include "native/shader_constants.h"
@@ -57,8 +58,12 @@ REXCVAR_DEFINE_BOOL(native_rect_gs, true, "GPU/Native",
                     "Expand guest rectangle lists with the oracle's geometry shader (the\n                    validated path). Off = draw each rect as a single bare triangle\n                    (loses the half past the diagonal) - kept as an A/B switch for\n                    isolating regressions to the GS path.");
 REXCVAR_DEFINE_BOOL(native_marker_empty_frames, false, "GPU/Native",
                     "Clear draw-less frames to a recognisable mid-blue instead of black.\n                    Bring-up aid only: level loads produce long runs of draw-less\n                    frames, so with this on they flash violently blue.");
-REXCVAR_DEFINE_BOOL(native_present_frontbuffer, false, "GPU/Native",
-                    "Present the resolved frontbuffer image instead of replaying its\n                    draws. The SELECTION is correct and measured - it is what makes\n                    SoulCalibur II report present=true - but the blit that consumes\n                    it still makes vkQueueSubmit fail, so it is off until that is\n                    found with validation layers enabled.");
+REXCVAR_DEFINE_BOOL(native_present_frontbuffer, true, "GPU/Native",
+                    "Present the resolved frontbuffer image instead of replaying its\n"
+                    "draws. The guest already copied the finished frame to the\n"
+                    "frontbuffer address; replaying those draws into a differently\n"
+                    "sized target is what left SF3's scale passes and several other\n"
+                    "titles black or cropped. Off falls back to replay.");
 REXCVAR_DEFINE_BOOL(native_log_phases, false, "GPU/Native",
                     "Log render-target phases, their draw ownership and their resolves.\n                    Cheap (a few lines per frame) and periodic, unlike\n                    native_log_draws, whose per-draw flood rotates these very lines\n                    out of the log file before they can be read.");
 REXCVAR_DEFINE_BOOL(native_preserve_edram, false, "GPU/Native",
@@ -2077,11 +2082,7 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   uint32_t viewport_max_y = vulkan_device_->properties().maxViewportDimensions[1];
   const uint32_t color_edram_base = regs.Get<reg::RB_COLOR_INFO>().color_base;
   if (regs.Get<reg::PA_CL_CLIP_CNTL>().clip_disable) {
-    const char* viewport_source = "device_max_fallthrough";
     const auto surface_extent_it = edram_base_surface_extents_.find(color_edram_base);
-    const bool surface_extent_hit =
-        surface_extent_it != edram_base_surface_extents_.end() && surface_extent_it->second.first &&
-        surface_extent_it->second.second;
     const uint32_t resolve_extent_x =
         surface_extent_it != edram_base_surface_extents_.end() ? surface_extent_it->second.first : 0;
     const uint32_t resolve_extent_y =
@@ -2094,31 +2095,18 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
         scissor_right && scissor_right < xenos::kTexture2DCubeMaxWidthHeight;
     const bool scissor_y_valid =
         scissor_bottom && scissor_bottom < xenos::kTexture2DCubeMaxWidthHeight;
-    if (surface_extent_hit) {
-      viewport_max_x = surface_extent_it->second.first;
-      viewport_max_y = surface_extent_it->second.second;
-      viewport_source = "resolve_extent_hit";
-    } else if (scissor_x_valid && scissor_y_valid) {
-      if (scissor_x_valid) {
-        viewport_max_x = scissor_right;
-      }
-      if (scissor_y_valid) {
-        viewport_max_y = scissor_bottom;
-      }
-      viewport_source = "scissor_fallback";
-    } else {
-      // Before the first resolve there is no authoritative per-EDRAM-base
-      // extent yet. PA_SC_WINDOW_SCISSOR commonly carries the 8192 sentinel on
-      // one axis at startup; accepting the other axis used to synthesize a
-      // bogus 1280x8192 viewport for the first few clip-disabled draws. The
-      // configured guest output is the only complete, bounded extent available
-      // until the first resolve establishes the surface size.
-      system::X_VIDEO_MODE video_mode;
-      kernel::xboxkrnl::VdQueryVideoMode(&video_mode);
-      viewport_max_x = std::max(uint32_t(1), uint32_t(video_mode.display_width));
-      viewport_max_y = std::max(uint32_t(1), uint32_t(video_mode.display_height));
-      viewport_source = "video_mode_fallback";
-    }
+    // Width is the surface being drawn now (RB_SURFACE_INFO.surface_pitch).
+    // The last resolve of this EDRAM base is the previous surface — SF3 reuses
+    // base 0 for several sizes in one frame — so it must not replace the pitch.
+    system::X_VIDEO_MODE video_mode;
+    kernel::xboxkrnl::VdQueryVideoMode(&video_mode);
+    const ClipDisabledExtent clip_extent = ChooseClipDisabledExtent(
+        regs.Get<reg::RB_SURFACE_INFO>().surface_pitch, resolve_extent_x, resolve_extent_y,
+        scissor_x_valid, scissor_right, scissor_y_valid, scissor_bottom,
+        uint32_t(video_mode.display_width), uint32_t(video_mode.display_height));
+    viewport_max_x = clip_extent.x;
+    viewport_max_y = clip_extent.y;
+    const char* viewport_source = clip_extent.source;
     if (REXCVAR_GET(native_log_draws)) {
       const auto scissor_tl = regs.Get<reg::PA_SC_WINDOW_SCISSOR_TL>();
       const auto scissor_br = regs.Get<reg::PA_SC_WINDOW_SCISSOR_BR>();
@@ -3219,7 +3207,10 @@ bool NativeCommandProcessor::IssueCopy() {
   // was last cleared - not just the draws since the previous resolve, because
   // resolving does not clear EDRAM (see RenderPhase).
   const uint32_t src_base = resolve_info.color_edram_info.base_tiles;
-  edram_base_surface_extents_[src_base] = {img_w, img_h};
+  // The EDRAM rect, not the destination texture. Destination layouts are
+  // larger than the surface (atlas strips) and are the wrong size to measure
+  // the next clip-disabled draw against.
+  edram_base_surface_extents_[src_base] = {rect_w, rect_h};
   const auto clear_it = base_clear_point_.find(src_base);
   const auto last_it = base_last_resolve_.find(src_base);
   RenderPhase phase;
@@ -3573,7 +3564,7 @@ void NativeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
 
   const bool presented = presenter->RefreshGuestOutput(
       width, height, display_width, display_height,
-      [this, width, height, clear_rgba, &display_ranges, present_index](
+      [this, width, height, clear_rgba, &display_ranges, present_index, fb_key](
           ui::Presenter::GuestOutputRefreshContext& context) mutable -> bool {
         auto& vk_ctx =
             static_cast<ui::vulkan::VulkanPresenter::VulkanGuestOutputRefreshContext&>(context);
@@ -3854,13 +3845,31 @@ void NativeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
         acquire_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         acquire_barrier.image = image;
         acquire_barrier.subresourceRange = subresource_range;
+        // Republication can alias two keys onto one image, so a key's tracked
+        // layout can lag. Only blit from an image that the phase loop left in
+        // SHADER_READ_ONLY — the layout the barrier below claims. Deciding
+        // this before the scene transition keeps the scene image and the
+        // render pass load op in agreement.
+        if (present_index != SIZE_MAX &&
+            resolved_target_storage_[present_index].layout !=
+                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) {
+          present_index = SIZE_MAX;
+        }
         // The scene image is written fresh every frame, so its previous
-        // contents are discardable (UNDEFINED).
+        // contents are discardable (UNDEFINED). When the resolved frontbuffer
+        // is presented, the scene's first use is the blit, so it must enter
+        // TRANSFER_DST — claiming COLOR_ATTACHMENT here and then transitioning
+        // from UNDEFINED again is VUID-VkImageMemoryBarrier-oldLayout-01197
+        // and is what made vkQueueSubmit fail, which is why presenting used
+        // to be forced off.
+        const bool present_scene = present_index != SIZE_MAX;
         VkImageMemoryBarrier scene_to_color = acquire_barrier;
         scene_to_color.srcAccessMask = 0;
-        scene_to_color.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        scene_to_color.dstAccessMask = present_scene ? VkAccessFlags(VK_ACCESS_TRANSFER_WRITE_BIT)
+                                                     : VkAccessFlags(VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
         scene_to_color.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-        scene_to_color.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        scene_to_color.newLayout = present_scene ? VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
+                                                 : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
         scene_to_color.image = scene_color_;
         const VkImageMemoryBarrier pre_scene[2] = {acquire_barrier, scene_to_color};
         dfn.vkCmdPipelineBarrier(
@@ -3883,19 +3892,8 @@ void NativeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
 
         // The guest already resolved this frame to the frontbuffer address, so
         // PRESENT that image rather than trying to re-render the draws that
-        // made it (see ChooseDisplaySource). The blit scales the resolved
-        // image - which is sized to the guest's texture layout - onto the
-        // scene image.
-        if (present_index != SIZE_MAX &&
-            resolved_target_storage_[present_index].layout !=
-                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) {
-          // Republication aliases two destination keys onto one image, so a
-          // key's tracked layout can lag what the other key did to it. Only
-          // blit from an image we know is in the layout we are about to claim -
-          // declaring the wrong oldLayout is VUID-VkImageMemoryBarrier-01213
-          // and makes the whole submit invalid.
-          present_index = SIZE_MAX;
-        }
+        // made it (see ChooseDisplaySource). The blit copies the resolve rect
+        // onto the scene image.
         if (present_index != SIZE_MAX) {
           ResolvedTarget& src = resolved_target_storage_[present_index];
           VkImageMemoryBarrier to_transfer[2] = {};
@@ -3905,26 +3903,50 @@ void NativeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
             to_transfer[i].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
             to_transfer[i].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
           }
+          // Scene is already TRANSFER_DST from the pre-scene barrier. Only the
+          // resolved image still needs to become a transfer source.
           to_transfer[0].srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
           to_transfer[0].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
           to_transfer[0].oldLayout = src.layout;
           to_transfer[0].newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
           to_transfer[0].image = src.image;
-          to_transfer[1].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-          to_transfer[1].dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-          to_transfer[1].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-          to_transfer[1].newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-          to_transfer[1].image = scene_color_;
           dfn.vkCmdPipelineBarrier(command_buffer_,
                                    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
                                        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-                                   VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 2,
-                                   to_transfer);
+                                   VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1,
+                                   &to_transfer[0]);
+
+          // Blit the frontbuffer resolve rect, not the whole destination
+          // texture. A texture built from several strips is larger than the
+          // visible frame; scaling all of it onto the swap image crops and
+          // stretches the picture.
+          int32_t blit_x = 0;
+          int32_t blit_y = 0;
+          int32_t blit_w = int32_t(src.width);
+          int32_t blit_h = int32_t(src.height);
+          for (const RenderPhase& phase : phases_) {
+            if (phase.dest_key == fb_key && phase.end_draw > phase.first_draw && phase.rect_w &&
+                phase.rect_h) {
+              blit_x = int32_t(phase.dest_x);
+              blit_y = int32_t(phase.dest_y);
+              blit_w = int32_t(phase.rect_w);
+              blit_h = int32_t(phase.rect_h);
+            }
+          }
+          if (blit_x < 0 || blit_y < 0 || blit_x >= int32_t(src.width) ||
+              blit_y >= int32_t(src.height)) {
+            blit_x = 0;
+            blit_y = 0;
+            blit_w = int32_t(src.width);
+            blit_h = int32_t(src.height);
+          }
+          blit_w = std::min(blit_w, int32_t(src.width) - blit_x);
+          blit_h = std::min(blit_h, int32_t(src.height) - blit_y);
 
           VkImageBlit present_blit = {};
           present_blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-          present_blit.srcOffsets[0] = {0, 0, 0};
-          present_blit.srcOffsets[1] = {int32_t(src.width), int32_t(src.height), 1};
+          present_blit.srcOffsets[0] = {blit_x, blit_y, 0};
+          present_blit.srcOffsets[1] = {blit_x + blit_w, blit_y + blit_h, 1};
           present_blit.dstSubresource = present_blit.srcSubresource;
           present_blit.dstOffsets[0] = {0, 0, 0};
           present_blit.dstOffsets[1] = {int32_t(width), int32_t(height), 1};
@@ -3932,15 +3954,17 @@ void NativeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
                              scene_color_, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &present_blit,
                              VK_FILTER_LINEAR);
 
-          VkImageMemoryBarrier back[2] = {to_transfer[0], to_transfer[1]};
-          back[0].srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-          back[0].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-          back[0].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-          back[0].newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-          back[1].srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-          back[1].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-          back[1].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-          back[1].newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+          VkImageMemoryBarrier back_src = to_transfer[0];
+          back_src.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+          back_src.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+          back_src.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+          back_src.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+          VkImageMemoryBarrier back_dst = scene_to_color;
+          back_dst.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+          back_dst.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+          back_dst.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+          back_dst.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+          const VkImageMemoryBarrier back[2] = {back_src, back_dst};
           dfn.vkCmdPipelineBarrier(command_buffer_, VK_PIPELINE_STAGE_TRANSFER_BIT,
                                    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
                                        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
