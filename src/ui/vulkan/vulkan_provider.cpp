@@ -20,9 +20,17 @@
 #include <rex/ui/vulkan/presenter.h>
 #include <rex/ui/vulkan/provider.h>
 
+// Debug builds ask for VK_LAYER_KHRONOS_validation. The instance creation
+// path already drops the layer when it is not installed. Release stays off.
+#ifndef NDEBUG
+REXCVAR_DEFINE_BOOL(vulkan_validation_enabled, true, "UI/Vulkan",
+                    "Enable Vulkan validation layers")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+#else
 REXCVAR_DEFINE_BOOL(vulkan_validation_enabled, false, "UI/Vulkan",
                     "Enable Vulkan validation layers")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+#endif
 
 REXCVAR_DEFINE_INT32(vulkan_device, -1, "UI/Vulkan", "Vulkan device index (-1 for auto selection)")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);

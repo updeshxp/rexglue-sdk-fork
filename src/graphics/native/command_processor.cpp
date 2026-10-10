@@ -2078,55 +2078,48 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   }
 
   // --- Viewport / NDC. ---
-  uint32_t viewport_max_x = vulkan_device_->properties().maxViewportDimensions[0];
-  uint32_t viewport_max_y = vulkan_device_->properties().maxViewportDimensions[1];
+  // Same inputs as vulkan/command_processor.cpp's GetHostViewportInfo call.
+  // Clip-disabled draws emit positions in pixels; GetHostViewportInfo turns
+  // these maxima into an 8192 host range. Surface pitch must not replace them:
+  // SF3's clip-disabled rectangles have pitch 640 and are then resolved at
+  // 1280x720 (draw #27, draw #177757). A 640 viewport clips that resolve.
   const uint32_t color_edram_base = regs.Get<reg::RB_COLOR_INFO>().color_base;
-  if (regs.Get<reg::PA_CL_CLIP_CNTL>().clip_disable) {
-    const auto surface_extent_it = edram_base_surface_extents_.find(color_edram_base);
-    const uint32_t resolve_extent_x =
-        surface_extent_it != edram_base_surface_extents_.end() ? surface_extent_it->second.first : 0;
-    const uint32_t resolve_extent_y =
-        surface_extent_it != edram_base_surface_extents_.end() ? surface_extent_it->second.second : 0;
-    draw_util::Scissor scissor;
-    draw_util::GetScissor(regs, scissor);
-    const uint32_t scissor_right = scissor.offset[0] + scissor.extent[0];
-    const uint32_t scissor_bottom = scissor.offset[1] + scissor.extent[1];
-    const bool scissor_x_valid =
-        scissor_right && scissor_right < xenos::kTexture2DCubeMaxWidthHeight;
-    const bool scissor_y_valid =
-        scissor_bottom && scissor_bottom < xenos::kTexture2DCubeMaxWidthHeight;
-    // Width is the surface being drawn now (RB_SURFACE_INFO.surface_pitch).
-    // The last resolve of this EDRAM base is the previous surface — SF3 reuses
-    // base 0 for several sizes in one frame — so it must not replace the pitch.
-    system::X_VIDEO_MODE video_mode;
-    kernel::xboxkrnl::VdQueryVideoMode(&video_mode);
-    const ClipDisabledExtent clip_extent = ChooseClipDisabledExtent(
-        regs.Get<reg::RB_SURFACE_INFO>().surface_pitch, resolve_extent_x, resolve_extent_y,
-        scissor_x_valid, scissor_right, scissor_y_valid, scissor_bottom,
-        uint32_t(video_mode.display_width), uint32_t(video_mode.display_height));
-    viewport_max_x = clip_extent.x;
-    viewport_max_y = clip_extent.y;
-    const char* viewport_source = clip_extent.source;
-    if (REXCVAR_GET(native_log_draws)) {
-      const auto scissor_tl = regs.Get<reg::PA_SC_WINDOW_SCISSOR_TL>();
-      const auto scissor_br = regs.Get<reg::PA_SC_WINDOW_SCISSOR_BR>();
-      REXLOG_INFO(
-          "rexgpu-native: viewport_clip_disable draw=#{} base=0x{:X} source={} "
-          "resolve_extent={}x{} raw_scissor=tl=0x{:08X}[{},{} off_disable={}] "
-          "br=0x{:08X}[{},{}] decoded_scissor=off={}+{} extent={}x{} right_bottom={}x{} "
-          "valid={}x{} device_max={}x{} final_max={}x{}",
-          draw_count_, color_edram_base, viewport_source, resolve_extent_x, resolve_extent_y,
-          scissor_tl.value, scissor_tl.tl_x, scissor_tl.tl_y, scissor_tl.window_offset_disable,
-          scissor_br.value, scissor_br.br_x, scissor_br.br_y, scissor.offset[0], scissor.offset[1],
-          scissor.extent[0], scissor.extent[1], scissor_right, scissor_bottom, scissor_x_valid,
-          scissor_y_valid, vulkan_device_->properties().maxViewportDimensions[0],
-          vulkan_device_->properties().maxViewportDimensions[1], viewport_max_x, viewport_max_y);
-    }
-  }
+  const auto surface_extent_it = edram_base_surface_extents_.find(color_edram_base);
+  const uint32_t resolve_extent_x =
+      surface_extent_it != edram_base_surface_extents_.end() ? surface_extent_it->second.first : 0;
+  const uint32_t resolve_extent_y =
+      surface_extent_it != edram_base_surface_extents_.end() ? surface_extent_it->second.second : 0;
+  const uint32_t surface_pitch = regs.Get<reg::RB_SURFACE_INFO>().surface_pitch;
+  const ClipDisabledViewportMax clip_viewport = HostClipDisabledViewportMax(
+      vulkan_device_->properties().maxViewportDimensions[0],
+      vulkan_device_->properties().maxViewportDimensions[1], surface_pitch, resolve_extent_x,
+      resolve_extent_y);
+  uint32_t viewport_max_x = clip_viewport.x;
+  uint32_t viewport_max_y = clip_viewport.y;
   draw_util::ViewportInfo viewport_info;
   draw_util::GetHostViewportInfo(regs, 1, 1, false, viewport_max_x, viewport_max_y, true,
                                  normalized_depth_control, false, false,
                                  pixel_shader && pixel_shader->writes_depth(), viewport_info);
+  if (regs.Get<reg::PA_CL_CLIP_CNTL>().clip_disable && REXCVAR_GET(native_log_draws)) {
+    draw_util::Scissor guest_scissor;
+    // Pitch clamp is the 640-wide crop: the resolve of this base is wider than
+    // the draw-time pitch. The record path clamps the scissor to the resolve.
+    draw_util::GetScissor(regs, guest_scissor, false);
+    const auto scissor_tl = regs.Get<reg::PA_SC_WINDOW_SCISSOR_TL>();
+    const auto scissor_br = regs.Get<reg::PA_SC_WINDOW_SCISSOR_BR>();
+    REXLOG_INFO(
+        "rexgpu-native: viewport_clip_disable draw=#{} base=0x{:X} source=device_max "
+        "surface_pitch={} resolve_extent={}x{} raw_scissor=tl=0x{:08X}[{},{} off_disable={}] "
+        "br=0x{:08X}[{},{}] guest_scissor=off={}+{} extent={}x{} "
+        "device_max={}x{} host_extent={}x{}",
+        draw_count_, color_edram_base, surface_pitch, resolve_extent_x, resolve_extent_y,
+        scissor_tl.value, scissor_tl.tl_x, scissor_tl.tl_y, scissor_tl.window_offset_disable,
+        scissor_br.value, scissor_br.br_x, scissor_br.br_y, guest_scissor.offset[0],
+        guest_scissor.offset[1], guest_scissor.extent[0], guest_scissor.extent[1],
+        vulkan_device_->properties().maxViewportDimensions[0],
+        vulkan_device_->properties().maxViewportDimensions[1], viewport_info.xy_extent[0],
+        viewport_info.xy_extent[1]);
+  }
 
   // --- System constants. ---
   SpirvShaderTranslator::SystemConstants system_constants;
@@ -2497,9 +2490,15 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   draw.viewport.height = float(std::max(viewport_info.xy_extent[1], UINT32_C(1)));
   draw.viewport.minDepth = viewport_info.z_min;
   draw.viewport.maxDepth = viewport_info.z_max;
-  draw.scissor.offset = {int32_t(viewport_info.xy_offset[0]), int32_t(viewport_info.xy_offset[1])};
-  draw.scissor.extent = {std::max(viewport_info.xy_extent[0], UINT32_C(1)),
-                         std::max(viewport_info.xy_extent[1], UINT32_C(1))};
+  // Working path: vulkan/command_processor.cpp UpdateDynamicState uses
+  // GetScissor, not the viewport box. clamp_to_surface_pitch is false because
+  // this backend's framebuffer is the resolve rect, which is wider than the
+  // draw-time pitch on the SF3 640-pitch / 1280-resolve draws. The record
+  // path clamps the scissor to that framebuffer.
+  draw_util::Scissor guest_scissor;
+  draw_util::GetScissor(regs, guest_scissor, false);
+  draw.scissor.offset = {int32_t(guest_scissor.offset[0]), int32_t(guest_scissor.offset[1])};
+  draw.scissor.extent = {guest_scissor.extent[0], guest_scissor.extent[1]};
   draw.indexed = indexed;
   draw.index_buffer = index_buffer;
   draw.index_offset = index_offset;
@@ -3265,12 +3264,19 @@ bool NativeCommandProcessor::IssueCopy() {
     return true;  // Bound the per-frame image-allocation cost.
   }
 
-  // The offscreen RT must cover the resolve rect and every phase draw's viewport.
+  // The offscreen RT covers the resolve rect. A clip-disabled viewport is the
+  // 8192 host range from GetHostViewportInfo, not the surface, so it must not
+  // grow the image. Guest pixels still land 1:1 inside the rect; the scissor
+  // is clamped to the rect when the draws are recorded.
   uint32_t need_w = rect_w;
   uint32_t need_h = rect_h;
   const uint32_t phase_end = uint32_t(deferred_draws_.size());
   for (uint32_t i = phase_first; i < phase_end; ++i) {
     const DeferredDraw& d = deferred_draws_[i];
+    if (IsHostClipRangeExtent(uint32_t(d.viewport.width)) ||
+        IsHostClipRangeExtent(uint32_t(d.viewport.height))) {
+      continue;
+    }
     need_w = std::max(need_w, uint32_t(d.viewport.x + d.viewport.width));
     need_h = std::max(need_h, uint32_t(d.viewport.y + d.viewport.height));
   }
@@ -3681,9 +3687,13 @@ void NativeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
           rt_rp_begin.clearValueCount = 2;
           rt_rp_begin.pClearValues = rt_clears;
           dfn.vkCmdBeginRenderPass(command_buffer_, &rt_rp_begin, VK_SUBPASS_CONTENTS_INLINE);
+          // Scissor must lie inside the framebuffer. Clamp to this phase's
+          // resolve rect, not the grown target: a clip-disabled guest scissor
+          // is the 8192 sentinel, and the copy reads only rect_w x rect_h.
+          const uint32_t pass_w = std::min(resolve_rt_width_, p.rect_w);
+          const uint32_t pass_h = std::min(resolve_rt_height_, p.rect_h);
           const uint32_t recorded = RecordDeferredDrawsForBase(
-              command_buffer_, p.first_draw, p.end_draw, p.src_base, resolve_rt_width_,
-              resolve_rt_height_);
+              command_buffer_, p.first_draw, p.end_draw, p.src_base, pass_w, pass_h);
           // TEMP-DIAG: what each resolved image is actually built from. Gated on
           // an OCCURRENCE COUNT, and on its own cheap cvar rather than
           // native_log_draws - an early-only bound plus the per-draw flood meant

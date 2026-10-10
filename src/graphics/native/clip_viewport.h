@@ -2,23 +2,19 @@
  ******************************************************************************
  * ReXGlue                                                                    *
  ******************************************************************************
- * Host viewport extent for guest draws with clipping disabled.
+ * Host viewport for guest draws with PA_CL_CLIP_CNTL.clip_disable.
  *
- * With PA_CL_CLIP_CNTL.clip_disable the vertex shader emits positions in
- * pixels, and GetHostViewportInfo turns `x_max`/`y_max` into the host
- * viewport those pixels are measured against. The extent has to be the
- * surface being drawn *now*.
+ * The working Vulkan backend passes VkPhysicalDeviceLimits::maxViewportDimensions
+ * into GetHostViewportInfo. That function then caps each axis at
+ * xenos::kTexture2DCubeMaxWidthHeight (8192). Guest pixel positions stay 1:1
+ * with host pixels for any extent, until the extent itself clips them.
  *
- * The native backend has no render-target cache, so an earlier attempt used
- * the last resolve's destination texture size for the EDRAM base. That size
- * belongs to the previous surface: SF3 reuses EDRAM base 0 for 384x224,
- * 768x448, 1536x896 and 1280x720 targets in one frame, and the logs show
- * clip-disabled draws (surface pitch 640) being given 1280x720 or 1536x896.
- * A pixel coordinate then lands at the wrong host pixel.
- *
- * Width comes from RB_SURFACE_INFO.surface_pitch, which is the current
- * surface. Height comes from a resolve of that same width when one exists,
- * otherwise from a valid window scissor, otherwise from the guest video mode.
+ * SF3's clip-disabled rectangle draws report RB_SURFACE_INFO.surface_pitch 640
+ * while the following resolve of that EDRAM base is 1280x720 (native log:
+ * draw #27 at startup, draw #177757 during a fight, resolve 1280x720). Using
+ * the pitch as the viewport clips that resolve to its left 640 pixels. The
+ * last resolve of the EDRAM base is also the wrong size: base 0 is reused for
+ * 384x224, 768x448, 1536x896 and 1280x720 in one frame.
  ******************************************************************************
  */
 
@@ -33,54 +29,32 @@ namespace rex {
 namespace graphics {
 namespace native {
 
-struct ClipDisabledExtent {
+struct ClipDisabledViewportMax {
   uint32_t x = 1;
   uint32_t y = 1;
-  // Diagnostic label, stable for the viewport log.
-  const char* source = "video_mode";
 };
 
-// `resolve_w/h` is the EDRAM rect of the last resolve of this base, or 0 if
-// this base has not been resolved yet. `surface_pitch` is
-// RB_SURFACE_INFO.surface_pitch for the draw. Scissor edges are valid when
-// they are non-zero and below the 8192 sentinel Direct3D 9 writes.
-inline ClipDisabledExtent ChooseClipDisabledExtent(uint32_t surface_pitch, uint32_t resolve_w,
-                                                   uint32_t resolve_h, bool scissor_x_valid,
-                                                   uint32_t scissor_right, bool scissor_y_valid,
-                                                   uint32_t scissor_bottom, uint32_t video_w,
-                                                   uint32_t video_h) {
-  constexpr uint32_t kSentinel = xenos::kTexture2DCubeMaxWidthHeight;
-  auto bounded = [](uint32_t v) { return v >= 1 && v < kSentinel; };
-
-  ClipDisabledExtent out;
-  out.x = bounded(video_w) ? video_w : 1;
-  out.y = bounded(video_h) ? video_h : 1;
-  out.source = "video_mode";
-
-  if (bounded(surface_pitch)) {
-    out.x = surface_pitch;
-    out.source = "surface_pitch";
-  } else if (scissor_x_valid && bounded(scissor_right)) {
-    out.x = scissor_right;
-    out.source = "scissor_x";
-  } else if (bounded(resolve_w)) {
-    out.x = resolve_w;
-    out.source = "resolve_width";
-  }
-
-  // A resolve height is only meaningful for the surface it was measured on.
-  // Matching the width is what stops a 1536x896 scale buffer from sizing the
-  // next 640-wide pass.
-  if (bounded(resolve_w) && bounded(resolve_h) && resolve_w == out.x) {
-    out.y = resolve_h;
-    out.source = "resolve_matched_width";
-  } else if (scissor_y_valid && bounded(scissor_bottom)) {
-    out.y = scissor_bottom;
-    if (out.source == "video_mode" || out.source == "resolve_width") {
-      out.source = "scissor_y";
-    }
-  }
+// Device viewport limits. `surface_pitch` and the last resolve size are
+// accepted so callers cannot quietly start using them again; they do not
+// affect the result. GetHostViewportInfo caps these at 8192.
+inline ClipDisabledViewportMax HostClipDisabledViewportMax(uint32_t device_max_x,
+                                                          uint32_t device_max_y,
+                                                          uint32_t surface_pitch,
+                                                          uint32_t resolve_w,
+                                                          uint32_t resolve_h) {
+  (void)surface_pitch;
+  (void)resolve_w;
+  (void)resolve_h;
+  ClipDisabledViewportMax out;
+  out.x = device_max_x ? device_max_x : 1;
+  out.y = device_max_y ? device_max_y : 1;
   return out;
+}
+
+// GetHostViewportInfo's clip-disabled extent. A resolve target must not be
+// grown to this range.
+inline bool IsHostClipRangeExtent(uint32_t extent) {
+  return extent >= xenos::kTexture2DCubeMaxWidthHeight;
 }
 
 }  // namespace native
