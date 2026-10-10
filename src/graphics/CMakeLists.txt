@@ -50,6 +50,7 @@ set(REXGPU_XENOS_VULKAN_SOURCES
     vulkan/deferred_command_buffer.cpp
     vulkan/command_processor.cpp
     vulkan/pipeline_cache.cpp
+    vulkan/geometry_shader_builder.cpp
     vulkan/primitive_processor.cpp
     vulkan/render_target_cache.cpp
     vulkan/shader.cpp
@@ -162,5 +163,106 @@ if(REXGLUE_USE_D3D12)
         dxgi
         dxguid
         d3dcompiler
+    )
+endif()
+
+#==============================================================================
+# rexgpu-native: game-agnostic NATIVE GPU renderer plugin
+#
+# Selected at runtime with --gpu_plugin native (loads librexgpu-native.so).
+# Reuses the SAME backend-agnostic PM4 command-processor + Xenos base that
+# rexgpu-xenos uses, and replaces only the backend draw/resolve/present seams
+# with native GPU command translation (no EDRAM/tiling/resolve emulation).
+#
+# This target is fully independent of rexgpu-xenos - it does not modify or
+# link it.
+#
+# Vulkan-only for now (the scaffold reuses the Vulkan provider for windowing).
+#==============================================================================
+if(REXGLUE_USE_VULKAN)
+    set(REXGPU_NATIVE_SOURCES
+        # Native renderer plugin entry + backend
+        native/plugin_main.cpp
+        native/graphics_system.cpp
+        native/command_processor.cpp
+        native/native_shared_memory.cpp
+        native/texture_cache.cpp
+
+        # Geometry-shader SPIR-V construction for Xenos primitive types with no
+        # direct Vulkan topology (rectangles today - see command_processor.cpp's
+        # GetGeometryShader). Split out of vulkan/pipeline_cache.cpp precisely so
+        # it can be compiled here without pulling in the rest of
+        # VulkanPipelineCache (VulkanCommandProcessor/VulkanRenderTargetCache/
+        # VulkanShader) - keeps this target independent of rexgpu-xenos.
+        vulkan/geometry_shader_builder.cpp
+
+        # Shared, game-agnostic PM4 + Xenos base (identical to the rexgpu-xenos
+        # backend-agnostic core; only the backend files differ).
+        flags.cpp
+        register_file.cpp
+        registers.cpp
+        pipeline/shader/shader.cpp
+        format/ucode.cpp
+        sampler_info.cpp
+        graphics_system.cpp
+        command_processor.cpp
+        pipeline/texture/extent.cpp
+        pipeline/texture/util.cpp
+        util/draw_extent_estimator.cpp
+        util/draw.cpp
+        packet_disassembler.cpp
+        primitive_processor.cpp
+        pipeline/render_target/cache.cpp
+        shared_memory.cpp
+        pipeline/texture/cache.cpp
+        pipeline/shader/interpreter.cpp
+        pipeline/shader/translator.cpp
+        pipeline/shader/translator_disasm.cpp
+
+        # SPIR-V shader translation (Xenos microcode -> SPIR-V). Reused verbatim
+        # from the shared translator - the native backend translates guest
+        # shaders itself instead of emulating the Xenos ALU.
+        pipeline/shader/spirv_builder.cpp
+        pipeline/shader/spirv.cpp
+        pipeline/shader/spirv_translator.cpp
+        pipeline/shader/spirv_translator_alu.cpp
+        pipeline/shader/spirv_translator_fetch.cpp
+        pipeline/shader/spirv_translator_memexport.cpp
+        pipeline/shader/spirv_translator_rb.cpp
+    )
+
+    add_library(rexgpu-native SHARED ${REXGPU_NATIVE_SOURCES})
+    add_library(rex::gpu-native ALIAS rexgpu-native)
+
+    set_target_properties(rexgpu-native PROPERTIES
+        EXPORT_NAME gpu-native
+        CXX_VISIBILITY_PRESET hidden
+        VISIBILITY_INLINES_HIDDEN ON
+    )
+
+    # ${CMAKE_CURRENT_SOURCE_DIR} (src/graphics) lets native/*.cpp resolve their
+    # "native/..." internal includes; renderdoc mirrors the xenos target.
+    target_include_directories(rexgpu-native PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${REXGLUE_ROOT}/thirdparty/renderdoc
+        ${REXGLUE_ROOT}
+    )
+
+    target_compile_options(rexgpu-native PRIVATE -Wno-unused-variable)
+
+    # Everything PRIVATE: the plugin has no consumers. rexruntime already
+    # contains the rexcore/rexui objects (including the Vulkan provider).
+    target_link_libraries(rexgpu-native PRIVATE
+        rexruntime
+        xxHash::xxhash
+        stb_image
+        stb_image_write
+        Vulkan::Headers
+        glslang::SPIRV
+        glslang
+        MachineIndependent
+        GenericCodeGen
+        OSDependent
+        OGLCompiler
     )
 endif()

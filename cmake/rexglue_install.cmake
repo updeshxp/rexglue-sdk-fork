@@ -24,6 +24,9 @@ if(REXGLUE_USE_VULKAN)
     list(APPEND REXGLUE_INSTALL_TARGETS
         SPIRV glslang MachineIndependent GenericCodeGen OSDependent OGLCompiler  # glslang
         spirv-tools-headers
+        # Native GPU renderer plugin (Vulkan-only; the target is only defined
+        # inside the REXGLUE_USE_VULKAN guard in src/graphics/CMakeLists.txt).
+        rexgpu-native
     )
 endif()
 

@@ -506,6 +506,23 @@ struct ResolveInfo {
   // dropped.
   uint32_t copy_dest_extent_start;
   uint32_t copy_dest_extent_length;
+  // Destination texture layout, for backends that keep resolved targets as
+  // whole host images rather than writing guest memory: the raw (unadjusted)
+  // RB_COPY_DEST_BASE, the resolve rect's origin in destination texture space
+  // (copy_dest_base above folds the tile-aligned part of this origin into the
+  // address, splitting the remainder into copy_dest_coordinate_info's
+  // offset_x/y_div_8), and the texture's declared pitch/height in pixels. A
+  // game resolving one texture in several rects (EDRAM tiling strips) keeps
+  // copy_dest_texture_base constant across the rects while copy_dest_base
+  // changes per rect.
+  uint32_t copy_dest_texture_base;
+  uint32_t copy_dest_x0;
+  uint32_t copy_dest_y0;
+  uint32_t copy_dest_pitch_px;
+  uint32_t copy_dest_height_px;
+  // Log2 bytes per pixel of the destination format (2 = 32bpp fallback when
+  // the format is not resolvable).
+  uint32_t copy_dest_bpp_log2;
 
   // The clear shaders always write to a uint4 view of EDRAM.
   uint32_t rb_depth_clear;
