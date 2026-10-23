@@ -218,7 +218,17 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
 
             MarkVblank();
           }
-          rex::thread::Sleep(std::chrono::milliseconds(1));
+          // Wait for the next vblank instead of polling for it.
+          current_time = chrono::Clock::QueryGuestTickCount();
+          uint64_t elapsed_ticks = current_time - last_frame_time;
+          if (elapsed_ticks >= interval_ticks) {
+            continue;
+          }
+          double remaining_us = double(interval_ticks - elapsed_ticks) * 1e6 /
+                                double(guest_tick_frequency) /
+                                std::max(chrono::Clock::guest_time_scalar(), 1e-3);
+          rex::thread::Sleep(std::chrono::microseconds(
+              std::clamp(int64_t(remaining_us), int64_t(1000), int64_t(100000))));
         }
         return 0;
       }));
@@ -226,6 +236,12 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
   // vsync_worker_thread_->set_can_debugger_suspend(true);
   vsync_worker_thread_->set_name("GPU VSync");
   vsync_worker_thread_->Create();
+#if REX_PLATFORM_WIN32
+  // It sleeps between vblanks; a busy machine must not make them late.
+  if (auto* vsync_thread = vsync_worker_thread_->thread()) {
+    vsync_thread->set_priority(rex::thread::ThreadPriority::kAboveNormal);
+  }
+#endif
 
   return X_STATUS_SUCCESS;
 }
@@ -387,6 +403,9 @@ void GraphicsSystem::MarkVblank() {
   //     something wrong and the CP will block waiting for code that
   //     needs to be run in the interrupt.
   DispatchInterruptCallback(0, 2);
+  if (command_processor_) {
+    command_processor_->NotifyGuestProgress();
+  }
 }
 
 void GraphicsSystem::ClearCaches() {

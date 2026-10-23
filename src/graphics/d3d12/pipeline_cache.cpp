@@ -111,6 +111,8 @@ PipelineCache::PipelineCache(D3D12CommandProcessor& command_processor,
       !render_target_cache_.gamma_render_target_as_unorm16(),
       render_target_cache_.msaa_2x_supported(), render_target_cache_.draw_resolution_scale_x(),
       render_target_cache_.draw_resolution_scale_y(), provider.GetGraphicsAnalysis() != nullptr);
+  shader_translator_->SetHostScaleQuarters(render_target_cache_.host_scale_quarters_x(),
+                                           render_target_cache_.host_scale_quarters_y());
 
   if (edram_rov_used) {
     depth_only_pixel_shader_ = std::move(shader_translator_->CreateDepthOnlyPixelShader());
@@ -391,6 +393,8 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
           render_target_cache_.msaa_2x_supported(), render_target_cache_.draw_resolution_scale_x(),
           render_target_cache_.draw_resolution_scale_y(),
           provider.GetGraphicsAnalysis() != nullptr);
+      translator.SetHostScaleQuarters(render_target_cache_.host_scale_quarters_x(),
+                                      render_target_cache_.host_scale_quarters_y());
       // If needed and possible, create objects needed for DXIL conversion and
       // disassembly on this thread.
       IDxbcConverter* dxbc_converter = nullptr;
@@ -3201,8 +3205,9 @@ ID3D12PipelineState* PipelineCache::CreateD3D12Pipeline(
   // more likely.
   state_desc.RasterizerState.SlopeScaledDepthBias =
       description.depth_bias_slope_scaled *
-      float(std::max(render_target_cache_.draw_resolution_scale_x(),
-                     render_target_cache_.draw_resolution_scale_y()));
+      (float(std::max(render_target_cache_.host_scale_quarters_x(),
+                      render_target_cache_.host_scale_quarters_y())) *
+       0.25f);
   state_desc.RasterizerState.DepthClipEnable = description.depth_clip ? TRUE : FALSE;
   uint32_t msaa_sample_count = uint32_t(1) << uint32_t(description.host_msaa_samples);
   if (edram_rov_used) {

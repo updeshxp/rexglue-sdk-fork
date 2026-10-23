@@ -862,6 +862,14 @@ class Presenter {
   // May be called from any thread.
   void ForceUIThreadPaintTick();
 
+  // A repaint for the UI alone waits for the next guest output refresh while the guest is refreshing
+  // it, which paints the UI too, instead of presenting the same guest frame again. Otherwise it waits
+  // for the display refresh interval where no vertical blank wait limits it.
+  void ScheduleUIRepaintFromUIThread();
+  // May be called from any thread.
+  void CancelScheduledUIRepaint();
+  void UIRepaintThread();
+
   // Must be called only in the end of entry points - reinitialization of the
   // presenter may be done by the handler if it was called from the UI thread
   // (even if the UI thread argument is false - such as when the guest output is
@@ -994,6 +1002,16 @@ class Presenter {
   bool is_in_ui_thread_paint_ = false;
   bool request_guest_output_paint_after_current_ui_thread_paint_;
   bool request_ui_paint_after_current_ui_thread_paint_;
+
+  // Steady clock nanoseconds of the latest guest output refresh and UI thread present.
+  std::atomic<uint64_t> last_guest_output_refresh_ns_{0};
+  uint64_t last_ui_thread_present_ns_ = 0;
+  // The scheduled UI repaint, 0 if none, requested by ui_repaint_thread_ when it's due.
+  std::mutex ui_repaint_mutex_;
+  std::condition_variable ui_repaint_condition_;
+  uint64_t ui_repaint_deadline_ns_ = 0;
+  bool ui_repaint_thread_shutdown_ = false;
+  std::thread ui_repaint_thread_;
 
   // Platform-specific, but implementation-agnostic parts, primarily for
   // limiting of the frame rate of the UI to avoid drawing the UI at extreme

@@ -313,7 +313,9 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
           view_stencil_(view_stencil),
           view_srgb_(view_srgb),
           view_color_transfer_separate_(view_color_transfer_separate),
-          descriptor_set_index_transfer_source_(descriptor_set_index_transfer_source) {}
+          descriptor_set_index_transfer_source_(descriptor_set_index_transfer_source) {
+      std::memset(stencil_tile_bits_, UINT8_MAX, sizeof(stencil_tile_bits_));
+    }
     ~VulkanRenderTarget();
 
     VkImage image() const { return image_; }
@@ -361,6 +363,29 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
     uint32_t temporary_sort_index() const { return temporary_sort_index_; }
     void SetTemporarySortIndex(uint32_t index) { temporary_sort_index_ = index; }
 
+    // For each EDRAM tile, the stencil bits that may be set in the render target there (the
+    // image is created uninitialized, so all of them until written). Copying a stencil bit that
+    // is clear everywhere in the source is pointless. The ranges are in EDRAM tiles, wrapping
+    // around the EDRAM.
+    uint32_t GetTileStencilBits(uint32_t tile) const {
+      return stencil_tile_bits_[tile & (xenos::kEdramTileCount - 1)];
+    }
+    uint32_t GetStencilBits(uint32_t start_tiles, uint32_t length_tiles) const {
+      uint32_t bits = 0;
+      for (uint32_t i = 0; i < length_tiles; ++i) {
+        bits |= GetTileStencilBits(start_tiles + i);
+      }
+      return bits;
+    }
+    void AddStencilBits(uint32_t start_tiles, uint32_t length_tiles, uint32_t bits) {
+      for (uint32_t i = 0; i < length_tiles; ++i) {
+        stencil_tile_bits_[(start_tiles + i) & (xenos::kEdramTileCount - 1)] |= uint8_t(bits);
+      }
+    }
+    void SetTileStencilBits(uint32_t tile, uint32_t bits) {
+      stencil_tile_bits_[tile & (xenos::kEdramTileCount - 1)] = uint8_t(bits);
+    }
+
    private:
     VulkanRenderTargetCache& render_target_cache_;
 
@@ -385,6 +410,8 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
 
     // Temporary storage for indices in operations like transfers and dumps.
     uint32_t temporary_sort_index_ = 0;
+
+    uint8_t stencil_tile_bits_[xenos::kEdramTileCount];
   };
 
   struct FramebufferKey {
@@ -604,8 +631,11 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   struct TransferInvocation {
     Transfer transfer;
     TransferShaderKey shader_key;
-    TransferInvocation(const Transfer& transfer, const TransferShaderKey& shader_key)
-        : transfer(transfer), shader_key(shader_key) {}
+    // Stencil bit modes: the bits to copy.
+    uint32_t stencil_bits;
+    TransferInvocation(const Transfer& transfer, const TransferShaderKey& shader_key,
+                       uint32_t stencil_bits = 0)
+        : transfer(transfer), shader_key(shader_key), stencil_bits(stencil_bits) {}
     bool operator<(const TransferInvocation& other_invocation) const {
       // TODO(Triang3l): See if it may be better to sort by the source in the
       // first place, especially when reading the same data multiple times (like
@@ -632,6 +662,7 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
     }
     bool CanBeMergedIntoOneDraw(const TransferInvocation& other_invocation) const {
       return shader_key == other_invocation.shader_key &&
+             stencil_bits == other_invocation.stencil_bits &&
              transfer.AreSourcesSame(other_invocation.transfer);
     }
   };
@@ -728,6 +759,9 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   struct DumpInvocation {
     ResolveCopyDumpRectangle rectangle;
     DumpPipelineKey pipeline_key;
+    // Only the tiles that are dirty.
+    ResolveCopyDumpRectangle::Dispatch dispatches[ResolveCopyDumpRectangle::kMaxDispatches];
+    uint32_t dispatch_count = 0;
     DumpInvocation(const ResolveCopyDumpRectangle& rectangle, const DumpPipelineKey& pipeline_key)
         : rectangle(rectangle), pipeline_key(pipeline_key) {}
     bool operator<(const DumpInvocation& other_invocation) const {
@@ -793,12 +827,98 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   // be null / empty in case there's nothing to do for them.
   // resolve_clear_rectangle is expected to be provided by
   // PrepareHostRenderTargetsResolveClear which should do all the needed size
-  // bound checks.
+  // bound checks. Without clear values, the rectangle is an area a draw replaces entirely, only
+  // transferred around. It's applied to the render targets of cutout_render_targets (bit 0 is
+  // depth); with depth_only_cutout, to the depth of the depth render target but not the stencil.
   void PerformTransfersAndResolveClears(
       uint32_t render_target_count, RenderTarget* const* render_targets,
       const std::vector<Transfer>* render_target_transfers,
       const uint64_t* render_target_resolve_clear_values = nullptr,
-      const Transfer::Rectangle* resolve_clear_rectangle = nullptr);
+      const Transfer::Rectangle* resolve_clear_rectangle = nullptr,
+      uint32_t cutout_render_targets = UINT32_MAX, bool depth_only_cutout = false);
+
+  // The depth render target's stencil in the tiles of the rectangle (relative to its base) was
+  // set to the value.
+  static void SetClearedStencilBits(VulkanRenderTarget& render_target,
+                                    const Transfer::Rectangle& rectangle, uint32_t stencil);
+
+  // Shrinks the dispatch to the smallest rectangle containing all its dirty tiles, false if there
+  // are none.
+  bool ShrinkDumpDispatchToDirtyTiles(uint32_t dump_base, uint32_t dump_pitch,
+                                      ResolveCopyDumpRectangle::Dispatch& dispatch) const;
+  bool CanDrawWriteDepthStencil(reg::RB_DEPTHCONTROL normalized_depth_control) const;
+  // The stencil bits the draw may set.
+  uint32_t GetDrawStencilBits(reg::RB_DEPTHCONTROL normalized_depth_control) const;
+  // A 32bpp color render target of these formats holds the depth and stencil of a transfer as
+  // they are packed (the stencil in the low byte), and reads the stencil back the same way. Its
+  // tile bits are the stencil bits that may be set in the low byte of the pixels there.
+  static bool IsStencilCarryingColorFormat(RenderTargetKey key) {
+    if (key.is_depth) {
+      return false;
+    }
+    switch (key.GetColorFormat()) {
+      case xenos::ColorRenderTargetFormat::k_8_8_8_8:
+      case xenos::ColorRenderTargetFormat::k_2_10_10_10:
+      case xenos::ColorRenderTargetFormat::k_2_10_10_10_AS_10_10_10_10:
+      case xenos::ColorRenderTargetFormat::k_16_16:
+        return true;
+      default:
+        return false;
+    }
+  }
+  // The stencil bits that may be set in a tile of the transfer source, as seen by the destination.
+  static uint32_t GetTransferTileStencilBits(const Transfer& transfer, uint32_t tile,
+                                             RenderTargetKey dest_key) {
+    const auto* source = static_cast<const VulkanRenderTarget*>(transfer.source);
+    RenderTargetKey source_key = source->key();
+    bool carried;
+    if (source_key.is_depth) {
+      carried = dest_key.is_depth || IsStencilCarryingColorFormat(dest_key);
+    } else {
+      carried = IsStencilCarryingColorFormat(source_key) &&
+                (dest_key.is_depth || source_key.resource_format == dest_key.resource_format);
+    }
+    return carried ? source->GetTileStencilBits(tile) : UINT8_MAX;
+  }
+  static uint32_t GetTransferSourceStencilBits(const Transfer& transfer) {
+    RenderTargetKey dest_key;
+    dest_key.is_depth = 1;
+    uint32_t bits = 0;
+    for (uint32_t tile = transfer.start_tiles; tile < transfer.end_tiles; ++tile) {
+      bits |= GetTransferTileStencilBits(transfer, tile, dest_key);
+    }
+    return bits;
+  }
+
+  struct StencilRun {
+    uint32_t start_tiles;
+    uint32_t end_tiles;
+    uint32_t bits;
+  };
+  static constexpr uint32_t kMaxStencilRuns = 8;
+  // Splits the tiles into runs of the same nonzero stencil bits, dropping the tiles without any.
+  // Past kMaxStencilRuns, the rest is merged into the last run (bits are only ever added).
+  template <typename BitsOfTile>
+  static uint32_t GetStencilRuns(uint32_t start_tiles, uint32_t end_tiles, BitsOfTile bits_of_tile,
+                                 StencilRun* runs_out) {
+    uint32_t run_count = 0;
+    for (uint32_t tile = start_tiles; tile < end_tiles; ++tile) {
+      uint32_t bits = bits_of_tile(tile);
+      if (!bits) {
+        continue;
+      }
+      if (run_count && runs_out[run_count - 1].end_tiles == tile &&
+          runs_out[run_count - 1].bits == bits) {
+        runs_out[run_count - 1].end_tiles = tile + 1;
+      } else if (run_count == kMaxStencilRuns) {
+        runs_out[run_count - 1].end_tiles = tile + 1;
+        runs_out[run_count - 1].bits |= bits;
+      } else {
+        runs_out[run_count++] = {tile, tile + 1, bits};
+      }
+    }
+    return run_count;
+  }
 
   VkPipeline GetDumpPipeline(DumpPipelineKey key);
   VkPipeline GetDirectResolvePipeline(DirectResolvePipelineKey key);
@@ -810,6 +930,15 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   // ResolveInfo::GetCopyEdramTileSpan to edram_buffer_.
   bool DumpRenderTargets(uint32_t dump_base, uint32_t dump_row_length_used, uint32_t dump_rows,
                          uint32_t dump_pitch);
+
+  // The resolve's write from edram_buffer_ to its memory. The shared memory is needed without
+  // resolution scaling.
+  bool DispatchResolveCopy(VulkanSharedMemory* shared_memory, VulkanTextureCache& texture_cache,
+                           const DeferredResolve& writes);
+  bool MaterializeDeferredResolve(const DeferredResolve& resolve) override;
+  // Sampled image descriptor sets of textures written to the EDRAM for deferred resolves, with the
+  // submission using them.
+  std::vector<std::pair<uint64_t, size_t>> deferred_resolve_descriptor_sets_;
 
   bool gamma_render_target_as_unorm16_ = false;
 
@@ -862,14 +991,15 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
 
   // Temporary storage for PerformTransfersAndResolveClears.
   std::vector<TransferInvocation> current_transfer_invocations_;
+  std::vector<Transfer> current_stencil_clear_transfers_;
+  // Temporary storage for the transfers remaining after a draw replaces part of the destinations.
+  std::vector<Transfer> draw_overwrite_transfers_[1 + xenos::kMaxColorRenderTargets];
 
   // Temporary storage for DumpRenderTargets.
   std::vector<ResolveCopyDumpRectangle> dump_rectangles_;
   std::vector<DumpInvocation> dump_invocations_;
   std::vector<ResolveCopyDispatch> direct_resolve_dispatches_;
   uint64_t direct_resolve_attempt_count_ = 0;
-  uint64_t direct_resolve_success_count_ = 0;
-  uint64_t direct_resolve_fallback_count_ = 0;
 
   // For pixel (fragment) shader interlock.
 

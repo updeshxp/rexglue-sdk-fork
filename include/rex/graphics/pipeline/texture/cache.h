@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <unordered_map>
@@ -25,6 +26,7 @@
 #include <rex/graphics/pipeline/texture/util.h>
 #include <rex/graphics/register_file.h>
 #include <rex/graphics/shared_memory.h>
+#include <rex/graphics/util/draw.h>
 #include <rex/graphics/xenos.h>
 #include <rex/hash.h>
 #include <rex/thread/mutex.h>
@@ -71,6 +73,11 @@ class TextureCache {
 
   // Returns whether the actual scale is not smaller than the requested one.
   static bool GetConfigDrawResolutionScale(uint32_t& x_out, uint32_t& y_out);
+  // Replaces the configured scale with the whole scale of the EDRAM, resolves and textures, and
+  // returns the scale of the host render targets in quarters of a guest pixel.
+  static void GetConfigInternalRenderScale(uint32_t& scale_x_inout, uint32_t& scale_y_inout,
+                                           uint32_t& host_quarters_x_out,
+                                           uint32_t& host_quarters_y_out);
   uint32_t draw_resolution_scale_x() const { return draw_resolution_scale_x_; }
   uint32_t draw_resolution_scale_y() const { return draw_resolution_scale_y_; }
   bool IsDrawResolutionScaled() const {
@@ -106,6 +113,24 @@ class TextureCache {
   }
 
   static uint32_t GuestToHostSwizzle(uint32_t guest_swizzle, uint32_t host_format_swizzle);
+  static uint32_t SwapRedBlueSwizzle(uint32_t host_swizzle);
+
+  // Called with the guest range before a texture is loaded from the scaled resolve memory.
+  void SetScaledResolveReadCallback(std::function<void(uint32_t start, uint32_t length)> callback) {
+    scaled_resolve_read_callback_ = std::move(callback);
+  }
+
+  // A texture holding what a resolve with deferred writeback hasn't written to the memory yet, for
+  // the render target cache.
+  using DeferredResolveTexture = const void*;
+  void SetHoldsDeferredResolve(DeferredResolveTexture texture, bool holds) {
+    static_cast<Texture*>(const_cast<void*>(texture))->SetHoldsDeferredResolve(holds);
+  }
+  bool TextureCoversResolve(DeferredResolveTexture texture, uint32_t width,
+                            uint32_t height) const {
+    const TextureKey& key = static_cast<const Texture*>(texture)->key();
+    return key.GetWidth() == width && key.GetHeight() == height;
+  }
 
   void TextureFetchConstantWritten(uint32_t index) { TextureFetchConstantsWritten(index, index); }
   void TextureFetchConstantsWritten(uint32_t first_index, uint32_t last_index) {
@@ -253,6 +278,16 @@ class TextureCache {
 
     void WatchCallback(const std::unique_lock<std::recursive_mutex>& global_lock, bool is_mip);
 
+    // The base level has red and blue in the other order, copied from a render target by a resolve
+    // that swaps them; sampling swaps them back.
+    bool content_red_blue_swapped() const { return content_red_blue_swapped_; }
+    void SetContentRedBlueSwapped(bool swapped) { content_red_blue_swapped_ = swapped; }
+
+    // Holds what a resolve with deferred writeback hasn't written to the memory yet, so it must not
+    // be destroyed before the memory is written.
+    bool holds_deferred_resolve() const { return holds_deferred_resolve_; }
+    void SetHoldsDeferredResolve(bool holds) { holds_deferred_resolve_ = holds; }
+
     // For LRU caching - updates the last usage frame and moves the texture to
     // the end of the usage queue. Must be called any time the texture is
     // referenced by any GPU work in the implementation to make sure it's not
@@ -290,6 +325,8 @@ class TextureCache {
     Texture* used_next_;
     bool in_usage_list_;
     bool force_load_3d_tiling_ = false;
+    bool content_red_blue_swapped_ = false;
+    bool holds_deferred_resolve_ = false;
 
     // These are to be accessed within the global critical region to synchronize
     // with shared memory.
@@ -584,6 +621,16 @@ class TextureCache {
   // Called when something in a texture binding is changed for the
   // implementation to update the internal dependencies of the binding.
   virtual void UpdateTextureBindingsImpl(uint32_t /*fetch_constant_mask*/) {}
+
+  // Up-to-date textures whose whole sampled content is written by the resolve, so they can be
+  // copied from the render target instead of being loaded from the resolved memory. Must be called
+  // before the resolve marks its range as resolved.
+  uint32_t FindResolveCopyTargets(const draw_util::ResolveTextureCopy& copy, Texture** targets_out,
+                                  uint32_t max_targets);
+  // After the render target has been copied into the texture: it matches the memory again.
+  void EndResolveCopyIntoTexture(Texture& texture, bool red_blue_swapped);
+
+  std::function<void(uint32_t start, uint32_t length)> scaled_resolve_read_callback_;
 
  private:
   struct PendingTextureLoad {

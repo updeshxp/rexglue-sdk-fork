@@ -131,6 +131,18 @@ class VulkanTextureCache final : public TextureCache {
                                               length_scaled_alignment_log2);
   }
   VkBuffer scaled_resolve_buffer() const { return scaled_resolve_buffer_; }
+
+  // Textures filled from the render target of a resolve instead of being loaded from its memory.
+  // Prepare before the resolve marks its range as resolved, perform after, with the render target
+  // in the transfer source layout.
+  uint32_t PrepareResolveTextureCopies(const draw_util::ResolveTextureCopy& copy,
+                                       VkFormat source_format);
+  void PerformResolveTextureCopies(const draw_util::ResolveTextureCopy& copy, VkImage source);
+  DeferredResolveTexture resolve_copy_texture(uint32_t index) const {
+    return resolve_copy_textures_[index];
+  }
+  // Makes the base level readable by compute shaders, returning a view of it in the host format.
+  VkImageView UseTextureForComputeRead(DeferredResolveTexture texture);
   void UseScaledResolveBufferForRead();
   void UseScaledResolveBufferForWrite(uint64_t written_start_scaled,
                                       uint64_t written_length_scaled);
@@ -201,6 +213,7 @@ class VulkanTextureCache final : public TextureCache {
       kTransferDestination,
       kGuestShaderSampled,
       kSwapSampled,
+      kComputeShaderSampled,
     };
 
     // Takes ownership of the image and its memory.
@@ -210,6 +223,7 @@ class VulkanTextureCache final : public TextureCache {
 
     VkImage image() const { return image_; }
 
+    Usage usage() const { return usage_; }
     // Doesn't transition (the caller must insert the barrier).
     Usage SetUsage(Usage new_usage) {
       Usage old_usage = usage_;
@@ -373,6 +387,10 @@ class VulkanTextureCache final : public TextureCache {
   bool null_images_cleared_ = false;
 
   std::array<VulkanTextureBinding, xenos::kTextureFetchConstantCount> vulkan_texture_bindings_;
+
+  static constexpr uint32_t kMaxResolveTextureCopies = 4;
+  Texture* resolve_copy_textures_[kMaxResolveTextureCopies];
+  uint32_t resolve_copy_texture_count_ = 0;
 
   // Unsupported texture formats used during this frame (for research and
   // testing).

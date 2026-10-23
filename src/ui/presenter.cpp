@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <chrono>
 #include <utility>
 
 #include <rex/assert.h>
@@ -251,6 +252,16 @@ void LogTemporalFsrQualityModeInputLimitOnce() {
 }
 #endif  // defined(REX_HAS_FIDELITYFX_SDK)
 
+uint64_t SteadyNowNs() {
+  return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                      std::chrono::steady_clock::now().time_since_epoch())
+                      .count());
+}
+
+// How long a UI repaint waits for the next guest frame, so a guest refreshing at under 20 Hz still
+// gets the UI drawn at least that often.
+constexpr uint64_t kUIRepaintGuestOutputWaitNs = 50'000'000;
+
 GuestOutputPaintConfig BuildGuestOutputPaintConfigFromCVar() {
   GuestOutputPaintConfig config;
   GuestOutputPaintConfig::Effect parsed_effect = ParsePresentEffect(REXCVAR_GET(present_effect));
@@ -286,6 +297,15 @@ Presenter::~Presenter() {
   // No intrusive lifetime management must be performed from UI drawers - defer
   // it if needed.
   assert_false(is_executing_ui_drawers_);
+
+  if (ui_repaint_thread_.joinable()) {
+    {
+      std::scoped_lock<std::mutex> ui_repaint_lock(ui_repaint_mutex_);
+      ui_repaint_thread_shutdown_ = true;
+    }
+    ui_repaint_condition_.notify_all();
+    ui_repaint_thread_.join();
+  }
 
 #if REX_PLATFORM_WIN32
   if (dxgi_ui_tick_thread_.joinable()) {
@@ -541,8 +561,13 @@ void Presenter::PaintFromUIThread(bool force_paint) {
       request_repaint_at_tick = true;
     }
   }
-  if (request_repaint_at_tick || request_repaint_immediately) {
-    RequestPaintOrConnectionRecoveryViaWindow(request_repaint_immediately);
+  if (paint_result == PaintResult::kPresented || paint_result == PaintResult::kPresentedSuboptimal) {
+    last_ui_thread_present_ns_ = SteadyNowNs();
+  }
+  if (request_repaint_immediately) {
+    RequestPaintOrConnectionRecoveryViaWindow(true);
+  } else if (request_repaint_at_tick) {
+    ScheduleUIRepaintFromUIThread();
   }
 }
 
@@ -550,6 +575,7 @@ bool Presenter::RefreshGuestOutput(
     uint32_t frontbuffer_width, uint32_t frontbuffer_height, uint32_t display_aspect_ratio_x,
     uint32_t display_aspect_ratio_y,
     std::function<bool(GuestOutputRefreshContext& context)> refresher) {
+  last_guest_output_refresh_ns_.store(SteadyNowNs(), std::memory_order_relaxed);
   GuestOutputProperties& writable_properties =
       guest_output_properties_[guest_output_mailbox_writable_];
   writable_properties.frontbuffer_width = frontbuffer_width;
@@ -795,6 +821,7 @@ bool Presenter::InitializeCommonSurfaceIndependent() {
 #if REX_PLATFORM_WIN32
   dxgi_ui_tick_thread_ = std::thread(&Presenter::DXGIUITickThread, this);
 #endif  // XE_PLATFORM
+  ui_repaint_thread_ = std::thread(&Presenter::UIRepaintThread, this);
 
   return true;
 }
@@ -1414,6 +1441,7 @@ bool Presenter::RequestPaintOrConnectionRecoveryViaWindow(bool force_ui_thread_p
   // theoretically. For safety, check whether the window exists unconditionally.
   assert_not_null(window_);
   assert_not_null(surface_);
+  CancelScheduledUIRepaint();
   if (ui_thread_paint_requested_.exchange(true, std::memory_order_relaxed)) {
     // Invalidation pending already, no need to do it twice.
     return false;
@@ -1610,6 +1638,66 @@ void Presenter::ForceUIThreadPaintTick() {
   std::scoped_lock<std::mutex> dxgi_ui_tick_lock(dxgi_ui_tick_mutex_);
   dxgi_ui_tick_force_requested_ = true;
 #endif  // XE_PLATFORM
+}
+
+void Presenter::ScheduleUIRepaintFromUIThread() {
+  uint64_t now = SteadyNowNs();
+  uint64_t last_guest_output_refresh = last_guest_output_refresh_ns_.load(std::memory_order_relaxed);
+  uint64_t deadline;
+  if (last_guest_output_refresh && now - last_guest_output_refresh < kUIRepaintGuestOutputWaitNs) {
+    deadline = last_guest_output_refresh + kUIRepaintGuestOutputWaitNs;
+  } else {
+    double refresh_rate = window_->GetDisplayRefreshRate();
+    bool vblank_limited = surface_paint_connection_has_implicit_vsync_;
+#if REX_PLATFORM_WIN32
+    vblank_limited |= AreUITicksNeededFromUIThread();
+#endif  // XE_PLATFORM
+    if (vblank_limited || !(refresh_rate > 0.0)) {
+      RequestPaintOrConnectionRecoveryViaWindow(false);
+      return;
+    }
+    deadline = last_ui_thread_present_ns_ + uint64_t(1e9 / refresh_rate);
+    if (deadline <= now) {
+      RequestPaintOrConnectionRecoveryViaWindow(false);
+      return;
+    }
+  }
+  {
+    std::scoped_lock<std::mutex> ui_repaint_lock(ui_repaint_mutex_);
+    ui_repaint_deadline_ns_ = deadline;
+  }
+  ui_repaint_condition_.notify_all();
+}
+
+void Presenter::CancelScheduledUIRepaint() {
+  std::scoped_lock<std::mutex> ui_repaint_lock(ui_repaint_mutex_);
+  ui_repaint_deadline_ns_ = 0;
+}
+
+void Presenter::UIRepaintThread() {
+  std::unique_lock<std::mutex> ui_repaint_lock(ui_repaint_mutex_);
+  while (!ui_repaint_thread_shutdown_) {
+    if (!ui_repaint_deadline_ns_) {
+      ui_repaint_condition_.wait(ui_repaint_lock);
+      continue;
+    }
+    uint64_t deadline = ui_repaint_deadline_ns_;
+    if (SteadyNowNs() < deadline) {
+      ui_repaint_condition_.wait_until(
+          ui_repaint_lock, std::chrono::steady_clock::time_point(std::chrono::nanoseconds(deadline)));
+      continue;
+    }
+    ui_repaint_deadline_ns_ = 0;
+    ui_repaint_lock.unlock();
+    {
+      // The window may be used here only while painting isn't disconnected (paint_mode_ isn't kNone).
+      std::scoped_lock<std::mutex> paint_mode_lock(paint_mode_mutex_);
+      if (paint_mode_ == PaintMode::kUIThreadOnRequest) {
+        RequestPaintOrConnectionRecoveryViaWindow(false);
+      }
+    }
+    ui_repaint_lock.lock();
+  }
 }
 
 #if REX_PLATFORM_WIN32

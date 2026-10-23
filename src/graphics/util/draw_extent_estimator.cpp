@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <cfloat>
+#include <cmath>
 #include <cstdint>
 
 #include <rex/assert.h>
@@ -24,7 +25,9 @@
 #include <rex/memory.h>
 #include <rex/ui/graphics_util.h>
 
-REXCVAR_DEFINE_BOOL(execute_unclipped_draw_vs_on_cpu, false, "GPU",
+// Xenia's default: without it, a draw with clipping disabled and an 8192 scissor, such as a clear,
+// is taken to cover the whole EDRAM and causes ownership transfers between render targets.
+REXCVAR_DEFINE_BOOL(execute_unclipped_draw_vs_on_cpu, true, "GPU",
                     "Execute unclipped draw vertex shader on CPU");
 
 REXCVAR_DEFINE_BOOL(execute_unclipped_draw_vs_on_cpu_with_scissor, false, "GPU",
@@ -78,8 +81,77 @@ void DrawExtentEstimator::PositionYExportSink::Export(ucode::ExportRegister expo
   }
 }
 
-uint32_t DrawExtentEstimator::EstimateVertexMaxY(const Shader& vertex_shader) {
+void DrawExtentEstimator::PositionExportSink::Export(ucode::ExportRegister export_register,
+                                                     const float* value, uint32_t value_mask) {
+  if (export_register == ucode::ExportRegister::kVSPosition) {
+    for (uint32_t i = 0; i < 4; ++i) {
+      if (value_mask & (uint32_t(1) << i)) {
+        position[i] = value[i];
+      }
+    }
+    position_mask |= value_mask & 0b1111;
+  } else if (export_register == ucode::ExportRegister::kVSPointSizeEdgeFlagKillVertex) {
+    if (value_mask & 0b0100) {
+      vertex_kill = rex::memory::Reinterpret<uint32_t>(value[2]);
+    }
+  }
+}
+
+bool DrawExtentEstimator::GetAutoIndexedVertexPositions(const Shader& vertex_shader,
+                                                        uint32_t vertex_count,
+                                                        float (*positions_out)[4]) {
   SCOPE_profile_cpu_f("gpu");
+
+  const RegisterFile& regs = register_file_;
+
+  auto vgt_draw_initiator = regs.Get<reg::VGT_DRAW_INITIATOR>();
+  if (vgt_draw_initiator.source_select != xenos::SourceSelect::kAutoIndex ||
+      vgt_draw_initiator.num_indices < vertex_count) {
+    return false;
+  }
+  if (xenos::IsMajorModeExplicit(vgt_draw_initiator.major_mode, vgt_draw_initiator.prim_type) &&
+      regs.Get<reg::VGT_OUTPUT_PATH_CNTL>().path_select ==
+          xenos::VGTOutputPath::kTessellationEnable) {
+    return false;
+  }
+  if (vertex_shader.type() != xenos::ShaderType::kVertex || !vertex_shader.is_ucode_analyzed() ||
+      !ShaderInterpreter::CanInterpretShader(vertex_shader)) {
+    return false;
+  }
+
+  uint32_t index_offset = regs.Get<reg::VGT_INDX_OFFSET>().indx_offset;
+  uint32_t min_index = regs.Get<reg::VGT_MIN_VTX_INDX>().min_indx;
+  uint32_t max_index = regs.Get<reg::VGT_MAX_VTX_INDX>().max_indx;
+
+  shader_interpreter_.SetShader(vertex_shader);
+  PositionExportSink position_export_sink;
+  shader_interpreter_.SetExportSink(&position_export_sink);
+  bool complete = true;
+  for (uint32_t i = 0; i < vertex_count; ++i) {
+    uint32_t vertex_index = std::min(max_index, std::max(min_index, (i + index_offset) & 0xFFFFFF));
+    position_export_sink.Reset();
+    shader_interpreter_.temp_registers()[0] = float(vertex_index);
+    shader_interpreter_.Execute();
+    if ((position_export_sink.vertex_kill & ~(UINT32_C(1) << 31)) ||
+        position_export_sink.position_mask != 0b1111) {
+      complete = false;
+      break;
+    }
+    for (uint32_t j = 0; j < 4; ++j) {
+      positions_out[i][j] = position_export_sink.position[j];
+    }
+  }
+  shader_interpreter_.SetExportSink(nullptr);
+  return complete;
+}
+
+uint32_t DrawExtentEstimator::EstimateVertexMaxY(const Shader& vertex_shader,
+                                                   uint32_t* min_y_out) {
+  SCOPE_profile_cpu_f("gpu");
+
+  if (min_y_out) {
+    *min_y_out = 0;
+  }
 
   const RegisterFile& regs = register_file_;
 
@@ -155,6 +227,7 @@ uint32_t DrawExtentEstimator::EstimateVertexMaxY(const Shader& vertex_shader) {
   }
 
   float max_y = -FLT_MAX;
+  float min_y = FLT_MAX;
 
   shader_interpreter_.SetShader(vertex_shader);
 
@@ -205,6 +278,7 @@ uint32_t DrawExtentEstimator::EstimateVertexMaxY(const Shader& vertex_shader) {
     }
 
     vertex_y = vertex_y * viewport_y_scale + viewport_y_offset;
+    float vertex_min_y = vertex_y;
 
     if (vgt_draw_initiator.prim_type == xenos::PrimitiveType::kPointList) {
       float point_radius_y;
@@ -222,13 +296,28 @@ uint32_t DrawExtentEstimator::EstimateVertexMaxY(const Shader& vertex_shader) {
         point_radius_y = point_constant_radius_y;
       }
       vertex_y += point_radius_y;
+      vertex_min_y -= point_radius_y;
     }
 
     // std::max is `a < b ? b : a`, thus in case of NaN, the first argument is
     // always returned - max_y, which is initialized to a normalized value.
     max_y = std::max(max_y, vertex_y);
+    min_y = std::min(min_y, vertex_min_y);
   }
   shader_interpreter_.SetExportSink(nullptr);
+
+  // Lines are widened by their width, which isn't accounted for.
+  if (min_y_out && min_y != FLT_MAX &&
+      vgt_draw_initiator.prim_type != xenos::PrimitiveType::kLineList &&
+      vgt_draw_initiator.prim_type != xenos::PrimitiveType::kLineStrip &&
+      vgt_draw_initiator.prim_type != xenos::PrimitiveType::kLineLoop) {
+    // The half-pixel offset only moves the draw down, ignoring it keeps the bound low.
+    int32_t min_row = int32_t(std::floor(std::min(std::max(min_y, -16384.0f), 16384.0f))) - 1;
+    if (pa_su_sc_mode_cntl.vtx_window_offset_enable) {
+      min_row += regs.Get<reg::PA_SC_WINDOW_OFFSET>().window_y_offset;
+    }
+    *min_y_out = uint32_t(std::max(min_row, int32_t(0)));
+  }
 
   int32_t max_y_24p8 = ui::FloatToD3D11Fixed16p8(max_y);
   // 16p8 range is -32768 to 32767+255/256, but it's stored as uint32_t here,
@@ -251,7 +340,7 @@ uint32_t DrawExtentEstimator::EstimateVertexMaxY(const Shader& vertex_shader) {
 }
 
 uint32_t DrawExtentEstimator::EstimateMaxY(bool try_to_estimate_vertex_max_y,
-                                           const Shader& vertex_shader) {
+                                           const Shader& vertex_shader, uint32_t* min_y_out) {
   SCOPE_profile_cpu_f("gpu");
 
   const RegisterFile& regs = register_file_;
@@ -269,6 +358,17 @@ uint32_t DrawExtentEstimator::EstimateMaxY(bool try_to_estimate_vertex_max_y,
   auto pa_sc_screen_scissor_br = regs.Get<reg::PA_SC_SCREEN_SCISSOR_BR>();
   scissor_bottom = std::min(scissor_bottom, int32_t(pa_sc_screen_scissor_br.br_y));
   uint32_t max_y = uint32_t(std::max(scissor_bottom, int32_t(0)));
+
+  uint32_t min_y = 0;
+  if (min_y_out) {
+    auto pa_sc_window_scissor_tl = regs.Get<reg::PA_SC_WINDOW_SCISSOR_TL>();
+    int32_t scissor_top = int32_t(pa_sc_window_scissor_tl.tl_y);
+    if (!pa_sc_window_scissor_tl.window_offset_disable) {
+      scissor_top += window_y_offset;
+    }
+    scissor_top = std::max(scissor_top, int32_t(regs.Get<reg::PA_SC_SCREEN_SCISSOR_TL>().tl_y));
+    min_y = uint32_t(std::max(scissor_top, int32_t(0)));
+  }
 
   if (regs.Get<reg::PA_CL_CLIP_CNTL>().clip_disable) {
     // Actual extent from the vertices.
@@ -294,7 +394,9 @@ uint32_t DrawExtentEstimator::EstimateMaxY(bool try_to_estimate_vertex_max_y,
         }
       }
       if (estimate_vertex_max_y) {
-        max_y = std::min(max_y, EstimateVertexMaxY(vertex_shader));
+        uint32_t vertex_min_y = 0;
+        max_y = std::min(max_y, EstimateVertexMaxY(vertex_shader, min_y_out ? &vertex_min_y : nullptr));
+        min_y = std::max(min_y, vertex_min_y);
       }
     }
   } else {
@@ -326,8 +428,27 @@ uint32_t DrawExtentEstimator::EstimateMaxY(bool try_to_estimate_vertex_max_y,
     // argument in the !(a < b) case (always for NaN), min as float (max_y is
     // well below 2^24) to safely drop very large values.
     max_y = uint32_t(std::min(float(max_y), std::max(0.0f, viewport_bottom)));
+    if (min_y_out) {
+      // The same bounds from the top; a row of slack covers the half-pixel offset.
+      float viewport_top = 0.0f;
+      if (regs.Get<reg::PA_SU_SC_MODE_CNTL>().vtx_window_offset_enable) {
+        viewport_top += float(window_y_offset);
+      }
+      if (pa_cl_vte_cntl.vport_y_offset_ena) {
+        viewport_top += regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_YOFFSET);
+      }
+      viewport_top -= pa_cl_vte_cntl.vport_y_scale_ena
+                          ? std::abs(regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_YSCALE))
+                          : 1.0f;
+      // The clamp also drops NaN.
+      viewport_top = std::min(std::max(0.0f, viewport_top), 16384.0f);
+      min_y = std::max(min_y, uint32_t(std::max(int32_t(std::floor(viewport_top)) - 1, int32_t(0))));
+    }
   }
 
+  if (min_y_out) {
+    *min_y_out = std::min(min_y, max_y);
+  }
   return max_y;
 }
 

@@ -2034,10 +2034,6 @@ bool PhysicalHeap::Release(uint32_t base_address, uint32_t* out_region_size) {
   auto global_lock = global_critical_region_.Acquire();
 
   uint32_t parent_base_address = GetPhysicalAddress(base_address);
-  if (!parent_heap_->Release(parent_base_address, out_region_size)) {
-    REXSYS_ERROR("PhysicalHeap::Release failed due to parent heap failure");
-    return false;
-  }
 
   // Must invalidate here because the range being released may be reused in
   // another mapping of physical memory - but callback flags are set in each
@@ -2052,7 +2048,17 @@ bool PhysicalHeap::Release(uint32_t base_address, uint32_t* out_region_size) {
     TriggerCallbacks(std::move(global_lock), base_address, region_size, true, true);
   }
 
-  return BaseHeap::Release(base_address, out_region_size);
+  // This view first, the parent second: TriggerCallbacks drops the global lock,
+  // and pages the parent has already freed could be pinned by another thread on
+  // top of this view's stale entries.
+  if (!BaseHeap::Release(base_address, nullptr)) {
+    return false;
+  }
+  if (!parent_heap_->Release(parent_base_address, out_region_size)) {
+    REXSYS_ERROR("PhysicalHeap::Release failed due to parent heap failure");
+    return false;
+  }
+  return true;
 }
 
 bool PhysicalHeap::Protect(uint32_t address, uint32_t size, uint32_t protect,

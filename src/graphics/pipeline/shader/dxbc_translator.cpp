@@ -73,6 +73,8 @@ DxbcShaderTranslator::DxbcShaderTranslator(ui::GraphicsProvider::GpuVendorID ven
       emit_source_map_(force_emit_source_map || REXCVAR_GET(dxbc_source_map)) {
   assert_not_zero(draw_resolution_scale_x);
   assert_not_zero(draw_resolution_scale_y);
+  host_scale_quarters_x_ = draw_resolution_scale_x << 2;
+  host_scale_quarters_y_ = draw_resolution_scale_y << 2;
   // Don't allocate again and again for the first shader.
   shader_code_.reserve(8192);
   shader_object_.reserve(16384);
@@ -658,13 +660,13 @@ void DxbcShaderTranslator::StartPixelShader() {
     in_position_used_ |= 0b0011;
     a_.OpRoundNI(dxbc::Dest::R(param_gen_temp, 0b0011), dxbc::Src::V1D(in_reg_ps_position_));
     uint32_t resolution_scaled_axes =
-        uint32_t(draw_resolution_scale_x_ > 1) | (uint32_t(draw_resolution_scale_y_ > 1) << 1);
+        uint32_t(host_scale_quarters_x_ != 4) | (uint32_t(host_scale_quarters_y_ != 4) << 1);
     if (resolution_scaled_axes) {
       // Revert resolution scale - after truncating, so if the pixel position
       // is passed to tfetch (assuming the game doesn't round it by itself),
       // it will be sampled with higher resolution too.
       a_.OpMul(dxbc::Dest::R(param_gen_temp, resolution_scaled_axes), dxbc::Src::R(param_gen_temp),
-               dxbc::Src::LF(1.0f / draw_resolution_scale_x_, 1.0f / draw_resolution_scale_y_, 1.0f,
+               dxbc::Src::LF(4.0f / host_scale_quarters_x_, 4.0f / host_scale_quarters_y_, 1.0f,
                              1.0f));
     }
     if (shader_modification.pixel.param_gen_point) {
@@ -723,8 +725,10 @@ void DxbcShaderTranslator::StartPixelShader() {
         dxbc::Dest::R(system_temp_memexport_enabled_and_eM_written_, 0b0001));
     dxbc::Src memexport_enabled_src(
         dxbc::Src::R(system_temp_memexport_enabled_and_eM_written_, dxbc::Src::kXXXX));
-    uint32_t resolution_scaled_axes =
-        uint32_t(draw_resolution_scale_x_ > 1) | (uint32_t(draw_resolution_scale_y_ > 1) << 1);
+    // Only whole host pixels per guest pixel can be told apart.
+    uint32_t memexport_scale_x = host_scale_quarters_x_ & 3 ? 1 : host_scale_quarters_x_ >> 2;
+    uint32_t memexport_scale_y = host_scale_quarters_y_ & 3 ? 1 : host_scale_quarters_y_ >> 2;
+    uint32_t resolution_scaled_axes = uint32_t(memexport_scale_x > 1) | (uint32_t(memexport_scale_y > 1) << 1);
     if (resolution_scaled_axes) {
       uint32_t memexport_condition_temp = PushSystemTemp();
       // Only do memexport for one host pixel in a guest pixel - prefer the
@@ -737,10 +741,10 @@ void DxbcShaderTranslator::StartPixelShader() {
                 dxbc::Src::V1D(in_reg_ps_position_));
       a_.OpUDiv(dxbc::Dest::Null(), dxbc::Dest::R(memexport_condition_temp, resolution_scaled_axes),
                 dxbc::Src::R(memexport_condition_temp),
-                dxbc::Src::LU(draw_resolution_scale_x_, draw_resolution_scale_y_, 0, 0));
+                dxbc::Src::LU(memexport_scale_x, memexport_scale_y, 0, 0));
       a_.OpIEq(dxbc::Dest::R(memexport_condition_temp, resolution_scaled_axes),
                dxbc::Src::R(memexport_condition_temp),
-               dxbc::Src::LU(draw_resolution_scale_x_ >> 1, draw_resolution_scale_y_ >> 1, 0, 0));
+               dxbc::Src::LU(memexport_scale_x >> 1, memexport_scale_y >> 1, 0, 0));
       for (uint32_t i = 0; i < 2; ++i) {
         if (!(resolution_scaled_axes & (1 << i))) {
           continue;

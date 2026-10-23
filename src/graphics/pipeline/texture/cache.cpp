@@ -79,6 +79,12 @@ REXCVAR_DEFINE_INT32(resolution_scale, 1, "GPU",
     .range(1, 8)
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
+REXCVAR_DEFINE_INT32(internal_render_scale, 100, "GPU",
+                     "Percent of the draw resolution the host render targets are drawn at "
+                     "(100, 75 or 50)")
+    .range(50, 100)
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
 REXCVAR_DEFINE_BOOL(pre_mask_resolve_l2_block, true, "GPU",
                     "Pre-mask scaled resolve L2 blocks to the write range before iterating");
 
@@ -281,6 +287,17 @@ bool TextureCache::GetConfigDrawResolutionScale(uint32_t& x_out, uint32_t& y_out
   return clamped_x == config_x && clamped_y == config_y;
 }
 
+void TextureCache::GetConfigInternalRenderScale(uint32_t& scale_x_inout, uint32_t& scale_y_inout,
+                                                uint32_t& host_quarters_x_out,
+                                                uint32_t& host_quarters_y_out) {
+  int32_t percent = REXCVAR_GET(internal_render_scale);
+  uint32_t quarters_per_scale = percent == 75 ? 3 : (percent == 50 ? 2 : 4);
+  host_quarters_x_out = scale_x_inout * quarters_per_scale;
+  host_quarters_y_out = scale_y_inout * quarters_per_scale;
+  scale_x_inout = (host_quarters_x_out + 3) >> 2;
+  scale_y_inout = (host_quarters_y_out + 3) >> 2;
+}
+
 void TextureCache::ClearCache() {
   DestroyAllTextures();
 }
@@ -308,7 +325,8 @@ void TextureCache::CompletedSubmissionUpdated(uint64_t completed_submission_inde
       break;
     }
     Texture* texture = texture_used_first_;
-    if (texture->last_usage_submission_index() > completed_submission_index) {
+    if (texture->last_usage_submission_index() > completed_submission_index ||
+        texture->holds_deferred_resolve()) {
       break;
     }
     if (!limit_hard_exceeded && (texture->last_usage_time() + limit_soft_lifetime) > current_time) {
@@ -398,6 +416,20 @@ uint32_t TextureCache::GuestToHostSwizzle(uint32_t guest_swizzle, uint32_t host_
   return host_swizzle;
 }
 
+uint32_t TextureCache::SwapRedBlueSwizzle(uint32_t host_swizzle) {
+  uint32_t swapped = 0;
+  for (uint32_t i = 0; i < 4; ++i) {
+    uint32_t component = (host_swizzle >> (3 * i)) & 0b111;
+    if (component == xenos::XE_GPU_TEXTURE_SWIZZLE_R) {
+      component = xenos::XE_GPU_TEXTURE_SWIZZLE_B;
+    } else if (component == xenos::XE_GPU_TEXTURE_SWIZZLE_B) {
+      component = xenos::XE_GPU_TEXTURE_SWIZZLE_R;
+    }
+    swapped |= component << (3 * i);
+  }
+  return swapped;
+}
+
 bool TextureCache::PrepareTextureLoad(Texture& texture, PendingTextureLoad& pending_load_out,
                                       PendingSharedMemoryRange* pending_ranges_out,
                                       size_t& pending_range_count_out) {
@@ -467,6 +499,15 @@ bool TextureCache::CommitPreparedTextureLoad(const PendingTextureLoad& pending_l
     }
   }
 
+  if (texture_key.scaled_resolve && scaled_resolve_read_callback_) {
+    if (pending_load.load_base) {
+      scaled_resolve_read_callback_(texture_key.base_page << 12, texture.GetGuestBaseSize());
+    }
+    if (pending_load.load_mips) {
+      scaled_resolve_read_callback_(texture_key.mip_page << 12, texture.GetGuestMipsSize());
+    }
+  }
+
   // If a replacement was attached, look it up directly from the cache
   // (const pointer — no copy) and upload.
   if (texture.replacement_content_hash_ != 0) {
@@ -506,6 +547,9 @@ bool TextureCache::CommitPreparedTextureLoad(const PendingTextureLoad& pending_l
                                 texture_key.pitch, texture_key.tiled != 0, texture_key.format,
                                 texture_key.endianness, guest_bytes, guest_size);
     }
+  }
+  if (pending_load.load_base) {
+    texture.SetContentRedBlueSwapped(false);
   }
 
   // Mark the ranges as uploaded and watch them. This is needed for scaled
@@ -553,6 +597,8 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
     }
   };
   uint32_t textures_remaining = used_texture_mask & ~texture_bindings_in_sync_;
+  const uint32_t textures_updated = textures_remaining;
+  uint32_t old_host_swizzles[32];
   uint32_t index = 0;
   while (rex::bit_scan_forward(textures_remaining, &index)) {
     uint32_t index_bit = UINT32_C(1) << index;
@@ -570,7 +616,7 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
       binding.Reset();
       continue;
     }
-    uint32_t old_host_swizzle = binding.host_swizzle;
+    old_host_swizzles[index] = binding.host_swizzle;
     binding.host_swizzle = GuestToHostSwizzle(fetch.swizzle, GetHostFormatSwizzle(binding.key));
 
     // Check if need to load the unsigned and the signed versions of the texture
@@ -581,8 +627,7 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
     bool any_sign_was_signed = texture_util::IsAnySignSigned(old_swizzled_signs);
     bool any_sign_is_not_signed = texture_util::IsAnySignNotSigned(binding.swizzled_signs);
     bool any_sign_is_signed = texture_util::IsAnySignSigned(binding.swizzled_signs);
-    if (key_changed || binding.host_swizzle != old_host_swizzle ||
-        any_sign_is_not_signed != any_sign_was_not_signed ||
+    if (key_changed || any_sign_is_not_signed != any_sign_was_not_signed ||
         any_sign_is_signed != any_sign_was_signed) {
       bindings_changed |= index_bit;
     }
@@ -656,9 +701,64 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
       }
     }
   }
+  // Known only after loading: a load gives a texture the memory's component order again.
+  uint32_t swizzles_remaining = textures_updated;
+  while (rex::bit_scan_forward(swizzles_remaining, &index)) {
+    swizzles_remaining &= ~(UINT32_C(1) << index);
+    TextureBinding& binding = texture_bindings_[index];
+    if (!binding.key.is_valid) {
+      continue;
+    }
+    if (binding.texture && binding.texture->content_red_blue_swapped()) {
+      binding.host_swizzle = SwapRedBlueSwizzle(binding.host_swizzle);
+    }
+    if (binding.host_swizzle != old_host_swizzles[index]) {
+      bindings_changed |= UINT32_C(1) << index;
+    }
+  }
   if (bindings_changed) {
     UpdateTextureBindingsImpl(bindings_changed);
   }
+}
+
+uint32_t TextureCache::FindResolveCopyTargets(const draw_util::ResolveTextureCopy& copy,
+                                              Texture** targets_out, uint32_t max_targets) {
+  uint32_t dest_page = (copy.dest_base & 0x1FFFFFFF) >> 12;
+  if (!dest_page) {
+    return 0;
+  }
+  bool scaled = IsDrawResolutionScaled();
+  uint32_t count = 0;
+  for (const auto& [key, texture_ptr] : textures_) {
+    if (count >= max_targets) {
+      break;
+    }
+    if (key.base_page != dest_page || key.format != copy.format ||
+        key.endianness != copy.endian || !key.tiled ||
+        key.dimension != xenos::DataDimension::k2DOrStacked || key.depth_or_array_size_minus_1 ||
+        key.mip_max_level || key.signed_separate || bool(key.scaled_resolve) != scaled ||
+        (uint32_t(key.pitch) << xenos::kTextureTileWidthHeightLog2) != copy.dest_pitch_texels ||
+        key.GetWidth() > copy.width || key.GetHeight() > copy.height ||
+        key.GetWidth() * draw_resolution_scale_x() <= copy.fill_x ||
+        key.GetHeight() * draw_resolution_scale_y() <= copy.fill_y ||
+        IsSignedVersionSeparateForFormat(key)) {
+      continue;
+    }
+    Texture& texture = *texture_ptr;
+    // Up to date, so watched, and the base level isn't in a packed mip tail.
+    if (texture.outdated_mask() || texture.GetGuestMipsSize() ||
+        !texture.guest_layout().packed_level) {
+      continue;
+    }
+    targets_out[count++] = &texture;
+  }
+  return count;
+}
+
+void TextureCache::EndResolveCopyIntoTexture(Texture& texture, bool red_blue_swapped) {
+  texture.SetContentRedBlueSwapped(red_blue_swapped);
+  texture.MarkAsUsed();
+  texture.MakeUpToDateAndWatch(global_critical_region_.Acquire());
 }
 
 const char* TextureCache::TextureKey::GetLogDimensionName(xenos::DataDimension dimension) {

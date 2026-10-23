@@ -167,8 +167,22 @@ void GetHostViewportInfo(const RegisterFile& regs, uint32_t draw_resolution_scal
                          reg::RB_DEPTHCONTROL normalized_depth_control, bool convert_z_to_float24,
                          bool full_float24_in_0_to_1, bool pixel_shader_writes_depth,
                          ViewportInfo& viewport_info_out) {
-  assert_not_zero(draw_resolution_scale_x);
-  assert_not_zero(draw_resolution_scale_y);
+  GetHostViewportInfoAtHostScale(regs, draw_resolution_scale_x << 2, draw_resolution_scale_y << 2,
+                                 origin_bottom_left, x_max, y_max, allow_reverse_z,
+                                 normalized_depth_control, convert_z_to_float24,
+                                 full_float24_in_0_to_1, pixel_shader_writes_depth,
+                                 viewport_info_out);
+}
+
+void GetHostViewportInfoAtHostScale(const RegisterFile& regs, uint32_t host_scale_quarters_x,
+                                    uint32_t host_scale_quarters_y, bool origin_bottom_left,
+                                    uint32_t x_max, uint32_t y_max, bool allow_reverse_z,
+                                    reg::RB_DEPTHCONTROL normalized_depth_control,
+                                    bool convert_z_to_float24, bool full_float24_in_0_to_1,
+                                    bool pixel_shader_writes_depth,
+                                    ViewportInfo& viewport_info_out) {
+  assert_not_zero(host_scale_quarters_x);
+  assert_not_zero(host_scale_quarters_y);
 
   // A vertex position goes the following path:
   //
@@ -329,7 +343,9 @@ void GetHostViewportInfo(const RegisterFile& regs, uint32_t draw_resolution_scal
 
   // The maximum value is at least the maximum host render target size anyway -
   // and a guest pixel is always treated as a whole with resolution scaling.
-  uint32_t xy_max_unscaled[] = {x_max / draw_resolution_scale_x, y_max / draw_resolution_scale_y};
+  uint32_t host_scale_quarters[] = {host_scale_quarters_x, host_scale_quarters_y};
+  uint32_t xy_max_unscaled[] = {(x_max << 2) / host_scale_quarters_x,
+                                (y_max << 2) / host_scale_quarters_y};
   assert_not_zero(xy_max_unscaled[0]);
   assert_not_zero(xy_max_unscaled[1]);
 
@@ -347,8 +363,10 @@ void GetHostViewportInfo(const RegisterFile& regs, uint32_t draw_resolution_scal
       viewport_info_out.xy_offset[i] = 0;
       uint32_t extent_axis_unscaled =
           std::min(xenos::kTexture2DCubeMaxWidthHeight, xy_max_unscaled[i]);
-      viewport_info_out.xy_extent[i] =
-          extent_axis_unscaled * (i ? draw_resolution_scale_y : draw_resolution_scale_x);
+      if (host_scale_quarters[i] & 3) {
+        extent_axis_unscaled &= ~uint32_t(3);
+      }
+      viewport_info_out.xy_extent[i] = (extent_axis_unscaled * host_scale_quarters[i]) >> 2;
       float extent_axis_unscaled_float = float(extent_axis_unscaled);
       float pixels_to_ndc_axis = 2.0f / extent_axis_unscaled_float;
       ndc_scale[i] = scale_xy[i] * pixels_to_ndc_axis;
@@ -373,7 +391,7 @@ void GetHostViewportInfo(const RegisterFile& regs, uint32_t draw_resolution_scal
       // vertices if we did flooring in host pixels. Instead of flooring, also
       // doing truncation for simplicity - since maxing with 0 is done anyway
       // (we only return viewports in the positive quarter-plane).
-      uint32_t axis_resolution_scale = i ? draw_resolution_scale_y : draw_resolution_scale_x;
+      uint32_t axis_scale_quarters = host_scale_quarters[i];
       float offset_axis = offset_base_xy[i] + offset_add_xy[i];
       float scale_axis = scale_xy[i];
       float scale_axis_abs = std::abs(scale_xy[i]);
@@ -383,11 +401,25 @@ void GetHostViewportInfo(const RegisterFile& regs, uint32_t draw_resolution_scal
       uint32_t axis_1_int =
           uint32_t(rex::clamp_float(offset_axis + scale_axis_abs, 0.0f, axis_max_unscaled_float));
       uint32_t axis_extent_int = axis_1_int - axis_0_int;
-      viewport_info_out.xy_offset[i] = axis_0_int * axis_resolution_scale;
-      viewport_info_out.xy_extent[i] = axis_extent_int * axis_resolution_scale;
+      // The guest pixel bounds the host viewport actually covers.
+      float axis_0_snapped = float(axis_0_int);
+      float axis_extent_snapped = float(axis_extent_int);
+      if (axis_scale_quarters & 3) {
+        // Outward, so a fractional host pixel is never left uncovered.
+        uint32_t axis_0_host = (axis_0_int * axis_scale_quarters) >> 2;
+        uint32_t axis_1_host = (axis_1_int * axis_scale_quarters + 3) >> 2;
+        viewport_info_out.xy_offset[i] = axis_0_host;
+        viewport_info_out.xy_extent[i] = axis_1_host - axis_0_host;
+        axis_0_snapped = float(axis_0_host) * 4.0f / float(axis_scale_quarters);
+        axis_extent_snapped =
+            float(axis_1_host - axis_0_host) * 4.0f / float(axis_scale_quarters);
+      } else {
+        viewport_info_out.xy_offset[i] = axis_0_int * (axis_scale_quarters >> 2);
+        viewport_info_out.xy_extent[i] = axis_extent_int * (axis_scale_quarters >> 2);
+      }
       float ndc_scale_axis;
       float ndc_offset_axis;
-      if (axis_extent_int) {
+      if (viewport_info_out.xy_extent[i]) {
         // Rescale from the old bounds to the new ones, and also apply the sign.
         // If the new bounds are smaller than the old, for instance, we're
         // cropping - the new -W...W clip space is a subregion of the old one -
@@ -395,10 +427,10 @@ void GetHostViewportInfo(const RegisterFile& regs, uint32_t draw_resolution_scal
         // -W...W. If the new region should include more than the original clip
         // space, a region previously outside -W...W should end up within it, so
         // the scale should be < 1.
-        float axis_extent_rounded = float(axis_extent_int);
+        float axis_extent_rounded = axis_extent_snapped;
         ndc_scale_axis = scale_axis * 2.0f / axis_extent_rounded;
         // Move the origin of the snapped coordinates back to the original one.
-        ndc_offset_axis = (float(offset_axis) - (float(axis_0_int) + axis_extent_rounded * 0.5f)) *
+        ndc_offset_axis = (float(offset_axis) - (axis_0_snapped + axis_extent_rounded * 0.5f)) *
                           2.0f / axis_extent_rounded;
       } else {
         // Empty viewport (everything outside the viewport scissor).
@@ -527,6 +559,17 @@ void GetHostViewportInfo(const RegisterFile& regs, uint32_t draw_resolution_scal
   for (uint32_t i = 0; i < 3; ++i) {
     viewport_info_out.ndc_scale[i] = ndc_scale[i];
     viewport_info_out.ndc_offset[i] = ndc_offset[i];
+  }
+}
+
+void ScaleScissorToHost(Scissor& scissor, uint32_t host_scale_quarters_x,
+                        uint32_t host_scale_quarters_y) {
+  uint32_t host_scale_quarters[] = {host_scale_quarters_x, host_scale_quarters_y};
+  for (uint32_t i = 0; i < 2; ++i) {
+    uint32_t start = (scissor.offset[i] * host_scale_quarters[i]) >> 2;
+    uint32_t end = ((scissor.offset[i] + scissor.extent[i]) * host_scale_quarters[i] + 3) >> 2;
+    scissor.offset[i] = start;
+    scissor.extent[i] = end - start;
   }
 }
 

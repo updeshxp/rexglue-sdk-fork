@@ -10,6 +10,7 @@
  */
 
 #include <algorithm>
+#include <bitset>
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
@@ -24,6 +25,7 @@
 #include <rex/graphics/command_processor.h>
 #include <rex/graphics/flags.h>
 #include <rex/graphics/graphics_system.h>
+#include <rex/graphics/guest_wake.h>
 #include <rex/graphics/pipeline/texture/info.h>
 #include <rex/graphics/sampler_info.h>
 #include <rex/graphics/xenos.h>
@@ -37,9 +39,11 @@
 
 REXCVAR_DEFINE_BOOL(vsync, true, "GPU", "Enable vertical sync");
 
-REXCVAR_DEFINE_BOOL(clear_memory_page_state, true, "GPU",
+// Write watches already invalidate the pages the guest changes; clearing the state at every frame
+// end re-uploads every buffer in the next frame, each upload being a barrier between draws.
+REXCVAR_DEFINE_BOOL(clear_memory_page_state, false, "GPU",
                     "Refresh page-valid state from GPU-written memory at frame end. "
-                    "Disable for minor CPU overhead reduction, but may break memory coherency.")
+                    "Guards against a missed invalidation, but re-uploads every buffer each frame.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_BOOL(occlusion_query_enable, true, "GPU", "Enable host occlusion query handling")
@@ -97,6 +101,42 @@ ReadbackResolveMode ParseReadbackResolveMode(std::string_view value) {
     return ReadbackResolveMode::kFull;
   }
   return ReadbackResolveMode::kDisabled;
+}
+
+// A table instead of RegisterFile::GetRegisterInfo's switch: WriteRegister
+// checks this on every register write.
+std::bitset<RegisterFile::kRegisterCount> BuildKnownRegisterSet() {
+  std::bitset<RegisterFile::kRegisterCount> known;
+#define XE_GPU_REGISTER(index, type, name) known.set(index);
+#include <rex/graphics/register_table.inc>
+#undef XE_GPU_REGISTER
+  return known;
+}
+
+const std::bitset<RegisterFile::kRegisterCount> kKnownRegisters = BuildKnownRegisterSet();
+
+// Render-state registers: no write side effects in any backend.
+bool IsContextRegisterRange(uint32_t first_index, uint32_t last_index) {
+  constexpr uint32_t kFirstContextRegister = 0x2000;
+  return first_index >= kFirstContextRegister && last_index < XE_GPU_REG_SHADER_CONSTANT_000_X;
+}
+
+// Runs of these only store values (the backends invalidate constant buffers
+// for the constant spans), so they can be copied as a block. Shorter runs are
+// cheaper one register at a time.
+bool IsBulkWritableRegisterRange(uint32_t first_index, uint32_t count) {
+  constexpr uint32_t kMinBulkRegisterCount = 3;
+  if (count < kMinBulkRegisterCount) {
+    return false;
+  }
+  uint32_t last_index = first_index + count - 1;
+  return IsContextRegisterRange(first_index, last_index) ||
+         (first_index >= XE_GPU_REG_SHADER_CONSTANT_000_X &&
+          last_index <= XE_GPU_REG_SHADER_CONSTANT_511_W) ||
+         (first_index >= XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 &&
+          last_index <= XE_GPU_REG_SHADER_CONSTANT_FETCH_31_5) ||
+         (first_index >= XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031 &&
+          last_index <= XE_GPU_REG_SHADER_CONSTANT_LOOP_31);
 }
 
 }  // namespace
@@ -214,21 +254,27 @@ void CommandProcessor::WorkerThreadMain() {
     if (write_ptr_index == 0xBAADF00D || read_ptr_index_ == write_ptr_index) {
       SCOPE_profile_cpu_i("gpu", "rex::graphics::CommandProcessor::Stall");
       // We've run out of commands to execute.
-      // We spin here waiting for new ones, as the overhead of waiting on our
-      // event is too high.
+      // A short yield burst catches back-to-back submissions, then sleep on the write pointer
+      // event so the core is free for the guest threads feeding the ring.
+      constexpr uint32_t kIdleYieldCount = 32;
       PrepareForWait();
+      bool poll_background_work = PollBackgroundWork();
       uint32_t loop_count = 0;
       do {
-        // If we spin around too much, revert to a "low-power" state.
-        if (loop_count > 500) {
-          const int wait_time_ms = 5;
-          rex::thread::Wait(write_ptr_index_event_.get(), true,
-                            std::chrono::milliseconds(wait_time_ms));
+        if (loop_count < kIdleYieldCount) {
+          rex::thread::MaybeYield();
+          loop_count++;
+        } else {
+          // Background work needs timely polling; thread calls posted without a write pointer
+          // update are only noticed when the wait times out. Not alertable: this thread has no
+          // APCs, and an alertable wait is polled in 1 ms slices on POSIX.
+          rex::thread::Wait(write_ptr_index_event_.get(), false,
+                            std::chrono::milliseconds(poll_background_work ? 1 : 5));
         }
-
-        rex::thread::MaybeYield();
-        loop_count++;
         write_ptr_index = write_ptr_index_.load();
+        if (poll_background_work) {
+          poll_background_work = PollBackgroundWork();
+        }
       } while (worker_running_ && pending_fns_.empty() &&
                (write_ptr_index == 0xBAADF00D || read_ptr_index_ == write_ptr_index));
       ReturnFromWait();
@@ -355,7 +401,7 @@ void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
 
   // Volatile for the WAIT_REG_MEM loop.
   const_cast<volatile uint32_t&>(regs.values[index]) = value;
-  if (!regs.GetRegisterInfo(index)) {
+  if (!kKnownRegisters[index]) {
     REXGPU_DEBUG("GPU: Write to unknown register ({:04X} = {:08X})", index, value);
   }
 
@@ -493,6 +539,10 @@ void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
 
 void CommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_t* base,
                                              uint32_t num_registers) {
+  if (num_registers && IsContextRegisterRange(start_index, start_index + num_registers - 1)) {
+    memory::copy_and_swap(register_file_->values + start_index, base, num_registers);
+    return;
+  }
   for (uint32_t i = 0; i < num_registers; ++i) {
     uint32_t data = memory::load_and_swap<uint32_t>(base + i);
     WriteRegister(start_index + i, data);
@@ -702,6 +752,10 @@ bool CommandProcessor::ExecutePacketType0(memory::RingBuffer* reader, uint32_t p
 
   uint32_t base_index = (packet & 0x7FFF);
   uint32_t write_one_reg = (packet >> 15) & 0x1;
+  if (!write_one_reg && IsBulkWritableRegisterRange(base_index, count)) {
+    WriteRegisterRangeFromRing(reader, base_index, count);
+    return true;
+  }
   for (uint32_t m = 0; m < count; m++) {
     uint32_t reg_data = reader->ReadAndSwap<uint32_t>();
     uint32_t target_index = write_one_reg ? base_index : base_index + m;
@@ -995,6 +1049,10 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
 
   bool is_memory = (wait_info & 0x10) != 0;
 
+  // The guest wait value is a poll interval hint, so re-poll quickly before sleeping and never
+  // sleep longer than 1 ms, not to delay the ring after the condition has already been met.
+  constexpr uint32_t kYieldPollCount = 16;
+  uint32_t unmatched_poll_count = 0;
   bool matched = false;
   do {
     uint32_t value = 0;
@@ -1036,14 +1094,17 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
         break;
     }
     if (!matched) {
+      PollBackgroundWork();
       // Wait.
       if (wait >= 0x100) {
         PrepareForWait();
-        if (!REXCVAR_GET(vsync)) {
-          // User wants it fast and dangerous.
+        if (unmatched_poll_count < kYieldPollCount || !REXCVAR_GET(vsync)) {
+          // Without vsync the user wants it fast and dangerous.
           rex::thread::MaybeYield();
+          ++unmatched_poll_count;
         } else {
-          rex::thread::Sleep(std::chrono::milliseconds(wait / 0x100));
+          // A notification set after the value above was read is still pending, so it isn't lost.
+          rex::thread::Wait(guest_progress_event_.get(), false, std::chrono::milliseconds(1));
         }
         rex::thread::SyncMemory();
         ReturnFromWait();
@@ -1101,6 +1162,7 @@ bool CommandProcessor::ExecutePacketType3_REG_TO_MEM(memory::RingBuffer* reader,
   mem_addr &= ~0x3;
   reg_val = GpuSwap(reg_val, endianness);
   memory::store(memory_->TranslatePhysical(mem_addr), reg_val);
+  WakeGuestWordWaiters(memory_->TranslatePhysical(mem_addr));
 
   return true;
 }
@@ -1115,6 +1177,7 @@ bool CommandProcessor::ExecutePacketType3_MEM_WRITE(memory::RingBuffer* reader, 
     auto addr = write_addr & ~0x3;
     write_data = GpuSwap(write_data, endianness);
     memory::store(memory_->TranslatePhysical(addr), write_data);
+    WakeGuestWordWaiters(memory_->TranslatePhysical(addr));
     write_addr += 4;
   }
 
@@ -1176,6 +1239,7 @@ bool CommandProcessor::ExecutePacketType3_COND_WRITE(memory::RingBuffer* reader,
       write_reg_addr &= ~0x3;
       write_data = GpuSwap(write_data, endianness);
       memory::store(memory_->TranslatePhysical(write_reg_addr), write_data);
+      WakeGuestWordWaiters(memory_->TranslatePhysical(write_reg_addr));
     } else {
       // Register.
       WriteRegister(write_reg_addr, write_data);
@@ -1221,6 +1285,7 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_SHD(memory::RingBuffer* re
   address &= ~0x3;
   data_value = GpuSwap(data_value, endianness);
   memory::store(memory_->TranslatePhysical(address), data_value);
+  WakeGuestWordWaiters(memory_->TranslatePhysical(address));
   return true;
 }
 

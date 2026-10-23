@@ -22,6 +22,7 @@
 
 #include <rex/assert.h>
 #include <rex/graphics/pipeline/shader/shader.h>
+#include <rex/graphics/pipeline/texture/cache.h>
 #include <rex/graphics/register_file.h>
 #include <rex/graphics/registers.h>
 #include <rex/graphics/util/draw.h>
@@ -164,12 +165,39 @@ class RenderTargetCache {
     return draw_resolution_scale_x() > 1 || draw_resolution_scale_y() > 1;
   }
 
+  // The host render targets are drawn at host_scale_quarters / 4 of the guest size, at most the
+  // draw resolution scale, which the EDRAM, the resolves and the textures keep.
+  uint32_t host_scale_quarters_x() const { return host_scale_quarters_x_; }
+  uint32_t host_scale_quarters_y() const { return host_scale_quarters_y_; }
+  bool AreHostRenderTargetsReduced() const {
+    return host_scale_quarters_x_ != (draw_resolution_scale_x_ << 2) ||
+           host_scale_quarters_y_ != (draw_resolution_scale_y_ << 2);
+  }
+  // Exact for the pixel counts of the tile and resolve granularity.
+  uint32_t GuestToHostX(uint32_t pixels) const { return (pixels * host_scale_quarters_x_) >> 2; }
+  uint32_t GuestToHostY(uint32_t pixels) const { return (pixels * host_scale_quarters_y_) >> 2; }
+  // Before Initialize.
+  void SetHostScaleQuarters(uint32_t x, uint32_t y) {
+    host_scale_quarters_x_ = x;
+    host_scale_quarters_y_ = y;
+  }
+
   // Virtual (both the common code and the implementation may do something
   // here), don't call from destructors (does work not needed for shutdown
   // also).
   virtual void ClearCache();
 
   virtual void BeginFrame();
+
+  // Resolves with deferred memory writes (resolve_defer_writeback, see DeferredResolve). Readback
+  // needs the resolved memory right away.
+  void SetResolveWritebackDeferralAllowed(bool allowed) {
+    resolve_writeback_deferral_allowed_ = allowed;
+  }
+  // Writes the memory of the deferred resolves overlapping the guest range.
+  void MaterializeDeferredResolves(uint32_t start, uint32_t length);
+  // At the beginning of a frame: writes the memory of those not repeated in the previous frame.
+  void MaterializeStaleDeferredResolves();
 
   virtual bool Update(bool is_rasterization_done, reg::RB_DEPTHCONTROL normalized_depth_control,
                       uint32_t normalized_color_mask, const Shader& vertex_shader);
@@ -186,12 +214,15 @@ class RenderTargetCache {
       : register_file_(register_file),
         draw_extent_estimator_(register_file, memory),
         draw_resolution_scale_x_(draw_resolution_scale_x),
-        draw_resolution_scale_y_(draw_resolution_scale_y) {
+        draw_resolution_scale_y_(draw_resolution_scale_y),
+        host_scale_quarters_x_(draw_resolution_scale_x << 2),
+        host_scale_quarters_y_(draw_resolution_scale_y << 2) {
     assert_not_zero(draw_resolution_scale_x);
     assert_not_zero(draw_resolution_scale_y);
   }
 
   const RegisterFile& register_file() const { return register_file_; }
+  DrawExtentEstimator& draw_extent_estimator() { return draw_extent_estimator_; }
 
   virtual bool IsGammaFormatHostStorageSeparate() const = 0;
 
@@ -496,6 +527,26 @@ class RenderTargetCache {
     assert_true(GetPath() == Path::kHostRenderTargets);
     return last_update_transfers_;
   }
+  // Tiles (wrapping around the EDRAM) in which the contents of the owning host render target may
+  // differ from what the EDRAM buffer last received from it: set when the owner changes or may
+  // write, cleared by dumping the tile.
+  void SetEdramTilesDirty(uint32_t start_tiles, uint32_t length_tiles, bool dirty);
+  bool IsEdramTileDirty(uint32_t tile) const {
+    return (edram_dirty_tiles_[(tile & (xenos::kEdramTileCount - 1)) >> 6] >> (tile & 63)) & 1;
+  }
+  // The EDRAM tiles [start, start + length), wrapping around the EDRAM, that the render target
+  // in the slot may be drawn to: what the last update claimed, or all of them if the slot has
+  // a render target the update didn't use.
+  void GetLastUpdateUsedTiles(uint32_t slot, uint32_t& start_tiles_out,
+                              uint32_t& length_tiles_out) const {
+    if (last_update_used_render_targets_[slot] != last_update_accumulated_render_targets_[slot]) {
+      start_tiles_out = 0;
+      length_tiles_out = xenos::kEdramTileCount;
+      return;
+    }
+    start_tiles_out = last_update_used_start_tiles_[slot];
+    length_tiles_out = last_update_used_length_tiles_[slot];
+  }
 
   HostDepthStoreRenderTargetConstant GetHostDepthStoreRenderTargetConstant(
       uint32_t pitch_tiles, bool msaa_2x_supported) const {
@@ -527,6 +578,65 @@ class RenderTargetCache {
                                       std::vector<ResolveCopyDumpRectangle>& rectangles_out,
                                       std::vector<ResolveCopyDispatch>& dispatches_out) const;
 
+  enum class ResolveTextureCopyResult {
+    kEligible,
+    kDisabled,
+    kDepth,
+    kMsaa,
+    kFormat,
+    kOffset,
+    // The host render target owning the resolved tiles doesn't start at the resolve origin, or
+    // the tiles have several owners.
+    kAliasing,
+  };
+  // For a resolve with host render targets, whether textures sampling its destination can be
+  // copied from the one render target owning the resolved area (resolve_copy_into_textures).
+  ResolveTextureCopyResult PlanResolveTextureCopy(const draw_util::ResolveInfo& resolve_info,
+                                                  draw_util::ResolveTextureCopy& copy_out,
+                                                  RenderTarget*& source_out);
+
+  // A resolve copied into the one texture sampling exactly its rectangle may leave the memory
+  // unwritten while only that texture uses it (resolve_defer_writeback). The memory is written,
+  // from the texture through the EDRAM like the resolve would have, before anything reads or partly
+  // overwrites it, or when the resolve isn't repeated the next frame.
+  struct DeferredResolve {
+    uint32_t extent_start;
+    uint32_t extent_length;
+    uint32_t dest_base;
+    draw_util::ResolveCopyShaderIndex copy_shader;
+    draw_util::ResolveCopyShaderConstants copy_constants;
+    uint32_t group_count_x;
+    uint32_t group_count_y;
+    uint32_t dump_base;
+    uint32_t dump_row_length_used;
+    uint32_t dump_rows;
+    uint32_t dump_pitch;
+    RenderTargetKey source_key;
+    TextureCache::DeferredResolveTexture texture;
+    uint64_t frame;
+
+    bool WritesSameAs(const DeferredResolve& other) const {
+      return extent_start == other.extent_start && extent_length == other.extent_length &&
+             dest_base == other.dest_base && copy_shader == other.copy_shader && group_count_x == other.group_count_x &&
+             group_count_y == other.group_count_y &&
+             !std::memcmp(&copy_constants, &other.copy_constants, sizeof(copy_constants));
+    }
+  };
+  static DeferredResolve GetResolveWrites(const draw_util::ResolveInfo& resolve_info,
+                                          draw_util::ResolveCopyShaderIndex copy_shader,
+                                          const draw_util::ResolveCopyShaderConstants& constants,
+                                          uint32_t group_count_x, uint32_t group_count_y);
+  bool CanDeferResolveWriteback(const draw_util::ResolveTextureCopy& copy,
+                                const TextureCache& texture_cache,
+                                TextureCache::DeferredResolveTexture texture) const;
+  // Before a resolve writes its range: deferred resolves writing the same bytes are dropped, others
+  // overlapping it written.
+  void PrepareResolveDestination(const DeferredResolve& writes);
+  void AddDeferredResolve(const DeferredResolve& resolve, TextureCache& texture_cache);
+  // Writes the memory of one deferred resolve from its texture.
+  virtual bool MaterializeDeferredResolve(const DeferredResolve&) { return false; }
+  TextureCache& deferred_resolve_texture_cache() const { return *deferred_resolve_texture_cache_; }
+
   // Sets up the needed render targets and transfers to perform a clear in a
   // resolve operation via a host render target clear. resolve_info is expected
   // to be obtained via draw_util::GetResolveInfo. Returns whether any clears
@@ -540,6 +650,17 @@ class RenderTargetCache {
                                             RenderTarget*& color_render_target_out,
                                             std::vector<Transfer>& color_transfers_out);
 
+  // For a rectangle list draw that replaces what it writes, returns the render targets (bit 0
+  // depth, 1... color) fully overwritten inside rectangle_out, where transferring their previous
+  // contents is pointless. The rectangle is in pixels, inside what the draw covers at any
+  // resolution scale and sample count. Bit 0 requires the stencil to be replaced too; if only the
+  // depth is, depth_only_out is set instead.
+  uint32_t GetDrawOverwrittenRenderTargets(reg::RB_DEPTHCONTROL normalized_depth_control,
+                                           uint32_t normalized_color_mask,
+                                           const Shader& vertex_shader, const Shader* pixel_shader,
+                                           Transfer::Rectangle& rectangle_out,
+                                           bool& depth_only_out);
+
   // For pixel shader interlock.
 
   virtual void RequestPixelShaderInterlockBarrier() {}
@@ -552,6 +673,15 @@ class RenderTargetCache {
   const RegisterFile& register_file_;
   uint32_t draw_resolution_scale_x_;
   uint32_t draw_resolution_scale_y_;
+  uint32_t host_scale_quarters_x_;
+  uint32_t host_scale_quarters_y_;
+
+  std::vector<ResolveCopyDumpRectangle> resolve_texture_copy_rectangles_;
+
+  std::vector<DeferredResolve> deferred_resolves_;
+  TextureCache* deferred_resolve_texture_cache_ = nullptr;
+  uint64_t deferred_resolve_frame_ = 0;
+  bool resolve_writeback_deferral_allowed_ = false;
 
   DrawExtentEstimator draw_extent_estimator_;
 
@@ -649,6 +779,8 @@ class RenderTargetCache {
                        uint32_t length_tiles, std::vector<Transfer>* transfers_append_out,
                        const Transfer::Rectangle* resolve_clear_cutout = nullptr);
 
+  uint64_t edram_dirty_tiles_[xenos::kEdramTileCount / 64];
+
   // If failed to create, may contain nullptr to prevent attempting to create a
   // render target twice.
   std::unordered_map<RenderTargetKey, RenderTarget*, RenderTargetKey::Hasher> render_targets_;
@@ -665,6 +797,9 @@ class RenderTargetCache {
   // update. 0 is depth, color starting from 1, nullptr if not bound.
   // Only valid for non-pixel-shader-interlock paths.
   RenderTarget* last_update_used_render_targets_[1 + xenos::kMaxColorRenderTargets];
+  // The EDRAM tiles they were given ownership of.
+  uint32_t last_update_used_start_tiles_[1 + xenos::kMaxColorRenderTargets];
+  uint32_t last_update_used_length_tiles_[1 + xenos::kMaxColorRenderTargets];
   // Render targets used by the draw call with the last successful update or
   // previous updates, unless a different or a totally new one was bound (or
   // surface info was changed), to avoid unneeded render target switching (which

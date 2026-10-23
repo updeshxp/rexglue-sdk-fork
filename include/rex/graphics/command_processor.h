@@ -90,6 +90,9 @@ class CommandProcessor {
 
   uint32_t counter() const { return counter_; }
   void increment_counter() { counter_++; }
+  // Guest CPU code may have changed memory a WAIT_REG_MEM polls (the vblank interrupt completes
+  // flips that the GPU waits for).
+  void NotifyGuestProgress() { guest_progress_event_->Set(); }
 
   // Number of guest swaps (PM4 XE_SWAP packets) actually executed by the
   // command processor, i.e. real presents. Unlike counter_ this is not also
@@ -403,6 +406,8 @@ class CommandProcessor {
   virtual void MakeCoherent();
   virtual void PrepareForWait();
   virtual void ReturnFromWait();
+  // Called while the command processor waits; returns whether it needs to be polled again soon.
+  virtual bool PollBackgroundWork() { return false; }
 
   uint32_t ExecutePrimaryBuffer(uint32_t start_index, uint32_t end_index);
   virtual void OnPrimaryBufferEnd() {}
@@ -472,6 +477,8 @@ class CommandProcessor {
 
   std::atomic<bool> worker_running_;
   system::object_ref<system::XHostThread> worker_thread_;
+  std::unique_ptr<rex::thread::Event> guest_progress_event_ =
+      rex::thread::Event::CreateAutoResetEvent(false);
 
   std::queue<std::function<void()>> pending_fns_;
 

@@ -28,10 +28,34 @@ class DrawExtentEstimator {
         shader_interpreter_(register_file, memory) {}
 
   // The shader must have its ucode analyzed.
-  uint32_t EstimateVertexMaxY(const Shader& vertex_shader);
-  uint32_t EstimateMaxY(bool try_to_estimate_vertex_max_y, const Shader& vertex_shader);
+  // min_y_out, if given, receives a row no lower than the first one the draw can touch (0 if
+  // that isn't known).
+  uint32_t EstimateVertexMaxY(const Shader& vertex_shader, uint32_t* min_y_out = nullptr);
+  uint32_t EstimateMaxY(bool try_to_estimate_vertex_max_y, const Shader& vertex_shader,
+                        uint32_t* min_y_out = nullptr);
+
+  // The positions (x, y, z, w) exported for vertices 0... of an auto-indexed draw, by running the
+  // vertex shader on the CPU. False if they can't be known exactly: the shader can't be
+  // interpreted, or a vertex is killed or doesn't export a whole position.
+  bool GetAutoIndexedVertexPositions(const Shader& vertex_shader, uint32_t vertex_count,
+                                     float (*positions_out)[4]);
 
  private:
+  class PositionExportSink : public ShaderInterpreter::ExportSink {
+   public:
+    void Export(ucode::ExportRegister export_register, const float* value,
+                uint32_t value_mask) override;
+
+    void Reset() {
+      position_mask = 0;
+      vertex_kill = 0;
+    }
+
+    float position[4] = {};
+    uint32_t position_mask = 0;
+    uint32_t vertex_kill = 0;
+  };
+
   class PositionYExportSink : public ShaderInterpreter::ExportSink {
    public:
     void Export(ucode::ExportRegister export_register, const float* value,

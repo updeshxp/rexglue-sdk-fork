@@ -2898,8 +2898,10 @@ void SpirvShaderTranslator::StartFragmentShaderBeforeMain() {
   // TODO(Triang3l): More conditions - alpha to coverage (if RT 0 is written,
   // and there's no early depth / stencil), depth writing in the fragment shader
   // (per-sample if supported).
-  bool memexport_resolution_scaled = current_shader().memexport_eM_written() &&
-                                     (draw_resolution_scale_x_ > 1 || draw_resolution_scale_y_ > 1);
+  uint32_t memexport_scale_x = host_scale_quarters_x_ & 3 ? 1 : host_scale_quarters_x_ >> 2;
+  uint32_t memexport_scale_y = host_scale_quarters_y_ & 3 ? 1 : host_scale_quarters_y_ >> 2;
+  bool memexport_resolution_scaled =
+      current_shader().memexport_eM_written() && (memexport_scale_x > 1 || memexport_scale_y > 1);
   if (edram_fragment_shader_interlock_ || param_gen_needed || memexport_resolution_scaled ||
       float24_depth_from_fragment_coordinates || alpha_to_coverage_possible) {
     input_fragment_coordinates_ = builder_->createVariable(spv::NoPrecision, spv::StorageClassInput,
@@ -3097,8 +3099,10 @@ void SpirvShaderTranslator::StartFragmentShaderInMain() {
 
   if (current_shader().memexport_eM_written()) {
     // Make sure memexport is done only once for a guest pixel.
+    uint32_t memexport_scale_x = host_scale_quarters_x_ & 3 ? 1 : host_scale_quarters_x_ >> 2;
+    uint32_t memexport_scale_y = host_scale_quarters_y_ & 3 ? 1 : host_scale_quarters_y_ >> 2;
     uint32_t resolution_scaled_axes =
-        uint32_t(draw_resolution_scale_x_ > 1) | (uint32_t(draw_resolution_scale_y_ > 1) << 1);
+        uint32_t(memexport_scale_x > 1) | (uint32_t(memexport_scale_y > 1) << 1);
     if (resolution_scaled_axes) {
       assert_true(input_fragment_coordinates_ != spv::NoResult);
       spv::Id memexport_allowed = spv::NoResult;
@@ -3115,11 +3119,11 @@ void SpirvShaderTranslator::StartFragmentShaderInMain() {
         spv::Id position_mod = builder_->createBinOp(
             spv::OpUMod, type_uint_,
             builder_->createUnaryOp(spv::OpConvertFToU, type_uint_, position),
-            builder_->makeUintConstant(i ? draw_resolution_scale_y_ : draw_resolution_scale_x_));
+            builder_->makeUintConstant(i ? memexport_scale_y : memexport_scale_x));
         spv::Id position_is_center =
             builder_->createBinOp(spv::OpIEqual, type_bool_, position_mod,
-                                  builder_->makeUintConstant(i ? (draw_resolution_scale_y_ >> 1)
-                                                               : (draw_resolution_scale_x_ >> 1)));
+                                  builder_->makeUintConstant(i ? (memexport_scale_y >> 1)
+                                                               : (memexport_scale_x >> 1)));
         memexport_allowed = memexport_allowed != spv::NoResult
                                 ? builder_->createBinOp(spv::OpLogicalAnd, type_bool_,
                                                         memexport_allowed, position_is_center)
@@ -3210,10 +3214,10 @@ void SpirvShaderTranslator::StartFragmentShaderInMain() {
             builder_->createAccessChain(spv::StorageClassInput, input_fragment_coordinates_,
                                         id_vector_temp_),
             spv::NoPrecision));
-    if (draw_resolution_scale_x_ > 1) {
+    if (host_scale_quarters_x_ != 4) {
       param_gen_x = builder_->createNoContractionBinOp(
           spv::OpFMul, type_float_, param_gen_x,
-          builder_->makeFloatConstant(1.0f / float(draw_resolution_scale_x_)));
+          builder_->makeFloatConstant(4.0f / float(host_scale_quarters_x_)));
     }
     param_gen_x = builder_->createUnaryBuiltinCall(type_float_, ext_inst_glsl_std_450_,
                                                    GLSLstd450FAbs, param_gen_x);
@@ -3246,10 +3250,10 @@ void SpirvShaderTranslator::StartFragmentShaderInMain() {
             builder_->createAccessChain(spv::StorageClassInput, input_fragment_coordinates_,
                                         id_vector_temp_),
             spv::NoPrecision));
-    if (draw_resolution_scale_y_ > 1) {
+    if (host_scale_quarters_y_ != 4) {
       param_gen_y = builder_->createNoContractionBinOp(
           spv::OpFMul, type_float_, param_gen_y,
-          builder_->makeFloatConstant(1.0f / float(draw_resolution_scale_y_)));
+          builder_->makeFloatConstant(4.0f / float(host_scale_quarters_y_)));
     }
     param_gen_y = builder_->createUnaryBuiltinCall(type_float_, ext_inst_glsl_std_450_,
                                                    GLSLstd450FAbs, param_gen_y);

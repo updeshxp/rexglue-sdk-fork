@@ -409,7 +409,16 @@ class SpirvShaderTranslator : public ShaderTranslator {
         native_2x_msaa_no_attachments_(native_2x_msaa_no_attachments),
         edram_fragment_shader_interlock_(edram_fragment_shader_interlock),
         draw_resolution_scale_x_(draw_resolution_scale_x ? draw_resolution_scale_x : 1),
-        draw_resolution_scale_y_(draw_resolution_scale_y ? draw_resolution_scale_y : 1) {}
+        draw_resolution_scale_y_(draw_resolution_scale_y ? draw_resolution_scale_y : 1),
+        host_scale_quarters_x_(draw_resolution_scale_x_ << 2),
+        host_scale_quarters_y_(draw_resolution_scale_y_ << 2) {}
+
+  // Size of the host render targets in quarters of a guest pixel, if smaller than the draw
+  // resolution scale.
+  void SetHostScaleQuarters(uint32_t x, uint32_t y) {
+    host_scale_quarters_x_ = x;
+    host_scale_quarters_y_ = y;
+  }
 
   uint64_t GetDefaultVertexShaderModification(
       uint32_t dynamic_addressable_register_count,
@@ -758,6 +767,8 @@ class SpirvShaderTranslator : public ShaderTranslator {
   bool edram_fragment_shader_interlock_;
   uint32_t draw_resolution_scale_x_;
   uint32_t draw_resolution_scale_y_;
+  uint32_t host_scale_quarters_x_;
+  uint32_t host_scale_quarters_y_;
 
   // Is currently writing the empty depth-only pixel shader, such as for depth
   // and stencil testing with fragment shader interlock.

@@ -278,6 +278,14 @@ void* WindowSDL::GetNativeWindowHandle() const {
 #endif
 }
 
+double WindowSDL::GetDisplayRefreshRate() const {
+  if (!sdl_window_) {
+    return 0.0;
+  }
+  const SDL_DisplayMode* mode = SDL_GetCurrentDisplayMode(SDL_GetDisplayForWindow(sdl_window_));
+  return mode ? double(mode->refresh_rate) : 0.0;
+}
+
 bool WindowSDL::SetRelativeMouseMode(bool enable) {
   if (!sdl_window_) {
     return false;

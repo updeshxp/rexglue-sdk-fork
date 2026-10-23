@@ -279,12 +279,25 @@ void GetHostViewportInfo(const RegisterFile& regs, uint32_t draw_resolution_scal
                          bool full_float24_in_0_to_1, bool pixel_shader_writes_depth,
                          ViewportInfo& viewport_info_out);
 
+// Same as GetHostViewportInfo, with the host render target scale in quarters of a guest pixel
+// (4 is native), not necessarily a multiple of 4.
+void GetHostViewportInfoAtHostScale(const RegisterFile& regs, uint32_t host_scale_quarters_x,
+                                    uint32_t host_scale_quarters_y, bool origin_bottom_left,
+                                    uint32_t x_max, uint32_t y_max, bool allow_reverse_z,
+                                    reg::RB_DEPTHCONTROL normalized_depth_control,
+                                    bool convert_z_to_float24, bool full_float24_in_0_to_1,
+                                    bool pixel_shader_writes_depth,
+                                    ViewportInfo& viewport_info_out);
+
 struct Scissor {
   // Offset from render target UV = 0 to +UV.
   uint32_t offset[2];
   // Extent can be zero.
   uint32_t extent[2];
 };
+// Converts the scissor from guest pixels to host pixels, outward if the scale is fractional.
+void ScaleScissorToHost(Scissor& scissor, uint32_t host_scale_quarters_x,
+                        uint32_t host_scale_quarters_y);
 void GetScissor(const RegisterFile& regs, Scissor& scissor_out, bool clamp_to_surface_pitch = true);
 
 // Returns the color component write mask for the draw command taking into
@@ -585,5 +598,51 @@ bool GetResolveInfo(const RegisterFile& regs, const memory::Memory& memory,
                     uint32_t draw_resolution_scale_x, uint32_t draw_resolution_scale_y,
                     bool fixed_rg16_truncated_to_minus_1_to_1,
                     bool fixed_rgba16_truncated_to_minus_1_to_1, ResolveInfo& info_out);
+
+// A resolve of a whole single-sampled render target from its origin into memory with the same bits,
+// so a texture sampling the destination equals the render target copied into it.
+struct ResolveTextureCopy {
+  uint32_t dest_base;
+  uint32_t dest_pitch_texels;
+  xenos::TextureFormat format;
+  xenos::Endian endian;
+  // In guest pixels.
+  uint32_t width;
+  uint32_t height;
+  // The resolve shader replaces the host pixels left of and above these with the first column and
+  // row at them (the half-pixel offset fill with resolution scaling).
+  uint32_t fill_x;
+  uint32_t fill_y;
+  bool red_blue_swapped;
+};
+
+struct ResolveTextureCopyRegion {
+  uint32_t source_x;
+  uint32_t source_y;
+  uint32_t dest_x;
+  uint32_t dest_y;
+  uint32_t width;
+  uint32_t height;
+};
+inline constexpr uint32_t kMaxResolveTextureCopyRegions = 16;
+
+// The render target to texture copies reproducing the resolve for a texture of width x height host
+// pixels, which must be larger than the fill.
+inline uint32_t GetResolveTextureCopyRegions(const ResolveTextureCopy& copy, uint32_t width,
+                                             uint32_t height, ResolveTextureCopyRegion* regions) {
+  uint32_t fill_x = copy.fill_x, fill_y = copy.fill_y;
+  uint32_t count = 0;
+  regions[count++] = {fill_x, fill_y, fill_x, fill_y, width - fill_x, height - fill_y};
+  for (uint32_t x = 0; x < fill_x; ++x) {
+    regions[count++] = {fill_x, fill_y, x, fill_y, 1, height - fill_y};
+  }
+  for (uint32_t y = 0; y < fill_y; ++y) {
+    regions[count++] = {fill_x, fill_y, fill_x, y, width - fill_x, 1};
+    for (uint32_t x = 0; x < fill_x; ++x) {
+      regions[count++] = {fill_x, fill_y, x, y, 1, 1};
+    }
+  }
+  return count;
+}
 
 }  // namespace rex::graphics::draw_util

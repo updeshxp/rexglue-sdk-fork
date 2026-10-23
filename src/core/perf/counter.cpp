@@ -27,6 +27,7 @@ namespace rex::perf {
 namespace {
 
 constexpr size_t kNumCounters = static_cast<size_t>(CounterId::kCount);
+constexpr int64_t kFunctionsDispatchedBatch = 1024;
 
 std::array<std::atomic<int64_t>, kNumCounters> g_counters{};
 std::array<std::atomic<int64_t>, kNumCounters> g_snapshot{};
@@ -94,6 +95,17 @@ void SetCounter(CounterId id, int64_t value) {
 }
 
 void IncrementCounter(CounterId id, int64_t delta) {
+  if (id == CounterId::kFunctionsDispatched) [[likely]] {
+    // Every guest indirect call lands here. Threads running guest code at once must not all lock the same
+    // cache line, so each one counts privately and publishes in batches.
+    thread_local int64_t pending = 0;
+    pending += delta;
+    if (pending >= kFunctionsDispatchedBatch) {
+      g_counters[static_cast<size_t>(id)].fetch_add(pending, std::memory_order_relaxed);
+      pending = 0;
+    }
+    return;
+  }
   g_counters[static_cast<size_t>(id)].fetch_add(delta, std::memory_order_relaxed);
 }
 
