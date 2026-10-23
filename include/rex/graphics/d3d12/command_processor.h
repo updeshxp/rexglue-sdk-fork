@@ -229,6 +229,7 @@ class D3D12CommandProcessor : public CommandProcessor {
                  uint32_t frontbuffer_height) override;
 
   void OnPrimaryBufferEnd() override;
+  bool PollBackgroundWork() override;
 
   Shader* LoadShader(xenos::ShaderType shader_type, uint32_t guest_address,
                      const uint32_t* host_address, uint32_t dword_count) override;
@@ -343,6 +344,9 @@ class D3D12CommandProcessor : public CommandProcessor {
   // as when there are unfinished graphics pipeline creation requests that would
   // need to be fulfilled before actually submitting the command list.
   bool CanEndSubmissionImmediately() const;
+  // Ending the submission while the GPU still has several submissions queued only adds overhead,
+  // so it is done early just when the GPU would otherwise run out of work.
+  bool ShouldEndSubmissionEarly();
   bool AwaitAllQueueOperationsCompletion() {
     CheckSubmissionFence(submission_current_);
     return submission_completed_ + 1 >= submission_current_;
@@ -423,8 +427,10 @@ class D3D12CommandProcessor : public CommandProcessor {
   bool InitializeOcclusionQueryResources();
   void ShutdownOcclusionQueryResources();
   bool BeginGuestOcclusionQuery(uint32_t sample_count_address);
-  bool EndGuestOcclusionQuery(uint32_t sample_count_address,
-                              xenos::xe_gpu_depth_sample_counts* sample_counts);
+  bool EndGuestOcclusionQuery(uint32_t sample_count_address);
+  // Writes the results of the ended queries whose submissions have completed to the guest, and,
+  // if wait is true, awaits the rest.
+  void CompleteOcclusionQueries(bool wait);
   bool AcquireOcclusionQueryIndex(uint32_t& host_index_out);
   void DisableHostOcclusionQueries();
   uint64_t NormalizeOcclusionSamples(uint64_t samples) const;
@@ -677,6 +683,12 @@ class D3D12CommandProcessor : public CommandProcessor {
     uint32_t host_index = UINT32_MAX;
     bool valid = false;
   } active_occlusion_query_;
+  struct PendingOcclusionQuery {
+    uint64_t submission;
+    uint32_t host_index;
+    uint32_t sample_count_address;
+  };
+  std::deque<PendingOcclusionQuery> pending_occlusion_queries_;
   struct VertexBufferState {
     uint32_t address = UINT32_MAX;
     uint32_t size = UINT32_MAX;

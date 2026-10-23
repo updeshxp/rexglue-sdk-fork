@@ -970,6 +970,9 @@ bool VulkanCommandProcessor::SetupContext() {
         "emulator, reducing to {}x{}",
         draw_resolution_scale_x, draw_resolution_scale_y);
   }
+  uint32_t host_scale_quarters_x, host_scale_quarters_y;
+  TextureCache::GetConfigInternalRenderScale(draw_resolution_scale_x, draw_resolution_scale_y,
+                                             host_scale_quarters_x, host_scale_quarters_y);
   if (draw_resolution_scale_x > 1 || draw_resolution_scale_y > 1) {
     REXGPU_WARN(
         "Vulkan draw resolution scaling is experimental and may not affect all "
@@ -1015,6 +1018,7 @@ bool VulkanCommandProcessor::SetupContext() {
   // Requires the transient descriptor set layouts.
   render_target_cache_ = std::make_unique<VulkanRenderTargetCache>(
       *register_file_, *memory_, draw_resolution_scale_x, draw_resolution_scale_y, *this);
+  render_target_cache_->SetHostScaleQuarters(host_scale_quarters_x, host_scale_quarters_y);
   if (!render_target_cache_->Initialize(shared_memory_binding_count)) {
     REXGPU_ERROR("Failed to initialize the render target cache");
     return false;
@@ -1075,6 +1079,9 @@ bool VulkanCommandProcessor::SetupContext() {
     REXGPU_ERROR("Failed to initialize the texture cache");
     return false;
   }
+  texture_cache_->SetScaledResolveReadCallback([this](uint32_t start, uint32_t length) {
+    render_target_cache_->MaterializeDeferredResolves(start, length);
+  });
 
   // Shared memory and EDRAM common bindings.
   VkDescriptorPoolSize descriptor_pool_sizes[1];
@@ -3628,10 +3635,42 @@ void VulkanCommandProcessor::SetScissor(const VkRect2D& scissor) {
 }
 
 void VulkanCommandProcessor::OnPrimaryBufferEnd() {
-  if (REXCVAR_GET(vulkan_submit_on_primary_buffer_end) && submission_open_ &&
-      CanEndSubmissionImmediately()) {
+  if (ShouldEndSubmissionEarly()) {
     EndSubmission(false);
   }
+  if (!pending_occlusion_queries_.empty()) {
+    CheckSubmissionFenceAndDeviceLoss(0);
+  }
+}
+
+bool VulkanCommandProcessor::ShouldEndSubmissionEarly() {
+  constexpr size_t kMaxSubmissionsInFlight = 3;
+  // Ending the submission would end the active query early, losing its result.
+  if (!REXCVAR_GET(vulkan_submit_on_primary_buffer_end) || !submission_open_ ||
+      active_occlusion_query_.valid || !CanEndSubmissionImmediately()) {
+    return false;
+  }
+  CheckSubmissionFenceAndDeviceLoss(0);
+  return submissions_in_flight_fences_.size() < kMaxSubmissionsInFlight;
+}
+
+bool VulkanCommandProcessor::PollBackgroundWork() {
+  bool submission_held = submission_open_ && REXCVAR_GET(vulkan_submit_on_primary_buffer_end);
+  if (pending_occlusion_queries_.empty() && !submission_held) {
+    return false;
+  }
+  // The guest may be polling the query results, so their submission must not stay open while
+  // there is nothing more to record.
+  bool queries_in_open_submission =
+      !pending_occlusion_queries_.empty() &&
+      pending_occlusion_queries_.back().submission >= GetCurrentSubmission();
+  if (submission_open_ && !active_occlusion_query_.valid && CanEndSubmissionImmediately() &&
+      (queries_in_open_submission || ShouldEndSubmissionEarly())) {
+    EndSubmission(false);
+  }
+  CheckSubmissionFenceAndDeviceLoss(0);
+  return !pending_occlusion_queries_.empty() ||
+         (submission_open_ && REXCVAR_GET(vulkan_submit_on_primary_buffer_end));
 }
 
 Shader* VulkanCommandProcessor::LoadShader(xenos::ShaderType shader_type, uint32_t guest_address,
@@ -3993,8 +4032,8 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
 
   bool host_render_targets_used =
       render_target_cache_->GetPath() == RenderTargetCache::Path::kHostRenderTargets;
-  uint32_t draw_resolution_scale_x = texture_cache_->draw_resolution_scale_x();
-  uint32_t draw_resolution_scale_y = texture_cache_->draw_resolution_scale_y();
+  uint32_t host_scale_quarters_x = render_target_cache_->host_scale_quarters_x();
+  uint32_t host_scale_quarters_y = render_target_cache_->host_scale_quarters_y();
 
   // Get dynamic rasterizer state.
   draw_util::ViewportInfo viewport_info;
@@ -4014,8 +4053,8 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   // life. Or even disregard the viewport bounds range in the fragment shader
   // interlocks case completely - apply the viewport and the scissor offset
   // directly to pixel address and to things like ps_param_gen.
-  draw_util::GetHostViewportInfo(
-      regs, draw_resolution_scale_x, draw_resolution_scale_y, false,
+  draw_util::GetHostViewportInfoAtHostScale(
+      regs, host_scale_quarters_x, host_scale_quarters_y, false,
       device_properties.maxViewportDimensions[0], device_properties.maxViewportDimensions[1], true,
       normalized_depth_control,
       host_render_targets_used && render_target_cache_->depth_float24_convert_in_pixel_shader(),
@@ -4480,6 +4519,8 @@ bool VulkanCommandProcessor::IssueCopy() {
   }
 
   ReadbackResolveMode readback_mode = GetReadbackResolveMode(REXCVAR_GET(vulkan_readback_resolve));
+  render_target_cache_->SetResolveWritebackDeferralAllowed(readback_mode ==
+                                                           ReadbackResolveMode::kDisabled);
   if (readback_mode == ReadbackResolveMode::kDisabled) {
     uint32_t written_address, written_length;
     return render_target_cache_->Resolve(*memory_, *shared_memory_, *texture_cache_,
@@ -4871,6 +4912,7 @@ bool VulkanCommandProcessor::InitializeOcclusionQueryResources() {
 
 void VulkanCommandProcessor::ShutdownOcclusionQueryResources() {
   DisableHostOcclusionQueries();
+  pending_occlusion_queries_.clear();
 
   const ui::vulkan::VulkanDevice* vulkan_device = GetVulkanDevice();
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
@@ -4899,6 +4941,8 @@ void VulkanCommandProcessor::ShutdownOcclusionQueryResources() {
 
 bool VulkanCommandProcessor::AcquireOcclusionQueryIndex(uint32_t& host_index_out) {
   if (occlusion_query_cursor_ >= kMaxOcclusionQueries) {
+    // Results still in flight must not be overwritten by the reused indices.
+    CompleteOcclusionQueries(true);
     occlusion_query_cursor_ = 0;
   }
   host_index_out = occlusion_query_cursor_++;
@@ -4971,43 +5015,77 @@ bool VulkanCommandProcessor::EndGuestOcclusionQuery(uint32_t sample_count_addres
                                            occlusion_query_readback_buffer_,
                                            sizeof(uint64_t) * host_index, sizeof(uint64_t),
                                            VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+  PushBufferMemoryBarrier(occlusion_query_readback_buffer_, sizeof(uint64_t) * host_index,
+                          sizeof(uint64_t), VK_PIPELINE_STAGE_TRANSFER_BIT,
+                          VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+                          VK_ACCESS_HOST_READ_BIT);
 
-  if (!EndSubmission(false)) {
-    return false;
-  }
-  if (!AwaitAllQueueOperationsCompletion()) {
-    return false;
-  }
-
-  const ui::vulkan::VulkanDevice* vulkan_device = GetVulkanDevice();
-  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
-  const VkDevice device = vulkan_device->device();
-  if (!(vulkan_device->memory_types().host_coherent &
-        (uint32_t(1) << occlusion_query_readback_memory_type_))) {
-    VkMappedMemoryRange memory_range = {};
-    memory_range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
-    memory_range.memory = occlusion_query_readback_memory_;
-    memory_range.offset = 0;
-    memory_range.size =
-        std::min(rex::round_up(VkDeviceSize(sizeof(uint64_t) * kMaxOcclusionQueries),
-                               vulkan_device->properties().nonCoherentAtomSize),
-                 occlusion_query_readback_memory_size_);
-    dfn.vkInvalidateMappedMemoryRanges(device, 1, &memory_range);
-  }
-
-  const uint64_t* results = reinterpret_cast<const uint64_t*>(occlusion_query_readback_mapping_);
-  uint64_t samples = NormalizeOcclusionSamples(results[host_index]);
-  WriteGuestOcclusionResult(sample_count_address, samples);
+  // The guest sees the query as unfinished until the result is written after the submission
+  // completes, like with the GPU running behind the command processor on the console. A result
+  // not yet written for the same address would be overwritten by the new query anyway.
+  pending_occlusion_queries_.erase(
+      std::remove_if(pending_occlusion_queries_.begin(), pending_occlusion_queries_.end(),
+                     [sample_count_address](const PendingOcclusionQuery& query) {
+                       return query.sample_count_address == sample_count_address;
+                     }),
+      pending_occlusion_queries_.end());
+  pending_occlusion_queries_.push_back({GetCurrentSubmission(), host_index, sample_count_address});
   return true;
 }
 
+void VulkanCommandProcessor::CompleteOcclusionQueries(bool wait) {
+  const ui::vulkan::VulkanDevice* vulkan_device = GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  bool readback_invalidated = false;
+  while (!pending_occlusion_queries_.empty()) {
+    uint64_t submission = pending_occlusion_queries_.front().submission;
+    if (submission_completed_ < submission) {
+      if (!wait) {
+        return;
+      }
+      CheckSubmissionFenceAndDeviceLoss(submission);
+      if (submission_completed_ < submission) {
+        return;
+      }
+      // Updating the completed submission may have already written the result.
+      continue;
+    }
+    PendingOcclusionQuery query = pending_occlusion_queries_.front();
+    pending_occlusion_queries_.pop_front();
+    if (device_lost_ || !occlusion_query_readback_mapping_) {
+      continue;
+    }
+    if (!readback_invalidated && !(vulkan_device->memory_types().host_coherent &
+                                   (uint32_t(1) << occlusion_query_readback_memory_type_))) {
+      VkMappedMemoryRange memory_range = {};
+      memory_range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+      memory_range.memory = occlusion_query_readback_memory_;
+      memory_range.offset = 0;
+      memory_range.size =
+          std::min(rex::round_up(VkDeviceSize(sizeof(uint64_t) * kMaxOcclusionQueries),
+                                 vulkan_device->properties().nonCoherentAtomSize),
+                   occlusion_query_readback_memory_size_);
+      dfn.vkInvalidateMappedMemoryRanges(device, 1, &memory_range);
+      readback_invalidated = true;
+    }
+    const uint64_t* results = reinterpret_cast<const uint64_t*>(occlusion_query_readback_mapping_);
+    WriteGuestOcclusionResult(query.sample_count_address,
+                              NormalizeOcclusionSamples(results[query.host_index]));
+  }
+}
+
 uint64_t VulkanCommandProcessor::NormalizeOcclusionSamples(uint64_t samples) const {
-  if (samples == 0 || !texture_cache_) {
+  if (samples == 0 || !texture_cache_ || !render_target_cache_) {
     return samples;
   }
-  uint64_t scale_x = texture_cache_->draw_resolution_scale_x();
-  uint64_t scale_y = texture_cache_->draw_resolution_scale_y();
-  uint64_t scale = scale_x * scale_y;
+  uint64_t quarters_x = render_target_cache_->host_scale_quarters_x();
+  uint64_t quarters_y = render_target_cache_->host_scale_quarters_y();
+  if ((quarters_x | quarters_y) & 3) {
+    uint64_t scale_sixteenths = quarters_x * quarters_y;
+    return (samples * 16 + (scale_sixteenths >> 1)) / scale_sixteenths;
+  }
+  uint64_t scale = (quarters_x >> 2) * (quarters_y >> 2);
   if (scale <= 1) {
     return samples;
   }
@@ -5174,6 +5252,8 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
     dfn.vkFreeMemory(device, destroy_pair.second, nullptr);
     destroy_memory_.pop_front();
   }
+
+  CompleteOcclusionQueries(false);
 }
 
 bool VulkanCommandProcessor::CanEndSubmissionImmediately() const {
@@ -5313,6 +5393,7 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
     primitive_processor_->BeginFrame();
 
     texture_cache_->BeginFrame();
+    render_target_cache_->MaterializeStaleDeferredResolves();
   }
 
   return true;
@@ -5749,8 +5830,8 @@ void VulkanCommandProcessor::UpdateDynamicState(const draw_util::ViewportInfo& v
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
 
   const RegisterFile& regs = *register_file_;
-  uint32_t draw_resolution_scale_x = texture_cache_ ? texture_cache_->draw_resolution_scale_x() : 1;
-  uint32_t draw_resolution_scale_y = texture_cache_ ? texture_cache_->draw_resolution_scale_y() : 1;
+  uint32_t host_scale_quarters_x = render_target_cache_->host_scale_quarters_x();
+  uint32_t host_scale_quarters_y = render_target_cache_->host_scale_quarters_y();
 
   // Window parameters.
   // http://ftp.tku.edu.tw/NetBSD/NetBSD-current/xsrc/external/mit/xf86-video-ati/dist/src/r600_reg_auto_r6xx.h
@@ -5781,10 +5862,7 @@ void VulkanCommandProcessor::UpdateDynamicState(const draw_util::ViewportInfo& v
   // Scissor.
   draw_util::Scissor scissor;
   draw_util::GetScissor(regs, scissor);
-  scissor.offset[0] *= draw_resolution_scale_x;
-  scissor.offset[1] *= draw_resolution_scale_y;
-  scissor.extent[0] *= draw_resolution_scale_x;
-  scissor.extent[1] *= draw_resolution_scale_y;
+  draw_util::ScaleScissorToHost(scissor, host_scale_quarters_x, host_scale_quarters_y);
   VkRect2D scissor_rect;
   scissor_rect.offset.x = int32_t(scissor.offset[0]);
   scissor_rect.offset.y = int32_t(scissor.offset[1]);
@@ -5806,7 +5884,7 @@ void VulkanCommandProcessor::UpdateDynamicState(const draw_util::ViewportInfo& v
     // better than less bias, because less bias means Z fighting with the
     // background is more likely.
     depth_bias_slope_factor *= xenos::kPolygonOffsetScaleSubpixelUnit *
-                               float(std::max(draw_resolution_scale_x, draw_resolution_scale_y));
+                               (float(std::max(host_scale_quarters_x, host_scale_quarters_y)) * 0.25f);
     // std::memcmp instead of != so in case of NaN, every draw won't be
     // invalidating it.
     dynamic_depth_bias_update_needed_ |=
@@ -6239,10 +6317,10 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
     // to radius conversion to avoid multiplying the per-vertex diameter by an
     // additional constant in the shader.
     float point_screen_diameter_to_ndc_radius_x =
-        (/* 0.5f * 2.0f * */ float(draw_resolution_scale_x)) /
+        (/* 0.5f * 2.0f * */ float(render_target_cache_->host_scale_quarters_x()) * 0.25f) /
         std::max(viewport_info.xy_extent[0], uint32_t(1));
     float point_screen_diameter_to_ndc_radius_y =
-        (/* 0.5f * 2.0f * */ float(draw_resolution_scale_y)) /
+        (/* 0.5f * 2.0f * */ float(render_target_cache_->host_scale_quarters_y()) * 0.25f) /
         std::max(viewport_info.xy_extent[1], uint32_t(1));
     dirty |= system_constants_.point_screen_diameter_to_ndc_radius[0] !=
              point_screen_diameter_to_ndc_radius_x;

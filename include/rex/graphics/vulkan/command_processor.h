@@ -266,6 +266,7 @@ class VulkanCommandProcessor : public CommandProcessor {
   void OnGammaRamp256EntryTableValueWritten() override;
   void OnGammaRampPWLValueWritten() override;
   void OnPrimaryBufferEnd() override;
+  bool PollBackgroundWork() override;
 
   void IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                  uint32_t frontbuffer_height) override;
@@ -433,6 +434,9 @@ class VulkanCommandProcessor : public CommandProcessor {
   // Keep primary-buffer-end submit behavior aligned with D3D12: only submit
   // when immediate submission is safe.
   bool CanEndSubmissionImmediately() const;
+  // Ending the submission while the GPU still has several submissions queued only adds overhead,
+  // so it is done early just when the GPU would otherwise run out of work.
+  bool ShouldEndSubmissionEarly();
 
   void ClearTransientDescriptorPools();
   bool IssueCopy_ReadbackResolvePath();
@@ -446,6 +450,9 @@ class VulkanCommandProcessor : public CommandProcessor {
   void ShutdownOcclusionQueryResources();
   bool BeginGuestOcclusionQuery(uint32_t sample_count_address);
   bool EndGuestOcclusionQuery(uint32_t sample_count_address);
+  // Writes the results of the ended queries whose submissions have completed to the guest, and,
+  // if wait is true, awaits the rest.
+  void CompleteOcclusionQueries(bool wait);
   bool AcquireOcclusionQueryIndex(uint32_t& host_index_out);
   void DisableHostOcclusionQueries();
   uint64_t NormalizeOcclusionSamples(uint64_t samples) const;
@@ -751,6 +758,12 @@ class VulkanCommandProcessor : public CommandProcessor {
     uint32_t host_index = UINT32_MAX;
     bool valid = false;
   } active_occlusion_query_;
+  struct PendingOcclusionQuery {
+    uint64_t submission;
+    uint32_t host_index;
+    uint32_t sample_count_address;
+  };
+  std::deque<PendingOcclusionQuery> pending_occlusion_queries_;
   struct VertexBufferState {
     uint32_t address = UINT32_MAX;
     uint32_t size = UINT32_MAX;

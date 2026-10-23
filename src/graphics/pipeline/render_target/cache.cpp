@@ -46,6 +46,16 @@ REXCVAR_DEFINE_BOOL(direct_host_resolve, true, "GPU",
                     "Resolve from host render targets directly to shared memory when possible")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_BOOL(resolve_copy_into_textures, true, "GPU",
+                    "Copy resolved single-sampled render targets straight into the textures that "
+                    "sample the result instead of loading them again from the resolved memory")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(resolve_defer_writeback, true, "GPU",
+                    "With resolution scaling, write the memory of a resolve copied into the one "
+                    "texture sampling it only when something else needs that memory")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 namespace rex::graphics {
 
 void RenderTargetCache::GetPSIColorFormatInfo(xenos::ColorRenderTargetFormat format,
@@ -338,8 +348,29 @@ RenderTargetCache::~RenderTargetCache() {
   ShutdownCommon();
 }
 
+void RenderTargetCache::SetEdramTilesDirty(uint32_t start_tiles, uint32_t length_tiles,
+                                           bool dirty) {
+  uint32_t end_tiles =
+      (start_tiles & (xenos::kEdramTileCount - 1)) + std::min(length_tiles, xenos::kEdramTileCount);
+  start_tiles &= xenos::kEdramTileCount - 1;
+  auto apply = [&](uint32_t first, uint32_t last) {
+    while (first < last) {
+      uint32_t count = std::min(64 - (first & 63), last - first);
+      uint64_t mask = (count == 64 ? ~uint64_t(0) : ((uint64_t(1) << count) - 1)) << (first & 63);
+      uint64_t& word = edram_dirty_tiles_[first >> 6];
+      word = dirty ? (word | mask) : (word & ~mask);
+      first += count;
+    }
+  };
+  apply(start_tiles, std::min(end_tiles, xenos::kEdramTileCount));
+  if (end_tiles > xenos::kEdramTileCount) {
+    apply(0, end_tiles - xenos::kEdramTileCount);
+  }
+}
+
 void RenderTargetCache::InitializeCommon() {
   assert_true(ownership_ranges_.empty());
+  SetEdramTilesDirty(0, xenos::kEdramTileCount, true);
   ownership_ranges_.emplace(std::piecewise_construct, std::forward_as_tuple(uint32_t(0)),
                             std::forward_as_tuple(xenos::kEdramTileCount, RenderTargetKey(),
                                                   RenderTargetKey(), RenderTargetKey()));
@@ -347,6 +378,7 @@ void RenderTargetCache::InitializeCommon() {
 
 void RenderTargetCache::DestroyAllRenderTargets(bool shutting_down) {
   ownership_ranges_.clear();
+  SetEdramTilesDirty(0, xenos::kEdramTileCount, true);
   if (!shutting_down) {
     ownership_ranges_.emplace(std::piecewise_construct, std::forward_as_tuple(uint32_t(0)),
                               std::forward_as_tuple(xenos::kEdramTileCount, RenderTargetKey(),
@@ -366,6 +398,9 @@ void RenderTargetCache::ShutdownCommon() {
 }
 
 void RenderTargetCache::ClearCache() {
+  // The texture cache is cleared first, destroying the textures holding them.
+  deferred_resolves_.clear();
+
   // Keep only render targets currently owning any EDRAM data.
   if (!render_targets_.empty()) {
     std::unordered_set<RenderTargetKey, RenderTargetKey::Hasher> used_render_targets;
@@ -400,6 +435,102 @@ void RenderTargetCache::ClearCache() {
 
 void RenderTargetCache::BeginFrame() {
   ResetAccumulatedRenderTargets();
+}
+
+namespace {
+bool GuestRangesOverlap(uint32_t start_a, uint32_t length_a, uint32_t start_b, uint32_t length_b) {
+  start_a &= 0x1FFFFFFF;
+  start_b &= 0x1FFFFFFF;
+  return start_a < start_b + length_b && start_b < start_a + length_a;
+}
+}  // namespace
+
+RenderTargetCache::DeferredResolve RenderTargetCache::GetResolveWrites(
+    const draw_util::ResolveInfo& resolve_info, draw_util::ResolveCopyShaderIndex copy_shader,
+    const draw_util::ResolveCopyShaderConstants& constants, uint32_t group_count_x,
+    uint32_t group_count_y) {
+  DeferredResolve writes = {};
+  writes.extent_start = resolve_info.copy_dest_extent_start;
+  writes.extent_length = resolve_info.copy_dest_extent_length;
+  writes.dest_base = resolve_info.copy_dest_base;
+  writes.copy_shader = copy_shader;
+  writes.copy_constants = constants;
+  writes.group_count_x = group_count_x;
+  writes.group_count_y = group_count_y;
+  resolve_info.GetCopyEdramTileSpan(writes.dump_base, writes.dump_row_length_used,
+                                    writes.dump_rows, writes.dump_pitch);
+  return writes;
+}
+
+bool RenderTargetCache::CanDeferResolveWriteback(
+    const draw_util::ResolveTextureCopy& copy, const TextureCache& texture_cache,
+    TextureCache::DeferredResolveTexture texture) const {
+  // Rewriting the memory from the texture reproduces only what the texture covers. Without
+  // resolution scaling, other GPU work reads the resolved memory directly.
+  return REXCVAR_GET(resolve_defer_writeback) && resolve_writeback_deferral_allowed_ &&
+         IsDrawResolutionScaled() && !AreHostRenderTargetsReduced() &&
+         texture_cache.TextureCoversResolve(texture, copy.width, copy.height);
+}
+
+void RenderTargetCache::PrepareResolveDestination(const DeferredResolve& writes) {
+  for (size_t i = 0; i < deferred_resolves_.size();) {
+    DeferredResolve resolve = deferred_resolves_[i];
+    if (!GuestRangesOverlap(resolve.extent_start, resolve.extent_length, writes.extent_start,
+                            writes.extent_length)) {
+      ++i;
+      continue;
+    }
+    deferred_resolves_[i] = deferred_resolves_.back();
+    deferred_resolves_.pop_back();
+    deferred_resolve_texture_cache_->SetHoldsDeferredResolve(resolve.texture, false);
+    if (resolve.WritesSameAs(writes)) {
+      continue;
+    }
+    if (!MaterializeDeferredResolve(resolve)) {
+      REXGPU_ERROR("RenderTargetCache: Failed to write the memory of a deferred resolve");
+    }
+  }
+}
+
+void RenderTargetCache::AddDeferredResolve(const DeferredResolve& resolve,
+                                           TextureCache& texture_cache) {
+  deferred_resolve_texture_cache_ = &texture_cache;
+  texture_cache.SetHoldsDeferredResolve(resolve.texture, true);
+  deferred_resolves_.push_back(resolve);
+  deferred_resolves_.back().frame = deferred_resolve_frame_;
+}
+
+void RenderTargetCache::MaterializeDeferredResolves(uint32_t start, uint32_t length) {
+  for (size_t i = 0; i < deferred_resolves_.size();) {
+    DeferredResolve resolve = deferred_resolves_[i];
+    if (!GuestRangesOverlap(resolve.extent_start, resolve.extent_length, start, length)) {
+      ++i;
+      continue;
+    }
+    deferred_resolves_[i] = deferred_resolves_.back();
+    deferred_resolves_.pop_back();
+    deferred_resolve_texture_cache_->SetHoldsDeferredResolve(resolve.texture, false);
+    if (!MaterializeDeferredResolve(resolve)) {
+      REXGPU_ERROR("RenderTargetCache: Failed to write the memory of a deferred resolve");
+    }
+  }
+}
+
+void RenderTargetCache::MaterializeStaleDeferredResolves() {
+  ++deferred_resolve_frame_;
+  for (size_t i = 0; i < deferred_resolves_.size();) {
+    DeferredResolve resolve = deferred_resolves_[i];
+    if (resolve.frame + 1 >= deferred_resolve_frame_) {
+      ++i;
+      continue;
+    }
+    deferred_resolves_[i] = deferred_resolves_.back();
+    deferred_resolves_.pop_back();
+    deferred_resolve_texture_cache_->SetHoldsDeferredResolve(resolve.texture, false);
+    if (!MaterializeDeferredResolve(resolve)) {
+      REXGPU_ERROR("RenderTargetCache: Failed to write the memory of a deferred resolve");
+    }
+  }
 }
 
 bool RenderTargetCache::Update(bool is_rasterization_done,
@@ -437,8 +568,7 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
       xenos::kEdramTileWidthSamples;
   if (!interlock_barrier_only) {
     uint32_t pitch_pixels_tile_aligned_scaled =
-        pitch_tiles_at_32bpp * (xenos::kEdramTileWidthSamples >> msaa_samples_x_log2) *
-        draw_resolution_scale_x();
+        GuestToHostX(pitch_tiles_at_32bpp * (xenos::kEdramTileWidthSamples >> msaa_samples_x_log2));
     uint32_t max_render_target_width = GetMaxRenderTargetWidth();
     if (pitch_pixels_tile_aligned_scaled > max_render_target_width) {
       // TODO(Triang3l): If really needed for some game on some device, clamp
@@ -548,6 +678,8 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
     // Nothing to bind, don't waste time on things like memexport-only draws -
     // just check if old bindings can still be used.
     std::memset(last_update_used_render_targets_, 0, sizeof(last_update_used_render_targets_));
+    std::memset(last_update_used_start_tiles_, 0, sizeof(last_update_used_start_tiles_));
+    std::memset(last_update_used_length_tiles_, 0, sizeof(last_update_used_length_tiles_));
     if (are_accumulated_render_targets_valid_) {
       for (size_t i = 0; i < rex::countof(last_update_accumulated_render_targets_); ++i) {
         const RenderTarget* render_target = last_update_accumulated_render_targets_[i];
@@ -571,13 +703,20 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
 
   // Estimate height used by render targets (for color for writes, for depth /
   // stencil for both reads and writes) from various sources.
+  uint32_t first_row_used = 0;
   uint32_t height_used =
       std::min(GetRenderTargetHeight(pitch_tiles_at_32bpp, msaa_samples),
                draw_extent_estimator_.EstimateMaxY(
                    interlock_barrier_only
                        ? REXCVAR_GET(execute_unclipped_draw_vs_on_cpu_for_psi_render_backend)
                        : true,
-                   vertex_shader));
+                   vertex_shader, interlock_barrier_only ? nullptr : &first_row_used));
+  // The tile rows above the first one the draw can touch are left to their current owners.
+  uint32_t rows_skipped_tiles = interlock_barrier_only
+                                    ? 0
+                                    : (std::min(first_row_used, height_used)
+                                       << uint32_t(msaa_samples >= xenos::MsaaSamples::k2X)) /
+                                          xenos::kEdramTileHeightSamples;
 
   // Sorted by EDRAM base and then by index in the pipeline - for simplicity,
   // treat render targets placed closer to the end of the EDRAM as truncating
@@ -630,6 +769,7 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
   RenderTargetKey rt_keys[1 + xenos::kMaxColorRenderTargets];
   RenderTarget* rts[1 + xenos::kMaxColorRenderTargets];
   uint32_t rt_lengths_tiles[1 + xenos::kMaxColorRenderTargets];
+  uint32_t rt_skipped_tiles[1 + xenos::kMaxColorRenderTargets] = {};
   uint32_t length_used_tiles_at_32bpp =
       ((height_used << uint32_t(msaa_samples >= xenos::MsaaSamples::k2X)) +
        (xenos::kEdramTileHeightSamples - 1)) /
@@ -671,6 +811,8 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
       // the wrong surface and write zeros.
       rt_lengths_tiles[i] = std::min(rt_lengths_tiles[i], xenos::kEdramTileCount - rt_base);
     }
+    rt_skipped_tiles[i] = std::min(rows_skipped_tiles * (pitch_tiles_at_32bpp << rt_is_64bpp),
+                                   rt_lengths_tiles[i]);
   }
 
   if (interlock_barrier_only) {
@@ -701,8 +843,12 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
   for (uint32_t i = 0; i < edram_bases_sorted_count; ++i) {
     const std::pair<uint32_t, uint32_t>& rt_base_index = edram_bases_sorted[i];
     uint32_t rt_bit_index = rt_base_index.second;
-    ChangeOwnership(rt_keys[rt_bit_index], 0, rt_lengths_tiles[i],
+    ChangeOwnership(rt_keys[rt_bit_index], rt_skipped_tiles[i],
+                    rt_lengths_tiles[i] - rt_skipped_tiles[i],
                     interlock_barrier_only ? nullptr : &last_update_transfers_[rt_bit_index]);
+    last_update_used_start_tiles_[rt_bit_index] =
+        (rt_keys[rt_bit_index].base_tiles + rt_skipped_tiles[i]) & (xenos::kEdramTileCount - 1);
+    last_update_used_length_tiles_[rt_bit_index] = rt_lengths_tiles[i] - rt_skipped_tiles[i];
   }
 
   if (interlock_barrier_only) {
@@ -815,10 +961,10 @@ uint32_t RenderTargetCache::GetRenderTargetHeight(uint32_t pitch_tiles_at_32bpp,
   static_assert(!(xenos::kTexture2DCubeMaxWidthHeight % xenos::kEdramTileHeightSamples),
                 "Maximum guest render target height is assumed to always be a multiple "
                 "of an EDRAM tile height");
-  uint32_t max_height_scaled = std::min(
-      xenos::kTexture2DCubeMaxWidthHeight * draw_resolution_scale_y(), GetMaxRenderTargetHeight());
+  uint32_t max_height_scaled = std::min(GuestToHostY(xenos::kTexture2DCubeMaxWidthHeight),
+                                        GetMaxRenderTargetHeight());
   uint32_t msaa_samples_y_log2 = uint32_t(msaa_samples >= xenos::MsaaSamples::k2X);
-  uint32_t tile_height_samples_scaled = xenos::kEdramTileHeightSamples * draw_resolution_scale_y();
+  uint32_t tile_height_samples_scaled = GuestToHostY(xenos::kEdramTileHeightSamples);
   tile_rows =
       std::min(tile_rows, (max_height_scaled << msaa_samples_y_log2) / tile_height_samples_scaled);
   assert_not_zero(tile_rows);
@@ -843,12 +989,12 @@ void RenderTargetCache::GetHostDepthStoreRectangleInfo(
   rectangle_constant.width_pixels_div_8_minus_1 = (transfer_rectangle.width_pixels >> 3) - 1;
   rectangle_constant_out = rectangle_constant;
   // 1 thread group = 64x8 host samples.
-  uint32_t pixel_size_x = draw_resolution_scale_x()
-                          << uint32_t(msaa_samples >= xenos::MsaaSamples::k4X);
-  uint32_t pixel_size_y = draw_resolution_scale_y()
-                          << uint32_t(msaa_samples >= xenos::MsaaSamples::k2X);
-  group_count_x_out = (transfer_rectangle.width_pixels * pixel_size_x + 63) >> 6;
-  group_count_y_out = (transfer_rectangle.height_pixels * pixel_size_y) >> 3;
+  uint32_t host_width_samples = GuestToHostX(transfer_rectangle.width_pixels)
+                                << uint32_t(msaa_samples >= xenos::MsaaSamples::k4X);
+  uint32_t host_height_samples = GuestToHostY(transfer_rectangle.height_pixels)
+                                 << uint32_t(msaa_samples >= xenos::MsaaSamples::k2X);
+  group_count_x_out = (host_width_samples + 63) >> 6;
+  group_count_y_out = host_height_samples >> 3;
 }
 
 void RenderTargetCache::GetResolveCopyRectanglesToDump(
@@ -995,7 +1141,7 @@ bool RenderTargetCache::PrepareHostRenderTargetsResolveClear(
   }
   uint32_t pitch_pixels =
       pitch_tiles_at_32bpp * (xenos::kEdramTileWidthSamples >> msaa_samples_x_log2);
-  uint32_t pitch_pixels_scaled = pitch_pixels * draw_resolution_scale_x();
+  uint32_t pitch_pixels_scaled = GuestToHostX(pitch_pixels);
   uint32_t max_render_target_width = GetMaxRenderTargetWidth();
   if (pitch_pixels_scaled > max_render_target_width) {
     // TODO(Triang3l): If really needed for some game on some device, clamp the
@@ -1123,6 +1269,11 @@ bool RenderTargetCache::PrepareHostRenderTargetsResolveClear(
     return false;
   }
 
+  // The clears happen in the host render targets even where they already own the tiles.
+  SetEdramTilesDirty(depth_render_target_key.base_tiles + depth_clear_start_tiles_base_relative,
+                     depth_clear_length_tiles, true);
+  SetEdramTilesDirty(color_render_target_key.base_tiles + color_clear_start_tiles_base_relative,
+                     color_clear_length_tiles, true);
   clear_rectangle_out = clear_rectangle;
   depth_render_target_out = depth_render_target;
   depth_transfers_out.clear();
@@ -1137,6 +1288,189 @@ bool RenderTargetCache::PrepareHostRenderTargetsResolveClear(
                     color_clear_length_tiles, &color_transfers_out, &clear_rectangle);
   }
   return true;
+}
+
+uint32_t RenderTargetCache::GetDrawOverwrittenRenderTargets(
+    reg::RB_DEPTHCONTROL normalized_depth_control, uint32_t normalized_color_mask,
+    const Shader& vertex_shader, const Shader* pixel_shader, Transfer::Rectangle& rectangle_out,
+    bool& depth_only_out) {
+  depth_only_out = false;
+  const RegisterFile& regs = register_file();
+
+  // Fragments rejected by the depth or stencil test keep their previous contents.
+  if ((normalized_depth_control.z_enable &&
+       normalized_depth_control.zfunc != xenos::CompareFunction::kAlways) ||
+      (normalized_depth_control.stencil_enable &&
+       (normalized_depth_control.stencilfunc != xenos::CompareFunction::kAlways ||
+        (normalized_depth_control.backface_enable &&
+         normalized_depth_control.stencilfunc_bf != xenos::CompareFunction::kAlways)))) {
+    return 0;
+  }
+  auto draw_initiator = regs.Get<reg::VGT_DRAW_INITIATOR>();
+  if (draw_initiator.prim_type != xenos::PrimitiveType::kRectangleList ||
+      draw_initiator.num_indices != 3 ||
+      draw_initiator.source_select != xenos::SourceSelect::kAutoIndex) {
+    return 0;
+  }
+
+  uint32_t overwritten = 0;
+  bool depth_only = false;
+  if (normalized_depth_control.z_enable && normalized_depth_control.z_write_enable &&
+      normalized_depth_control.zfunc == xenos::CompareFunction::kAlways) {
+    bool stencil_replaced =
+        normalized_depth_control.stencil_enable &&
+        normalized_depth_control.stencilzpass == xenos::StencilOp::kReplace &&
+        regs.Get<reg::RB_STENCILREFMASK>().stencilwritemask == UINT8_MAX;
+    if (stencil_replaced && normalized_depth_control.backface_enable) {
+      stencil_replaced = normalized_depth_control.stencilzpass_bf == xenos::StencilOp::kReplace &&
+                         regs.Get<reg::RB_STENCILREFMASK>(XE_GPU_REG_RB_STENCILREFMASK_BF)
+                                 .stencilwritemask == UINT8_MAX;
+    }
+    if (stencil_replaced) {
+      overwritten |= 1;
+    } else {
+      depth_only = true;
+    }
+  }
+  for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
+    if (((normalized_color_mask >> (4 * i)) & 0b1111) != 0b1111) {
+      continue;
+    }
+    auto blend_control =
+        regs.Get<reg::RB_BLENDCONTROL>(reg::RB_BLENDCONTROL::rt_register_indices[i]);
+    if (blend_control.color_srcblend != xenos::BlendFactor::kOne ||
+        blend_control.color_destblend != xenos::BlendFactor::kZero ||
+        blend_control.color_comb_fcn != xenos::BlendOp::kAdd ||
+        blend_control.alpha_srcblend != xenos::BlendFactor::kOne ||
+        blend_control.alpha_destblend != xenos::BlendFactor::kZero ||
+        blend_control.alpha_comb_fcn != xenos::BlendOp::kAdd) {
+      continue;
+    }
+    overwritten |= uint32_t(1) << (1 + i);
+  }
+  if (!overwritten && !depth_only) {
+    return 0;
+  }
+
+  auto sc_mode_cntl = regs.Get<reg::PA_SU_SC_MODE_CNTL>();
+  if (sc_mode_cntl.cull_front || sc_mode_cntl.cull_back ||
+      sc_mode_cntl.poly_mode != xenos::PolygonModeEnable::kDisabled) {
+    return 0;
+  }
+  auto surface_info = regs.Get<reg::RB_SURFACE_INFO>();
+  if (surface_info.msaa_samples != xenos::MsaaSamples::k1X) {
+    uint32_t sample_mask =
+        (uint32_t(1) << (uint32_t(1) << uint32_t(surface_info.msaa_samples))) - 1;
+    if ((regs[XE_GPU_REG_PA_SC_AA_MASK] & sample_mask) != sample_mask) {
+      return 0;
+    }
+  }
+  if (pixel_shader && (!pixel_shader->is_ucode_analyzed() || pixel_shader->kills_pixels() ||
+                       pixel_shader->writes_depth())) {
+    return 0;
+  }
+  auto color_control = regs.Get<reg::RB_COLORCONTROL>();
+  if (color_control.alpha_to_mask_enable ||
+      (color_control.alpha_test_enable &&
+       color_control.alpha_func != xenos::CompareFunction::kAlways)) {
+    return 0;
+  }
+  auto clip_cntl = regs.Get<reg::PA_CL_CLIP_CNTL>();
+  bool clip_disable = clip_cntl.clip_disable;
+  if (!clip_disable && clip_cntl.ucp_ena) {
+    return 0;
+  }
+
+  float positions[3][4];
+  if (!draw_extent_estimator().GetAutoIndexedVertexPositions(vertex_shader, 3, positions)) {
+    return 0;
+  }
+  auto vte_cntl = regs.Get<reg::PA_CL_VTE_CNTL>();
+  float x[3], y[3];
+  for (uint32_t i = 0; i < 3; ++i) {
+    const float* position = positions[i];
+    float w = vte_cntl.vtx_w0_fmt ? position[3] : 1.0f / position[3];
+    float z = vte_cntl.vtx_z_fmt ? position[2] * w : position[2];
+    // Anything clipped makes the covered area unknown.
+    if (!(w > 0.0f) || (!clip_disable && !(z >= 0.0f && z <= w))) {
+      return 0;
+    }
+    float vertex_x = position[0];
+    float vertex_y = position[1];
+    if (!vte_cntl.vtx_xy_fmt) {
+      vertex_x /= w;
+      vertex_y /= w;
+    }
+    if (!clip_disable && !(std::abs(vertex_x) <= 1.0f && std::abs(vertex_y) <= 1.0f)) {
+      return 0;
+    }
+    if (vte_cntl.vport_x_scale_ena) {
+      vertex_x *= regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_XSCALE);
+    }
+    if (vte_cntl.vport_x_offset_ena) {
+      vertex_x += regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_XOFFSET);
+    }
+    if (vte_cntl.vport_y_scale_ena) {
+      vertex_y *= regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_YSCALE);
+    }
+    if (vte_cntl.vport_y_offset_ena) {
+      vertex_y += regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_YOFFSET);
+    }
+    if (!std::isfinite(vertex_x) || !std::isfinite(vertex_y)) {
+      return 0;
+    }
+    x[i] = vertex_x;
+    y[i] = vertex_y;
+  }
+
+  // Three distinct corners of an axis-aligned rectangle - the fourth is generated by mirroring
+  // across the diagonal, so the rectangle is covered whole.
+  float x0 = std::min({x[0], x[1], x[2]});
+  float x1 = std::max({x[0], x[1], x[2]});
+  float y0 = std::min({y[0], y[1], y[2]});
+  float y1 = std::max({y[0], y[1], y[2]});
+  for (uint32_t i = 0; i < 3; ++i) {
+    if ((x[i] != x0 && x[i] != x1) || (y[i] != y0 && y[i] != y1)) {
+      return 0;
+    }
+    for (uint32_t j = 0; j < i; ++j) {
+      if (x[i] == x[j] && y[i] == y[j]) {
+        return 0;
+      }
+    }
+  }
+
+  // Window and half-pixel offsets, then shrunk by half a pixel more on every side: the host may
+  // shift the edges by up to that at higher resolution scales, and whole pixels (all their
+  // samples) have to be covered.
+  float offset_x = 0.0f, offset_y = 0.0f;
+  if (sc_mode_cntl.vtx_window_offset_enable) {
+    auto window_offset = regs.Get<reg::PA_SC_WINDOW_OFFSET>();
+    offset_x += float(window_offset.window_x_offset);
+    offset_y += float(window_offset.window_y_offset);
+  }
+  if (regs.Get<reg::PA_SU_VTX_CNTL>().pix_center == xenos::PixelCenter::kD3DZero) {
+    offset_x += 0.5f;
+    offset_y += 0.5f;
+  }
+  draw_util::Scissor scissor;
+  draw_util::GetScissor(regs, scissor, false);
+  auto to_pixel = [](float value) { return int32_t(std::clamp(value, -65536.0f, 65536.0f)); };
+  int32_t rect_x0 = std::max(to_pixel(std::ceil(x0 + offset_x + 0.5f)), int32_t(scissor.offset[0]));
+  int32_t rect_y0 = std::max(to_pixel(std::ceil(y0 + offset_y + 0.5f)), int32_t(scissor.offset[1]));
+  int32_t rect_x1 = std::min(to_pixel(std::floor(x1 + offset_x - 0.5f)),
+                             int32_t(scissor.offset[0] + scissor.extent[0]));
+  int32_t rect_y1 = std::min(to_pixel(std::floor(y1 + offset_y - 0.5f)),
+                             int32_t(scissor.offset[1] + scissor.extent[1]));
+  if (rect_x0 >= rect_x1 || rect_y0 >= rect_y1) {
+    return 0;
+  }
+  rectangle_out.x_pixels = uint32_t(rect_x0);
+  rectangle_out.y_pixels = uint32_t(rect_y0);
+  rectangle_out.width_pixels = uint32_t(rect_x1 - rect_x0);
+  rectangle_out.height_pixels = uint32_t(rect_y1 - rect_y0);
+  depth_only_out = depth_only;
+  return overwritten;
 }
 
 void RenderTargetCache::PixelShaderInterlockFullEdramBarrierPlaced() {
@@ -1358,6 +1692,7 @@ void RenderTargetCache::ChangeOwnership(RenderTargetKey dest, uint32_t start_til
         }
       }
       // Claim the current range.
+      SetEdramTilesDirty(it->first, it->second.end_tiles - it->first, true);
       it->second.render_target = dest;
       if (host_depth_encoding_different) {
         it->second.GetHostDepthRenderTarget(dest.GetDepthFormat()) = dest;
@@ -1398,6 +1733,96 @@ void RenderTargetCache::ChangeOwnership(RenderTargetKey dest, uint32_t start_til
     // The ownership change extent goes to the next EDRAM addressing period.
     change_ownership_in_extent(0, std::min(end_tiles & (xenos::kEdramTileCount - 1), start_tiles));
   }
+}
+
+RenderTargetCache::ResolveTextureCopyResult RenderTargetCache::PlanResolveTextureCopy(
+    const draw_util::ResolveInfo& resolve_info, draw_util::ResolveTextureCopy& copy_out,
+    RenderTarget*& source_out) {
+  if (!REXCVAR_GET(resolve_copy_into_textures) || AreHostRenderTargetsReduced()) {
+    return ResolveTextureCopyResult::kDisabled;
+  }
+  if (resolve_info.IsCopyingDepth()) {
+    return ResolveTextureCopyResult::kDepth;
+  }
+  const draw_util::ResolveEdramInfo& edram_info = resolve_info.color_edram_info;
+  if (edram_info.msaa_samples != xenos::MsaaSamples::k1X) {
+    return ResolveTextureCopyResult::kMsaa;
+  }
+  const reg::RB_COPY_DEST_INFO& dest_info = resolve_info.copy_dest_info;
+  auto edram_format = xenos::ColorRenderTargetFormat(edram_info.format);
+  auto dest_format = xenos::TextureFormat(dest_info.copy_dest_format);
+  bool is_2_10_10_10 =
+      edram_format == xenos::ColorRenderTargetFormat::k_2_10_10_10 ||
+      edram_format == xenos::ColorRenderTargetFormat::k_2_10_10_10_AS_10_10_10_10;
+  if (!(edram_format == xenos::ColorRenderTargetFormat::k_8_8_8_8 &&
+        dest_format == xenos::TextureFormat::k_8_8_8_8) &&
+      !(is_2_10_10_10 && dest_format == xenos::TextureFormat::k_2_10_10_10)) {
+    return ResolveTextureCopyResult::kFormat;
+  }
+  if (dest_info.copy_dest_exp_bias || dest_info.copy_dest_array ||
+      uint32_t(dest_info.copy_dest_endian) > uint32_t(xenos::Endian128::k16in32) ||
+      !xenos::IsSingleCopySampleSelected(
+          resolve_info.copy_dest_coordinate_info.copy_sample_select)) {
+    return ResolveTextureCopyResult::kFormat;
+  }
+
+  // Only from the origin: the destination texel at x, y is then the render target pixel at x, y.
+  uint32_t dest_base = register_file()[XE_GPU_REG_RB_COPY_DEST_BASE];
+  if (resolve_info.copy_dest_base != dest_base || (dest_base & 0xFFF) ||
+      resolve_info.copy_dest_coordinate_info.offset_x_div_8 ||
+      resolve_info.copy_dest_coordinate_info.offset_y_div_8 ||
+      resolve_info.coordinate_info.edram_offset_x_div_8 ||
+      resolve_info.coordinate_info.edram_offset_y_div_8 ||
+      edram_info.base_tiles != (resolve_info.color_original_base & (xenos::kEdramTileCount - 1))) {
+    return ResolveTextureCopyResult::kOffset;
+  }
+
+  uint32_t span_base, span_row_length, span_rows, span_pitch;
+  resolve_info.GetCopyEdramTileSpan(span_base, span_row_length, span_rows, span_pitch);
+  GetResolveCopyRectanglesToDump(span_base, span_row_length, span_rows, span_pitch,
+                                 resolve_texture_copy_rectangles_);
+  if (resolve_texture_copy_rectangles_.size() != 1) {
+    return ResolveTextureCopyResult::kAliasing;
+  }
+  const ResolveCopyDumpRectangle& rectangle = resolve_texture_copy_rectangles_.front();
+  if (rectangle.row_first || rectangle.rows != span_rows || rectangle.row_first_start ||
+      rectangle.row_last_end != span_row_length) {
+    return ResolveTextureCopyResult::kAliasing;
+  }
+  RenderTargetKey key = rectangle.render_target->key();
+  if (key.is_depth || key.msaa_samples != xenos::MsaaSamples::k1X ||
+      key.base_tiles != span_base || key.GetPitchTiles() != span_pitch) {
+    return ResolveTextureCopyResult::kAliasing;
+  }
+  xenos::ColorRenderTargetFormat key_format = key.GetColorFormat();
+  bool key_is_2_10_10_10 =
+      key_format == xenos::ColorRenderTargetFormat::k_2_10_10_10 ||
+      key_format == xenos::ColorRenderTargetFormat::k_2_10_10_10_AS_10_10_10_10;
+  if (is_2_10_10_10 ? !key_is_2_10_10_10
+                    : key_format != xenos::ColorRenderTargetFormat::k_8_8_8_8) {
+    return ResolveTextureCopyResult::kAliasing;
+  }
+  uint32_t width = resolve_info.coordinate_info.width_div_8 << xenos::kResolveAlignmentPixelsLog2;
+  uint32_t height = resolve_info.height_div_8 << xenos::kResolveAlignmentPixelsLog2;
+  if (width > key.GetWidth() ||
+      height > GetRenderTargetHeight(key.pitch_tiles_at_32bpp, key.msaa_samples)) {
+    return ResolveTextureCopyResult::kAliasing;
+  }
+
+  copy_out.dest_base = dest_base;
+  copy_out.dest_pitch_texels = resolve_info.copy_dest_coordinate_info.pitch_aligned_div_32
+                               << xenos::kTextureTileWidthHeightLog2;
+  copy_out.format = dest_format;
+  copy_out.endian = xenos::Endian(dest_info.copy_dest_endian);
+  copy_out.width = width;
+  copy_out.height = height;
+  // Matches the resolve shaders, which take the fill offset from the resolution scale.
+  bool fill = edram_info.fill_half_pixel_offset != 0;
+  copy_out.fill_x = fill ? draw_resolution_scale_x() >> 1 : 0;
+  copy_out.fill_y = fill ? draw_resolution_scale_y() >> 1 : 0;
+  copy_out.red_blue_swapped = dest_info.copy_dest_swap != 0;
+  source_out = rectangle.render_target;
+  return ResolveTextureCopyResult::kEligible;
 }
 
 }  // namespace rex::graphics

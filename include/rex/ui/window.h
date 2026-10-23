@@ -769,6 +769,12 @@ class Window {
   // complex than just a small state update, and recursive painting is
   // completely unsupported by the Presenter.
   bool is_painting_ = false;
+
+ public:
+  // The refresh rate of the display the window is on in Hz, or 0 if unknown. UI thread only.
+  // Last, so the other virtual functions keep the vtable slots the game, built against the
+  // unpatched header, calls them through.
+  virtual double GetDisplayRefreshRate() const { return 0.0; }
 };
 
 }  // namespace ui

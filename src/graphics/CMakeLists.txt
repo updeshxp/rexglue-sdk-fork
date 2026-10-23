@@ -21,6 +21,7 @@ set(REXGPU_XENOS_SOURCES
     pipeline/texture/extent.cpp
     pipeline/texture/util.cpp
     pipeline/texture/replacement.cpp
+    guest_wake.cpp
     util/draw_extent_estimator.cpp
     util/draw.cpp
     packet_disassembler.cpp
@@ -142,6 +143,10 @@ target_link_libraries(rexgpu-xenos PRIVATE
     stb_image
     stb_image_write
 )
+
+if(WIN32)
+    target_link_libraries(rexgpu-xenos PRIVATE synchronization)
+endif()
 
 if(REXGLUE_USE_VULKAN)
     target_link_libraries(rexgpu-xenos PRIVATE

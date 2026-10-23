@@ -202,6 +202,14 @@ bool D3D12RenderTargetCache::Initialize() {
     path_ = Path::kHostRenderTargets;
   }
 
+  if (path_ != Path::kHostRenderTargets && AreHostRenderTargetsReduced()) {
+    SetHostScaleQuarters(draw_resolution_scale_x() << 2, draw_resolution_scale_y() << 2);
+    REXGPU_WARN(
+        "The internal render scale needs the host render target path, drawing at {}x{} of the "
+        "guest resolution instead",
+        draw_resolution_scale_x(), draw_resolution_scale_y());
+  }
+
   // Create the buffer for reinterpreting EDRAM contents.
   uint32_t edram_buffer_size =
       xenos::kEdramSizeBytes * (draw_resolution_scale_x() * draw_resolution_scale_y());
@@ -434,10 +442,13 @@ bool D3D12RenderTargetCache::Initialize() {
         msaa_2x_supported_ = false;
       }
     }
-    if (!msaa_2x_supported_) {
+    if (msaa_2x_supported_) {
+      REXGPU_INFO("Guest 2x MSAA render targets: host 2x MSAA");
+    } else {
       REXGPU_WARN(
-          "2x MSAA is not supported, emulated via top-left and bottom-right "
-          "samples of 4x MSAA");
+          "Guest 2x MSAA render targets: host 4x MSAA, top-left and bottom-right samples ({})",
+          REXCVAR_GET(native_2x_msaa) ? "2x MSAA is unsupported for a needed format"
+                                      : "native_2x_msaa is off");
     }
 
     descriptor_pool_color_ = std::make_unique<ui::d3d12::D3D12CpuDescriptorPool>(
@@ -1065,10 +1076,90 @@ bool D3D12RenderTargetCache::Update(bool is_rasterization_done,
   }
   switch (GetPath()) {
     case Path::kHostRenderTargets: {
+      constexpr uint32_t kRenderTargetCount = 1 + xenos::kMaxColorRenderTargets;
       RenderTarget* const* depth_and_color_render_targets =
           last_update_accumulated_render_targets();
-      PerformTransfersAndResolveClears(1 + xenos::kMaxColorRenderTargets,
-                                       depth_and_color_render_targets, last_update_transfers());
+      const std::vector<Transfer>* transfers = last_update_transfers();
+      bool any_transfers = false;
+      for (uint32_t i = 0; i < kRenderTargetCount; ++i) {
+        any_transfers |= !transfers[i].empty();
+      }
+      Transfer::Rectangle overwrite_rectangle = {};
+      uint32_t overwritten = 0;
+      bool overwritten_depth_only = false;
+      if (any_transfers) {
+        // The pixel shader isn't used outside the color and depth mode.
+        const Shader* pixel_shader =
+            register_file().Get<reg::RB_MODECONTROL>().edram_mode == xenos::EdramMode::kColorDepth
+                ? command_processor_.active_pixel_shader()
+                : nullptr;
+        overwritten = GetDrawOverwrittenRenderTargets(
+            normalized_depth_control, normalized_color_mask, vertex_shader, pixel_shader,
+            overwrite_rectangle, overwritten_depth_only);
+        // With the stencil written by the transfer shader, the depth can't be skipped alone.
+        overwritten_depth_only &= !use_stencil_reference_output_;
+      }
+      if (overwritten || overwritten_depth_only) {
+        uint32_t cutout_render_targets = overwritten | uint32_t(overwritten_depth_only);
+        for (uint32_t i = 0; i < kRenderTargetCount; ++i) {
+          std::vector<Transfer>& kept_transfers = draw_overwrite_transfers_[i];
+          kept_transfers.clear();
+          const RenderTarget* render_target = depth_and_color_render_targets[i];
+          if (!render_target) {
+            continue;
+          }
+          if (!(cutout_render_targets & (uint32_t(1) << i))) {
+            kept_transfers = transfers[i];
+            continue;
+          }
+          RenderTargetKey key = render_target->key();
+          for (const Transfer& transfer : transfers[i]) {
+            Transfer::Rectangle rectangles[Transfer::kMaxRectanglesWithCutout];
+            // The stencil of a depth-only overwrite is transferred whole if it has anything to
+            // copy.
+            if (transfer.GetRectangles(key.base_tiles, key.GetPitchTiles(), key.msaa_samples,
+                                       key.Is64bpp(), rectangles, &overwrite_rectangle) ||
+                (overwritten_depth_only && i == 0 &&
+                 (static_cast<const D3D12RenderTarget*>(render_target)
+                      ->GetStencilBits(transfer.start_tiles,
+                                       transfer.end_tiles - transfer.start_tiles) ||
+                  GetTransferSourceStencilBits(transfer)))) {
+              kept_transfers.push_back(transfer);
+            }
+          }
+        }
+        PerformTransfersAndResolveClears(kRenderTargetCount, depth_and_color_render_targets,
+                                         draw_overwrite_transfers_, nullptr, &overwrite_rectangle,
+                                         cutout_render_targets, overwritten_depth_only);
+      } else {
+        PerformTransfersAndResolveClears(kRenderTargetCount, depth_and_color_render_targets,
+                                         transfers);
+      }
+      if (depth_and_color_render_targets[0]) {
+        if (CanDrawWriteDepthStencil(normalized_depth_control)) {
+          uint32_t draw_start_tiles, draw_length_tiles;
+          GetLastUpdateUsedTiles(0, draw_start_tiles, draw_length_tiles);
+          SetEdramTilesDirty(draw_start_tiles, draw_length_tiles, true);
+        }
+        uint32_t draw_stencil_bits = GetDrawStencilBits(normalized_depth_control);
+        if (draw_stencil_bits) {
+          uint32_t draw_start_tiles, draw_length_tiles;
+          GetLastUpdateUsedTiles(0, draw_start_tiles, draw_length_tiles);
+          static_cast<D3D12RenderTarget*>(depth_and_color_render_targets[0])
+              ->AddStencilBits(draw_start_tiles, draw_length_tiles, draw_stencil_bits);
+        }
+      }
+      // What a draw writes to a color render target is not a stencil carried from before.
+      for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
+        if (depth_and_color_render_targets[1 + i] &&
+            ((normalized_color_mask >> (4 * i)) & 0b1111)) {
+          uint32_t draw_start_tiles, draw_length_tiles;
+          GetLastUpdateUsedTiles(1 + i, draw_start_tiles, draw_length_tiles);
+          SetEdramTilesDirty(draw_start_tiles, draw_length_tiles, true);
+          static_cast<D3D12RenderTarget*>(depth_and_color_render_targets[1 + i])
+              ->AddStencilBits(draw_start_tiles, draw_length_tiles, UINT8_MAX);
+        }
+      }
       SetCommandListRenderTargets(depth_and_color_render_targets);
     } break;
     case Path::kPixelShaderInterlock: {
@@ -1194,29 +1285,17 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
     if (copy_shader != draw_util::ResolveCopyShaderIndex::kUnknown) {
       const draw_util::ResolveCopyShaderInfo& copy_shader_info =
           draw_util::resolve_copy_shader_info[size_t(copy_shader)];
-      bool direct_resolved = false;
       if (GetPath() == Path::kHostRenderTargets) {
-        if (REXCVAR_GET(direct_host_resolve)) {
-          direct_resolved =
-              TryResolveCopyDirectly(resolve_info, copy_shader, draw_resolution_scaled);
-          if (direct_resolved) {
-            ++direct_resolve_success_count_;
-          } else {
-            ++direct_resolve_fallback_count_;
-          }
-        }
-        if (!direct_resolved) {
-          // Dump the current contents of the render targets owning the affected
-          // range to edram_buffer_.
-          uint32_t dump_base;
-          uint32_t dump_row_length_used;
-          uint32_t dump_rows;
-          uint32_t dump_pitch;
-          resolve_info.GetCopyEdramTileSpan(dump_base, dump_row_length_used, dump_rows, dump_pitch);
-          if (!DumpRenderTargets(dump_base, dump_row_length_used, dump_rows, dump_pitch)) {
-            REXGPU_ERROR("D3D12RenderTargetCache: Failed to dump host render targets for resolve");
-            return false;
-          }
+        // Dump the current contents of the render targets owning the affected
+        // range to edram_buffer_.
+        uint32_t dump_base;
+        uint32_t dump_row_length_used;
+        uint32_t dump_rows;
+        uint32_t dump_pitch;
+        resolve_info.GetCopyEdramTileSpan(dump_base, dump_row_length_used, dump_rows, dump_pitch);
+        if (!DumpRenderTargets(dump_base, dump_row_length_used, dump_rows, dump_pitch)) {
+          REXGPU_ERROR("D3D12RenderTargetCache: Failed to dump host render targets for resolve");
+          return false;
         }
       }
 
@@ -1309,9 +1388,32 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
             shared_memory.MarkUAVWritesCommitNeeded();
           }
 
+          // Textures sampling the destination must be found while they still match the memory.
+          draw_util::ResolveTextureCopy texture_copy;
+          RenderTarget* texture_copy_source = nullptr;
+          ResolveTextureCopyResult texture_copy_result =
+              GetPath() == Path::kHostRenderTargets
+                  ? PlanResolveTextureCopy(resolve_info, texture_copy, texture_copy_source)
+                  : ResolveTextureCopyResult::kDisabled;
+          if (texture_copy_result == ResolveTextureCopyResult::kEligible &&
+              copy_shader != draw_util::ResolveCopyShaderIndex::kFast32bpp1x2xMSAA) {
+            texture_copy_result = ResolveTextureCopyResult::kFormat;
+          }
+          uint32_t texture_copy_count =
+              texture_copy_result == ResolveTextureCopyResult::kEligible
+                  ? texture_cache.PrepareResolveTextureCopies(texture_copy)
+                  : 0;
+
           // Invalidate textures and mark the range as scaled if needed.
           texture_cache.MarkRangeAsResolved(resolve_info.copy_dest_extent_start,
                                             resolve_info.copy_dest_extent_length);
+          if (texture_copy_count) {
+            auto& source = *static_cast<D3D12RenderTarget*>(texture_copy_source);
+            command_processor_.PushTransitionBarrier(
+                source.resource(), source.SetResourceState(D3D12_RESOURCE_STATE_COPY_SOURCE),
+                D3D12_RESOURCE_STATE_COPY_SOURCE);
+            texture_cache.PerformResolveTextureCopies(texture_copy, source.resource());
+          }
           written_address_out = resolve_info.copy_dest_extent_start;
           written_length_out = resolve_info.copy_dest_extent_length;
           copied = true;
@@ -1557,9 +1659,9 @@ RenderTargetCache::RenderTarget* D3D12RenderTargetCache::CreateRenderTarget(Rend
   D3D12_RESOURCE_DESC resource_desc;
   resource_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
   resource_desc.Alignment = 0;
-  resource_desc.Width = key.GetWidth() * draw_resolution_scale_x();
+  resource_desc.Width = GuestToHostX(key.GetWidth());
   resource_desc.Height =
-      GetRenderTargetHeight(key.pitch_tiles_at_32bpp, key.msaa_samples) * draw_resolution_scale_y();
+      GuestToHostY(GetRenderTargetHeight(key.pitch_tiles_at_32bpp, key.msaa_samples));
   resource_desc.DepthOrArraySize = 1;
   resource_desc.MipLevels = 1;
   if (key.is_depth) {
@@ -1702,6 +1804,10 @@ RenderTargetCache::RenderTarget* D3D12RenderTargetCache::CreateRenderTarget(Rend
 
 bool D3D12RenderTargetCache::IsHostDepthEncodingDifferent(
     xenos::DepthRenderTargetFormat format) const {
+  // The host depth is stored in the EDRAM buffer at the draw resolution scale.
+  if (AreHostRenderTargetsReduced()) {
+    return false;
+  }
   if (format == xenos::DepthRenderTargetFormat::kD24FS8) {
     return !depth_float24_convert_in_pixel_shader_;
   }
@@ -2424,11 +2530,8 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
   // for the coordinates for that load. Currently 3 temps are enough.
   a.OpDclTemps(3);
 
-  uint32_t draw_resolution_scale_x = this->draw_resolution_scale_x();
-  uint32_t draw_resolution_scale_y = this->draw_resolution_scale_y();
-
-  uint32_t tile_width_samples = xenos::kEdramTileWidthSamples * draw_resolution_scale_x;
-  uint32_t tile_height_samples = xenos::kEdramTileHeightSamples * draw_resolution_scale_y;
+  uint32_t tile_width_samples = GuestToHostX(xenos::kEdramTileWidthSamples);
+  uint32_t tile_height_samples = GuestToHostY(xenos::kEdramTileHeightSamples);
 
   // Split the destination pixel index into 32bpp tile in r0.zw and
   // 32bpp-tile-relative pixel index in r0.xy.
@@ -3793,12 +3896,120 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
   return pipelines;
 }
 
+bool D3D12RenderTargetCache::CanDrawWriteDepthStencil(
+    reg::RB_DEPTHCONTROL normalized_depth_control) const {
+  if (normalized_depth_control.z_enable && normalized_depth_control.z_write_enable) {
+    return true;
+  }
+  if (!normalized_depth_control.stencil_enable) {
+    return false;
+  }
+  const RegisterFile& regs = register_file();
+  if (!regs.Get<reg::RB_STENCILREFMASK>().stencilwritemask &&
+      !regs.Get<reg::RB_STENCILREFMASK>(XE_GPU_REG_RB_STENCILREFMASK_BF).stencilwritemask) {
+    return false;
+  }
+  xenos::StencilOp ops[2][3] = {
+      {normalized_depth_control.stencilfail, normalized_depth_control.stencilzfail,
+       normalized_depth_control.stencilzpass},
+      {normalized_depth_control.stencilfail_bf, normalized_depth_control.stencilzfail_bf,
+       normalized_depth_control.stencilzpass_bf}};
+  for (uint32_t face = 0; face <= uint32_t(normalized_depth_control.backface_enable); ++face) {
+    for (xenos::StencilOp op : ops[face]) {
+      if (op != xenos::StencilOp::kKeep) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+uint32_t D3D12RenderTargetCache::GetDrawStencilBits(
+    reg::RB_DEPTHCONTROL normalized_depth_control) const {
+  if (!normalized_depth_control.stencil_enable) {
+    return 0;
+  }
+  const RegisterFile& regs = register_file();
+  bool z_enabled = normalized_depth_control.z_enable;
+  xenos::CompareFunction z_function = normalized_depth_control.zfunc;
+  // Which of the two is used depends on the face and the culling, consider both.
+  reg::RB_STENCILREFMASK ref_masks[2] = {
+      regs.Get<reg::RB_STENCILREFMASK>(),
+      regs.Get<reg::RB_STENCILREFMASK>(XE_GPU_REG_RB_STENCILREFMASK_BF)};
+  xenos::CompareFunction functions[2] = {normalized_depth_control.stencilfunc,
+                                         normalized_depth_control.stencilfunc_bf};
+  // Stencil fail, depth fail, depth pass.
+  xenos::StencilOp ops[2][3] = {
+      {normalized_depth_control.stencilfail, normalized_depth_control.stencilzfail,
+       normalized_depth_control.stencilzpass},
+      {normalized_depth_control.stencilfail_bf, normalized_depth_control.stencilzfail_bf,
+       normalized_depth_control.stencilzpass_bf}};
+  uint32_t bits = 0;
+  for (uint32_t face = 0; face <= uint32_t(normalized_depth_control.backface_enable); ++face) {
+    bool stencil_can_fail = functions[face] != xenos::CompareFunction::kAlways;
+    bool stencil_can_pass = functions[face] != xenos::CompareFunction::kNever;
+    bool depth_can_fail = z_enabled && z_function != xenos::CompareFunction::kAlways;
+    bool depth_can_pass = !z_enabled || z_function != xenos::CompareFunction::kNever;
+    bool op_used[3] = {stencil_can_fail, stencil_can_pass && depth_can_fail,
+                       stencil_can_pass && depth_can_pass};
+    for (uint32_t i = 0; i < 3; ++i) {
+      xenos::StencilOp op = ops[face][i];
+      if (!op_used[i] || op == xenos::StencilOp::kKeep || op == xenos::StencilOp::kZero) {
+        continue;
+      }
+      for (const reg::RB_STENCILREFMASK& ref_mask : ref_masks) {
+        bits |= (op == xenos::StencilOp::kReplace ? ref_mask.stencilref : UINT8_MAX) &
+                ref_mask.stencilwritemask;
+      }
+    }
+  }
+  return bits;
+}
+
+void D3D12RenderTargetCache::SetClearedStencilBits(D3D12RenderTarget& render_target,
+                                                   const Transfer::Rectangle& rectangle,
+                                                   uint32_t stencil) {
+  if (!rectangle.width_pixels || !rectangle.height_pixels) {
+    return;
+  }
+  RenderTargetKey key = render_target.key();
+  uint32_t tile_width = xenos::kEdramTileWidthSamples >>
+                        (uint32_t(key.msaa_samples >= xenos::MsaaSamples::k4X) +
+                         uint32_t(key.Is64bpp()));
+  uint32_t tile_height = xenos::kEdramTileHeightSamples >>
+                         uint32_t(key.msaa_samples >= xenos::MsaaSamples::k2X);
+  uint32_t pitch_tiles = key.GetPitchTiles();
+  uint32_t x_end = rectangle.x_pixels + rectangle.width_pixels;
+  uint32_t y_end = rectangle.y_pixels + rectangle.height_pixels;
+  for (uint32_t row = rectangle.y_pixels / tile_height; row * tile_height < y_end; ++row) {
+    for (uint32_t column = rectangle.x_pixels / tile_width; column * tile_width < x_end;
+         ++column) {
+      uint32_t tile = key.base_tiles + row * pitch_tiles + column;
+      bool cleared_whole = rectangle.x_pixels <= column * tile_width &&
+                           (column + 1) * tile_width <= x_end &&
+                           rectangle.y_pixels <= row * tile_height &&
+                           (row + 1) * tile_height <= y_end;
+      render_target.SetTileStencilBits(
+          tile, cleared_whole ? stencil : (stencil | render_target.GetTileStencilBits(tile)));
+    }
+  }
+}
+
 void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
     uint32_t render_target_count, RenderTarget* const* render_targets,
     const std::vector<Transfer>* render_target_transfers,
     const uint64_t* render_target_resolve_clear_values,
-    const Transfer::Rectangle* resolve_clear_rectangle) {
+    const Transfer::Rectangle* resolve_clear_rectangle, uint32_t cutout_render_targets,
+    bool depth_only_cutout) {
   assert_true(GetPath() == Path::kHostRenderTargets);
+  auto get_cutout = [&](uint32_t render_target_index,
+                        bool stencil) -> const Transfer::Rectangle* {
+    if (!(cutout_render_targets & (uint32_t(1) << render_target_index)) ||
+        (stencil && depth_only_cutout)) {
+      return nullptr;
+    }
+    return resolve_clear_rectangle;
+  };
 
   const ui::d3d12::D3D12Provider& provider = command_processor_.GetD3D12Provider();
   ID3D12Device* device = provider.GetDevice();
@@ -3810,14 +4021,12 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
   if (resolve_clear_needed) {
     // Assuming the rectangle is already clamped by the setup function from the
     // common render target cache.
-    clear_rect.left = LONG(resolve_clear_rectangle->x_pixels * draw_resolution_scale_x());
-    clear_rect.top = LONG(resolve_clear_rectangle->y_pixels * draw_resolution_scale_y());
-    clear_rect.right =
-        LONG((resolve_clear_rectangle->x_pixels + resolve_clear_rectangle->width_pixels) *
-             draw_resolution_scale_x());
-    clear_rect.bottom =
-        LONG((resolve_clear_rectangle->y_pixels + resolve_clear_rectangle->height_pixels) *
-             draw_resolution_scale_y());
+    clear_rect.left = LONG(GuestToHostX(resolve_clear_rectangle->x_pixels));
+    clear_rect.top = LONG(GuestToHostY(resolve_clear_rectangle->y_pixels));
+    clear_rect.right = LONG(GuestToHostX(resolve_clear_rectangle->x_pixels +
+                                         resolve_clear_rectangle->width_pixels));
+    clear_rect.bottom = LONG(GuestToHostY(resolve_clear_rectangle->y_pixels +
+                                          resolve_clear_rectangle->height_pixels));
   }
 
   // Do host depth storing for the depth destination (assuming there can be only
@@ -3895,8 +4104,7 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
       Transfer::Rectangle transfer_rectangles[Transfer::kMaxRectanglesWithCutout];
       uint32_t transfer_rectangle_count = transfer.GetRectangles(
           dest_rt_key.base_tiles, dest_rt_key.pitch_tiles_at_32bpp, dest_rt_key.msaa_samples, false,
-          transfer_rectangles, resolve_clear_rectangle);
-      assert_not_zero(transfer_rectangle_count);
+          transfer_rectangles, get_cutout(i, false));
       HostDepthStoreRectangleConstant host_depth_store_rectangle_constant;
       for (uint32_t j = 0; j < transfer_rectangle_count; ++j) {
         uint32_t group_count_x, group_count_y;
@@ -4073,8 +4281,8 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
 
   bool transfer_viewport_set = false;
   float pixels_to_ndc_unscaled = 2.0f / float(D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION);
-  float pixels_to_ndc_x = pixels_to_ndc_unscaled * draw_resolution_scale_x();
-  float pixels_to_ndc_y = pixels_to_ndc_unscaled * draw_resolution_scale_y();
+  float pixels_to_ndc_x = pixels_to_ndc_unscaled * (float(host_scale_quarters_x()) * 0.25f);
+  float pixels_to_ndc_y = pixels_to_ndc_unscaled * (float(host_scale_quarters_y()) * 0.25f);
 
   TransferRootSignatureIndex last_transfer_root_signature_index =
       TransferRootSignatureIndex::kCount;
@@ -4137,7 +4345,27 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
       TransferShaderKey new_transfer_shader_key;
       new_transfer_shader_key.dest_msaa_samples = dest_rt_key.msaa_samples;
       new_transfer_shader_key.dest_resource_format = dest_rt_key.resource_format;
+      // The stencil only needs clearing where it may have something to be cleared (it is zero
+      // until written to), and only the bits set in the source need to be copied.
+      current_stencil_clear_transfers_.clear();
+      if (need_stencil_bit_draws) {
+        for (const Transfer& transfer : current_transfers) {
+          StencilRun clear_runs[kMaxStencilRuns];
+          uint32_t clear_run_count = GetStencilRuns(
+              transfer.start_tiles, transfer.end_tiles,
+              [&](uint32_t tile) { return dest_d3d12_rt.GetTileStencilBits(tile); }, clear_runs);
+          for (uint32_t k = 0; k < clear_run_count; ++k) {
+            current_stencil_clear_transfers_.emplace_back(
+                clear_runs[k].start_tiles, clear_runs[k].end_tiles, transfer.source, nullptr);
+          }
+        }
+      }
       uint32_t stencil_clear_rectangle_count = 0;
+      for (const Transfer& transfer : current_stencil_clear_transfers_) {
+        stencil_clear_rectangle_count += transfer.GetRectangles(
+            dest_rt_key.base_tiles, dest_pitch_tiles, dest_rt_key.msaa_samples, dest_is_64bpp,
+            nullptr, get_cutout(i, true));
+      }
       for (uint32_t j = 0; j <= uint32_t(need_stencil_bit_draws); ++j) {
         // j == 0 - color or depth.
         // j == 1 - stencil bits.
@@ -4180,28 +4408,33 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
             new_transfer_shader_key.mode = source_rt_key.is_depth
                                                ? TransferMode::kDepthToStencilBit
                                                : TransferMode::kColorToStencilBit;
-            stencil_clear_rectangle_count += transfer.GetRectangles(
-                dest_rt_key.base_tiles, dest_pitch_tiles, dest_rt_key.msaa_samples, dest_is_64bpp,
-                nullptr, resolve_clear_rectangle);
-          } else {
-            if (dest_rt_key.is_depth) {
-              if (host_depth_source_d3d12_rt) {
-                new_transfer_shader_key.mode = source_rt_key.is_depth
-                                                   ? TransferMode::kDepthAndHostDepthToDepth
-                                                   : TransferMode::kColorAndHostDepthToDepth;
-              } else {
-                new_transfer_shader_key.mode = source_rt_key.is_depth ? TransferMode::kDepthToDepth
-                                                                      : TransferMode::kColorToDepth;
-              }
-            } else {
-              new_transfer_shader_key.mode = source_rt_key.is_depth ? TransferMode::kDepthToColor
-                                                                    : TransferMode::kColorToColor;
+            StencilRun source_runs[kMaxStencilRuns];
+            uint32_t source_run_count = GetStencilRuns(
+                transfer.start_tiles, transfer.end_tiles,
+                [&](uint32_t tile) { return GetTransferTileStencilBits(transfer, tile, dest_rt_key); },
+                source_runs);
+            for (uint32_t k = 0; k < source_run_count; ++k) {
+              current_transfer_invocations_.emplace_back(
+                  Transfer(source_runs[k].start_tiles, source_runs[k].end_tiles, transfer.source,
+                           nullptr),
+                  new_transfer_shader_key, source_runs[k].bits);
             }
+            continue;
+          }
+          if (dest_rt_key.is_depth) {
+            if (host_depth_source_d3d12_rt) {
+              new_transfer_shader_key.mode = source_rt_key.is_depth
+                                                 ? TransferMode::kDepthAndHostDepthToDepth
+                                                 : TransferMode::kColorAndHostDepthToDepth;
+            } else {
+              new_transfer_shader_key.mode = source_rt_key.is_depth ? TransferMode::kDepthToDepth
+                                                                    : TransferMode::kColorToDepth;
+            }
+          } else {
+            new_transfer_shader_key.mode = source_rt_key.is_depth ? TransferMode::kDepthToColor
+                                                                  : TransferMode::kColorToColor;
           }
           current_transfer_invocations_.emplace_back(transfer, new_transfer_shader_key);
-          if (j) {
-            current_transfer_invocations_.back().transfer.host_depth_source = nullptr;
-          }
         }
       }
       std::sort(current_transfer_invocations_.begin(), current_transfer_invocations_.end());
@@ -4216,24 +4449,22 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
             dest_d3d12_rt.descriptor_draw().GetHandle(), D3D12_CLEAR_FLAG_STENCIL, 0.0f, 0,
             stencil_clear_rectangle_count);
         assert_not_null(stencil_clear_rect_write_ptr);
-        for (const Transfer& transfer : current_transfers) {
+        for (const Transfer& transfer : current_stencil_clear_transfers_) {
           Transfer::Rectangle transfer_stencil_clear_rectangles[Transfer::kMaxRectanglesWithCutout];
           uint32_t transfer_stencil_clear_rectangle_count = transfer.GetRectangles(
               dest_rt_key.base_tiles, dest_pitch_tiles, dest_rt_key.msaa_samples, dest_is_64bpp,
-              transfer_stencil_clear_rectangles, resolve_clear_rectangle);
+              transfer_stencil_clear_rectangles, get_cutout(i, true));
           for (uint32_t j = 0; j < transfer_stencil_clear_rectangle_count; ++j) {
             const Transfer::Rectangle& stencil_clear_rectangle =
                 transfer_stencil_clear_rectangles[j];
             stencil_clear_rect_write_ptr->left =
-                LONG(stencil_clear_rectangle.x_pixels * draw_resolution_scale_x());
+                LONG(GuestToHostX(stencil_clear_rectangle.x_pixels));
             stencil_clear_rect_write_ptr->top =
-                LONG(stencil_clear_rectangle.y_pixels * draw_resolution_scale_y());
-            stencil_clear_rect_write_ptr->right =
-                LONG((stencil_clear_rectangle.x_pixels + stencil_clear_rectangle.width_pixels) *
-                     draw_resolution_scale_x());
-            stencil_clear_rect_write_ptr->bottom =
-                LONG((stencil_clear_rectangle.y_pixels + stencil_clear_rectangle.height_pixels) *
-                     draw_resolution_scale_y());
+                LONG(GuestToHostY(stencil_clear_rectangle.y_pixels));
+            stencil_clear_rect_write_ptr->right = LONG(GuestToHostX(
+                stencil_clear_rectangle.x_pixels + stencil_clear_rectangle.width_pixels));
+            stencil_clear_rect_write_ptr->bottom = LONG(GuestToHostY(
+                stencil_clear_rectangle.y_pixels + stencil_clear_rectangle.height_pixels));
             ++stencil_clear_rect_write_ptr;
           }
         }
@@ -4264,14 +4495,18 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
         command_processor_.SetScissorRect(transfer_scissor);
       }
 
+      bool all_transfers_drawn = true;
       for (auto it = current_transfer_invocations_.cbegin();
            it != current_transfer_invocations_.cend(); ++it) {
         const TransferInvocation& transfer_invocation_first = *it;
+        const Transfer::Rectangle* invocation_cutout = get_cutout(
+            i, kTransferModes[size_t(transfer_invocation_first.shader_key.mode)].output ==
+                   TransferOutput::kStencilBit);
         // Will be merging transfers from the same source into one mesh.
         auto it_merged_first = it, it_merged_last = it;
         uint32_t transfer_rectangle_count = transfer_invocation_first.transfer.GetRectangles(
             dest_rt_key.base_tiles, dest_pitch_tiles, dest_rt_key.msaa_samples, dest_is_64bpp,
-            nullptr, resolve_clear_rectangle);
+            nullptr, invocation_cutout);
         for (auto it_merge = std::next(it_merged_first);
              it_merge != current_transfer_invocations_.cend(); ++it_merge) {
           if (!transfer_invocation_first.CanBeMergedIntoOneDraw(*it_merge)) {
@@ -4279,12 +4514,15 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
           }
           transfer_rectangle_count += it_merge->transfer.GetRectangles(
               dest_rt_key.base_tiles, dest_pitch_tiles, dest_rt_key.msaa_samples, dest_is_64bpp,
-              nullptr, resolve_clear_rectangle);
+              nullptr, invocation_cutout);
           it_merged_last = it_merge;
         }
-        assert_not_zero(transfer_rectangle_count);
         // Skip the merged transfers in the subsequent iterations.
         it = it_merged_last;
+        if (!transfer_rectangle_count) {
+          // Entirely inside what the draw replaces.
+          continue;
+        }
 
         assert_not_null(it->transfer.source);
         auto& source_d3d12_rt = *static_cast<D3D12RenderTarget*>(it->transfer.source);
@@ -4331,14 +4569,14 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
                 current_submission, transfer_rectangle_buffer_view.SizeInBytes, sizeof(float),
                 nullptr, nullptr, &transfer_rectangle_buffer_view.BufferLocation));
         if (!transfer_rectangle_write_ptr) {
+          all_transfers_drawn = false;
           continue;
         }
         for (auto it_merged = it_merged_first; it_merged <= it_merged_last; ++it_merged) {
           Transfer::Rectangle transfer_invocation_rectangles[Transfer::kMaxRectanglesWithCutout];
           uint32_t transfer_invocation_rectangle_count = it_merged->transfer.GetRectangles(
               dest_rt_key.base_tiles, dest_pitch_tiles, dest_rt_key.msaa_samples, dest_is_64bpp,
-              transfer_invocation_rectangles, resolve_clear_rectangle);
-          assert_not_zero(transfer_invocation_rectangle_count);
+              transfer_invocation_rectangles, invocation_cutout);
           for (uint32_t j = 0; j < transfer_invocation_rectangle_count; ++j) {
             const Transfer::Rectangle& transfer_rectangle = transfer_invocation_rectangles[j];
             float transfer_rectangle_x0 = -1.0f + transfer_rectangle.x_pixels * pixels_to_ndc_x;
@@ -4385,6 +4623,7 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
         ID3D12PipelineState* const* transfer_pipelines =
             GetOrCreateTransferPipelines(transfer_shader_key);
         if (!transfer_pipelines) {
+          all_transfers_drawn = false;
           continue;
         }
         if (last_transfer_root_signature_index != transfer_root_signature_index) {
@@ -4537,16 +4776,35 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
 
         // Draw the transfer rectangles.
         command_processor_.SubmitBarriers();
-        for (uint32_t j = 0; j <= uint32_t(is_stencil_bit) * 7; ++j) {
-          if (is_stencil_bit) {
+        if (is_stencil_bit) {
+          uint32_t stencil_bits_remaining = transfer_invocation_first.stencil_bits;
+          uint32_t j;
+          while (rex::bit_scan_forward(stencil_bits_remaining, &j)) {
+            stencil_bits_remaining &= ~(uint32_t(1) << j);
             uint32_t transfer_stencil_bit = uint32_t(1) << j;
             command_list.D3DSetGraphicsRoot32BitConstants(
                 rex::bit_count(transfer_root_parameters_used &
                                (kTransferUsedRootParameterStencilMaskConstantBit - 1)),
                 sizeof(transfer_stencil_bit) / sizeof(uint32_t), &transfer_stencil_bit, 0);
+            command_processor_.SetExternalPipeline(transfer_pipelines[j]);
+            command_list.D3DDrawInstanced(transfer_vertex_count, 1, 0, 0);
           }
-          command_processor_.SetExternalPipeline(transfer_pipelines[j]);
+        } else {
+          command_processor_.SetExternalPipeline(transfer_pipelines[0]);
           command_list.D3DDrawInstanced(transfer_vertex_count, 1, 0, 0);
+        }
+      }
+
+      // Where the destination was cleared and the whole tile was transferred, it now has the
+      // source's; otherwise something of what it had may remain. A color render target that doesn't
+      // carry the stencil has it unknown.
+      bool dest_replaced = all_transfers_drawn && !get_cutout(i, dest_rt_key.is_depth);
+      for (const Transfer& transfer : current_transfers) {
+        for (uint32_t tile = transfer.start_tiles; tile < transfer.end_tiles; ++tile) {
+          uint32_t source_bits = GetTransferTileStencilBits(transfer, tile, dest_rt_key);
+          dest_d3d12_rt.SetTileStencilBits(
+              tile, dest_replaced ? source_bits
+                                  : (source_bits | dest_d3d12_rt.GetTileStencilBits(tile)));
         }
       }
     }
@@ -4575,6 +4833,7 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
                                               D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL,
                                               depth_host_clear_value, UINT(clear_value) & 0xFF, 1,
                                               &clear_rect);
+        SetClearedStencilBits(dest_d3d12_rt, *resolve_clear_rectangle, UINT(clear_value) & 0xFF);
       } else {
         float color_clear_value[4] = {};
         bool clear_via_drawing = false;
@@ -4684,6 +4943,10 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
                   : dest_d3d12_rt.descriptor_draw().GetHandle(),
               color_clear_value, 1, &clear_rect);
         }
+        SetClearedStencilBits(dest_d3d12_rt, *resolve_clear_rectangle,
+                              IsStencilCarryingColorFormat(dest_rt_key)
+                                  ? uint32_t(clear_value) & 0xFF
+                                  : uint32_t(UINT8_MAX));
       }
     }
   }
@@ -5083,6 +5346,10 @@ ID3D12PipelineState* D3D12RenderTargetCache::GetOrCreateDumpPipeline(DumpPipelin
   uint32_t tile_width =
       (xenos::kEdramTileWidthSamples * draw_resolution_scale_x) >> uint32_t(format_is_64bpp);
   uint32_t tile_height = xenos::kEdramTileHeightSamples * draw_resolution_scale_y;
+  // The source texture is at the host scale, and the EDRAM at the draw resolution scale.
+  uint32_t source_tile_width =
+      GuestToHostX(xenos::kEdramTileWidthSamples) >> uint32_t(format_is_64bpp);
+  uint32_t source_tile_height = GuestToHostY(xenos::kEdramTileHeightSamples);
 
   // Get the parts of the address - tile row index within the dispatch to r0.zw,
   // sample Y within the tile to r0.xy.
@@ -5217,6 +5484,28 @@ ID3D12PipelineState* D3D12RenderTargetCache::GetOrCreateDumpPipeline(DumpPipelin
   // r1.x = Y tile row index within the source texture
   a.OpUDiv(dxbc::Dest::R(1, 0b0001), dxbc::Dest::R(0, 0b1000), dxbc::Src::R(0, dxbc::Src::kWWWW),
            dxbc::Src::R(1, dxbc::Src::kXXXX));
+  if (AreHostRenderTargetsReduced()) {
+    // The sample of the EDRAM scale gets the value of the source pixel its center is in.
+    uint32_t source_msaa_log2[] = {uint32_t(key.msaa_samples >= xenos::MsaaSamples::k4X),
+                                   uint32_t(key.msaa_samples >= xenos::MsaaSamples::k2X)};
+    uint32_t host_scale_quarters[] = {host_scale_quarters_x(), host_scale_quarters_y()};
+    uint32_t draw_resolution_scale[] = {draw_resolution_scale_x, draw_resolution_scale_y};
+    for (uint32_t i = 0; i < 2; ++i) {
+      dxbc::Src position_src(dxbc::Src::R(0, i ? dxbc::Src::kYYYY : dxbc::Src::kXXXX));
+      a.OpUShR(dxbc::Dest::R(1, 0b0010), position_src, dxbc::Src::LU(source_msaa_log2[i]));
+      a.OpAnd(dxbc::Dest::R(1, 0b0100), position_src,
+              dxbc::Src::LU((UINT32_C(1) << source_msaa_log2[i]) - 1));
+      a.OpUMAd(dxbc::Dest::R(1, 0b0010), dxbc::Src::R(1, dxbc::Src::kYYYY), dxbc::Src::LU(2),
+               dxbc::Src::LU(1));
+      a.OpUMAd(dxbc::Dest::R(1, 0b0010), dxbc::Src::R(1, dxbc::Src::kYYYY),
+               dxbc::Src::LU(host_scale_quarters[i]), dxbc::Src::LU(0));
+      a.OpUDiv(dxbc::Dest::R(1, 0b0010), dxbc::Dest::Null(), dxbc::Src::R(1, dxbc::Src::kYYYY),
+               dxbc::Src::LU(draw_resolution_scale[i] << 3));
+      a.OpUMAd(dxbc::Dest::R(0, i ? 0b0010 : 0b0001), dxbc::Src::R(1, dxbc::Src::kYYYY),
+               dxbc::Src::LU(UINT32_C(1) << source_msaa_log2[i]),
+               dxbc::Src::R(1, dxbc::Src::kZZZZ));
+    }
+  }
   // Add the source texture tile X offset to the source texture sample X
   // coordinate.
   // r0.x = X sample position within the source texture
@@ -5224,8 +5513,8 @@ ID3D12PipelineState* D3D12RenderTargetCache::GetOrCreateDumpPipeline(DumpPipelin
   // r0.z = sample offset in the EDRAM
   // r0.w = free
   // r1.x = Y tile row index within the source texture
-  a.OpUMAd(dxbc::Dest::R(0, 0b0001), dxbc::Src::R(0, dxbc::Src::kWWWW), dxbc::Src::LU(tile_width),
-           dxbc::Src::R(0, dxbc::Src::kXXXX));
+  a.OpUMAd(dxbc::Dest::R(0, 0b0001), dxbc::Src::R(0, dxbc::Src::kWWWW),
+           dxbc::Src::LU(source_tile_width), dxbc::Src::R(0, dxbc::Src::kXXXX));
   // Add the source texture tile Y offset to the source texture sample Y
   // coordinate.
   // r0.x = X sample position within the source texture
@@ -5233,8 +5522,7 @@ ID3D12PipelineState* D3D12RenderTargetCache::GetOrCreateDumpPipeline(DumpPipelin
   // r0.z = sample offset in the EDRAM
   // r1.x = free
   a.OpUMAd(dxbc::Dest::R(0, 0b0010), dxbc::Src::R(1, dxbc::Src::kXXXX),
-           dxbc::Src::LU(xenos::kEdramTileHeightSamples * draw_resolution_scale_y),
-           dxbc::Src::R(0, dxbc::Src::kYYYY));
+           dxbc::Src::LU(source_tile_height), dxbc::Src::R(0, dxbc::Src::kYYYY));
   // Will be using the source texture coordinates from r0.xy, and for
   // single-sampled source, LOD from r0.w.
   dxbc::Src source_address_src(dxbc::Src::R(0, 0b11000100));
@@ -5580,6 +5868,29 @@ bool D3D12RenderTargetCache::TryResolveCopyDirectly(const draw_util::ResolveInfo
   return DumpRenderTargets(dump_base, dump_row_length_used, dump_rows, dump_pitch);
 }
 
+bool D3D12RenderTargetCache::ShrinkDumpDispatchToDirtyTiles(
+    uint32_t dump_base, uint32_t dump_pitch, ResolveCopyDumpRectangle::Dispatch& dispatch) const {
+  uint32_t first_row = UINT32_MAX, last_row = 0, first_column = UINT32_MAX, last_column = 0;
+  for (uint32_t row = 0; row < dispatch.height_tiles; ++row) {
+    uint32_t row_first_tile = dump_base + dispatch.offset + row * dump_pitch;
+    for (uint32_t column = 0; column < dispatch.width_tiles; ++column) {
+      if (IsEdramTileDirty(row_first_tile + column)) {
+        first_row = std::min(first_row, row);
+        last_row = row;
+        first_column = std::min(first_column, column);
+        last_column = std::max(last_column, column);
+      }
+    }
+  }
+  if (first_row == UINT32_MAX) {
+    return false;
+  }
+  dispatch.offset += first_row * dump_pitch + first_column;
+  dispatch.width_tiles = last_column - first_column + 1;
+  dispatch.height_tiles = last_row - first_row + 1;
+  return true;
+}
+
 bool D3D12RenderTargetCache::DumpRenderTargets(uint32_t dump_base, uint32_t dump_row_length_used,
                                                uint32_t dump_rows, uint32_t dump_pitch) {
   assert_true(GetPath() == Path::kHostRenderTargets);
@@ -5599,13 +5910,35 @@ bool D3D12RenderTargetCache::DumpRenderTargets(uint32_t dump_base, uint32_t dump
   }
   // Gather all needed barriers and info needed to create descriptors and to
   // sort the invocations.
-  TransitionEdramBuffer(D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
   dump_invocations_.clear();
   dump_invocations_.reserve(dump_rectangles_.size());
+  for (const ResolveCopyDumpRectangle& rectangle : dump_rectangles_) {
+    RenderTargetKey rt_key = rectangle.render_target->key();
+    DumpPipelineKey pipeline_key;
+    pipeline_key.msaa_samples = rt_key.msaa_samples;
+    pipeline_key.resource_format = rt_key.resource_format;
+    pipeline_key.is_depth = rt_key.is_depth;
+    DumpInvocation invocation(rectangle, pipeline_key);
+    ResolveCopyDumpRectangle::Dispatch dispatches[ResolveCopyDumpRectangle::kMaxDispatches];
+    uint32_t dispatch_count = rectangle.GetDispatches(dump_pitch, dump_row_length_used, dispatches);
+    for (uint32_t i = 0; i < dispatch_count; ++i) {
+      if (ShrinkDumpDispatchToDirtyTiles(dump_base, dump_pitch, dispatches[i])) {
+        invocation.dispatches[invocation.dispatch_count++] = dispatches[i];
+      }
+    }
+    if (invocation.dispatch_count) {
+      dump_invocations_.push_back(invocation);
+    }
+  }
+  if (dump_invocations_.empty()) {
+    return true;
+  }
+  TransitionEdramBuffer(D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
   current_temporary_descriptors_cpu_.clear();
   bool any_sources_32bpp_64bpp[2] = {};
   uint32_t rt_sort_index = 0;
-  for (const ResolveCopyDumpRectangle& rectangle : dump_rectangles_) {
+  for (const DumpInvocation& invocation : dump_invocations_) {
+    const ResolveCopyDumpRectangle& rectangle = invocation.rectangle;
     auto& d3d12_rt = *static_cast<D3D12RenderTarget*>(rectangle.render_target);
     command_processor_.PushTransitionBarrier(
         d3d12_rt.resource(),
@@ -5625,11 +5958,6 @@ bool D3D12RenderTargetCache::DumpRenderTargets(uint32_t dump_base, uint32_t dump
       current_temporary_descriptors_cpu_.push_back(d3d12_rt.descriptor_srv_stencil().GetHandle());
     }
     any_sources_32bpp_64bpp[size_t(rt_key.Is64bpp())] = true;
-    DumpPipelineKey pipeline_key;
-    pipeline_key.msaa_samples = rt_key.msaa_samples;
-    pipeline_key.resource_format = rt_key.resource_format;
-    pipeline_key.is_depth = rt_key.is_depth;
-    dump_invocations_.emplace_back(rectangle, pipeline_key);
   }
   // 32bpp and 64bpp.
   size_t edram_uav_indices[2] = {SIZE_MAX, SIZE_MAX};
@@ -5770,10 +6098,8 @@ bool D3D12RenderTargetCache::DumpRenderTargets(uint32_t dump_base, uint32_t dump
     constexpr uint32_t kDumpRootParameterOffsetsBit = uint32_t(1) << kDumpRootParameterOffsets;
     DumpOffsets offsets;
     offsets.source_base_tiles = rt_key.base_tiles;
-    ResolveCopyDumpRectangle::Dispatch dispatches[ResolveCopyDumpRectangle::kMaxDispatches];
-    uint32_t dispatch_count = rectangle.GetDispatches(dump_pitch, dump_row_length_used, dispatches);
-    for (uint32_t i = 0; i < dispatch_count; ++i) {
-      const ResolveCopyDumpRectangle::Dispatch& dispatch = dispatches[i];
+    for (uint32_t i = 0; i < invocation.dispatch_count; ++i) {
+      const ResolveCopyDumpRectangle::Dispatch& dispatch = invocation.dispatches[i];
       offsets.dispatch_first_tile = dump_base + dispatch.offset;
       if (last_offsets != offsets) {
         last_offsets = offsets;
@@ -5790,6 +6116,10 @@ bool D3D12RenderTargetCache::DumpRenderTargets(uint32_t dump_base, uint32_t dump
       command_list.D3DDispatch((dispatch.width_tiles * draw_resolution_scale_x())
                                    << uint32_t(!format_is_64bpp),
                                dispatch.height_tiles * draw_resolution_scale_y(), 1);
+      for (uint32_t row = 0; row < dispatch.height_tiles; ++row) {
+        SetEdramTilesDirty(dump_base + dispatch.offset + row * dump_pitch, dispatch.width_tiles,
+                           false);
+      }
     }
     MarkEdramBufferModified();
   }

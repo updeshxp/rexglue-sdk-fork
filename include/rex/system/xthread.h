@@ -321,6 +321,23 @@ class XThread : public XObject {
   // via Exit(0) and DOES NOT RETURN. Called from the kernel wait primitives.
   static void CheckTitleTermination();
 
+  // Waits until no other guest thread can run guest code: each one has exited or is blocked
+  // in a kernel wait, which it then never leaves. If one still runs when the time is up, the
+  // process ends here, as nothing that thread can reach may be destroyed under it.
+  static void StopTitleThreads();
+
+  // Scope of a blocking kernel wait of the current thread.
+  class GuestWait {
+   public:
+    GuestWait();
+    ~GuestWait();
+    GuestWait(const GuestWait&) = delete;
+    GuestWait& operator=(const GuestWait&) = delete;
+
+   private:
+    bool counted_;
+  };
+
   static uint32_t GetLastError();
   static void SetLastError(uint32_t error_code);
 
@@ -419,7 +436,7 @@ class XThread : public XObject {
   bool guest_thread_ = false;
   bool main_thread_ = false;  // Entry-point thread
   // Atomic: written by the thread itself in Exit/Terminate, read cross-thread by
-  // KernelState::TerminateTitle's cooperative drain.
+  // KernelState::TerminateTitle.
   std::atomic<bool> running_{false};
 
   std::string thread_name_;

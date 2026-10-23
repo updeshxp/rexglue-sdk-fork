@@ -376,6 +376,16 @@ u32 RtlInitializeCriticalSectionAndSpinCount_entry(ppc_ptr_t<X_RTL_CRITICAL_SECT
   return xeRtlInitializeCriticalSectionAndSpinCount(cs, cs.guest_address(), spin_count);
 }
 
+constexpr int kCriticalSectionIdleSpins = 256;
+
+inline void SpinPause() {
+#if defined(__x86_64__) || defined(_M_X64)
+  _mm_pause();
+#elif defined(__aarch64__)
+  __builtin_arm_yield();
+#endif
+}
+
 void RtlEnterCriticalSection_entry(ppc_ptr_t<X_RTL_CRITICAL_SECTION> cs) {
   uint32_t cur_thread = XThread::GetCurrentThread()->guest_object();
   uint32_t spin_count = cs->header.absolute * 256;
@@ -395,6 +405,18 @@ void RtlEnterCriticalSection_entry(ppc_ptr_t<X_RTL_CRITICAL_SECTION> cs) {
       cs->recursion_count = 1;
       return;
     }
+  }
+
+  // Holds are short and a kernel wait costs far more than the hold, so poll briefly first. Only a free
+  // lock without waiters reads -1, so this cannot take the lock from a thread that is already waiting.
+  for (int i = 0; i < kCriticalSectionIdleSpins; ++i) {
+    if (*reinterpret_cast<volatile int32_t*>(&cs->lock_count) == -1 &&
+        rex::thread::atomic_cas(-1, 0, &cs->lock_count)) {
+      cs->owning_thread = cur_thread;
+      cs->recursion_count = 1;
+      return;
+    }
+    SpinPause();
   }
 
   if (rex::thread::atomic_inc(&cs->lock_count) != 0) {

@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdlib>
 #include <cstring>
 
 #include <fmt/format.h>
@@ -117,6 +118,63 @@ XThread* GetBoundCurrentXThread() {
   return current_xthread_tls_;
 }
 
+// Guest threads that can run guest code: started, not finished and not blocked in a kernel wait.
+// kTitleStopped is set once none was left, and from then on none runs again.
+constexpr uint32_t kTitleStopped = 0x80000000u;
+std::atomic<uint32_t> title_threads_running_{0};
+std::atomic<bool> title_stop_waiting_{false};
+
+struct TitleStopSignal {
+  std::mutex mutex;
+  std::condition_variable changed;
+};
+
+// Never destroyed: stopped threads stay parked on it until the process exits.
+TitleStopSignal& title_stop_signal() {
+  static auto* signal = new TitleStopSignal;
+  return *signal;
+}
+
+[[noreturn]] void ParkStoppedThread() {
+  auto& signal = title_stop_signal();
+  std::unique_lock<std::mutex> lock(signal.mutex);
+  for (;;) {
+    signal.changed.wait(lock);
+  }
+}
+
+void BeginTitleExecution() {
+  uint32_t state = title_threads_running_.load();
+  do {
+    if (state & kTitleStopped) {
+      ParkStoppedThread();
+    }
+  } while (!title_threads_running_.compare_exchange_weak(state, state + 1));
+}
+
+void EndTitleExecution() {
+  title_threads_running_.fetch_sub(1);
+  if (title_stop_waiting_.load()) {
+    auto& signal = title_stop_signal();
+    std::lock_guard<std::mutex> lock(signal.mutex);
+    signal.changed.notify_all();
+  }
+}
+
+// Destroyed with the thread's other thread-local storage, after the thread released its last
+// kernel object (on POSIX, Thread::Exit unwinds the stack first).
+struct TitleThreadCount {
+  bool counted = false;
+  // Set on a thread that stopped the others: it stays counted until it has exited, but never parks.
+  bool stopping = false;
+  ~TitleThreadCount() {
+    if (counted) {
+      EndTitleExecution();
+    }
+  }
+};
+thread_local TitleThreadCount title_thread_count_;
+
 }  // namespace
 
 bool XThread::IsInThread() {
@@ -141,6 +199,48 @@ void XThread::CheckTitleTermination() {
       self->kernel_state()->is_terminating_title()) {
     // Unwind cleanly at this safe point. Does not return.
     self->Exit(0);
+  }
+}
+
+void XThread::StopTitleThreads() {
+  constexpr auto kStopTimeout = std::chrono::seconds(2);
+  // The stopping thread is not one of the threads it waits for, but a later stop waits for its exit.
+  title_thread_count_.stopping = true;
+  const uint32_t self = title_thread_count_.counted ? 1 : 0;
+  auto& signal = title_stop_signal();
+  title_stop_waiting_.store(true);
+  {
+    std::unique_lock<std::mutex> lock(signal.mutex);
+    const auto deadline = std::chrono::steady_clock::now() + kStopTimeout;
+    for (bool timed_out = false;;) {
+      uint32_t state = self;
+      if (title_threads_running_.compare_exchange_strong(state, kTitleStopped | self) ||
+          state == (kTitleStopped | self)) {
+        return;
+      }
+      if (timed_out) {
+        break;
+      }
+      timed_out = signal.changed.wait_until(lock, deadline) == std::cv_status::timeout;
+    }
+  }
+  // Killing that thread would orphan the host locks it holds, so the process ends without any
+  // teardown, as on window close.
+  REXSYS_ERROR("XThread::StopTitleThreads: guest threads are still running; exiting");
+  rex::FlushLogging();
+  std::_Exit(EXIT_FAILURE);
+}
+
+XThread::GuestWait::GuestWait()
+    : counted_(title_thread_count_.counted && !title_thread_count_.stopping) {
+  if (counted_) {
+    EndTitleExecution();
+  }
+}
+
+XThread::GuestWait::~GuestWait() {
+  if (counted_) {
+    BeginTitleExecution();
   }
 }
 
@@ -448,6 +548,10 @@ X_STATUS XThread::Create() {
     // Execute user code.
     current_xthread_tls_ = this;
     running_ = true;
+    if (guest_thread_) {
+      BeginTitleExecution();
+      title_thread_count_.counted = true;
+    }
     Execute();
     running_ = false;
     current_xthread_tls_ = nullptr;
@@ -1014,7 +1118,11 @@ X_STATUS XThread::Delay(uint32_t processor_mode, uint32_t alertable, uint64_t in
   timeout_ms = chrono::Clock::ScaleGuestDurationMillis(timeout_ms);
   CheckTitleTermination();
   if (alertable) {
-    auto result = rex::thread::AlertableSleep(std::chrono::milliseconds(timeout_ms));
+    rex::thread::SleepResult result;
+    {
+      GuestWait wait;
+      result = rex::thread::AlertableSleep(std::chrono::milliseconds(timeout_ms));
+    }
     CheckTitleTermination();
     switch (result) {
       default:
@@ -1031,6 +1139,7 @@ X_STATUS XThread::Delay(uint32_t processor_mode, uint32_t alertable, uint64_t in
         rex::thread::MaybeYield();
       }
     } else {
+      GuestWait wait;
       rex::thread::Sleep(std::chrono::milliseconds(timeout_ms));
     }
     CheckTitleTermination();

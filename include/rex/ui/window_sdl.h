@@ -35,6 +35,7 @@ class WindowSDL final : public Window {
   void* GetNativeWindowHandle() const override;
   void* GetSDLWindowHandle() const override { return sdl_window_; }
   void Hide() override;
+  double GetDisplayRefreshRate() const override;
   bool SetRelativeMouseMode(bool enable) override;
   bool WarpMouseToCenter(int32_t& x_out, int32_t& y_out) override;
   std::string GetClipboardText() override;

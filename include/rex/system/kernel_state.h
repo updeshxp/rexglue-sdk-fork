@@ -272,7 +272,7 @@ class KernelState {
     return object_ref<T>(reinterpret_cast<T*>(module.release()));
   }
 
-  // Terminates a title: Unloads all modules, and kills all guest threads.
+  // Terminates a title: stops all of its guest threads.
   // This DOES NOT RETURN if called from a guest thread!
   void TerminateTitle();
   bool is_terminating_title() const { return terminating_title_.load(std::memory_order_acquire); }
@@ -342,7 +342,6 @@ class KernelState {
 
  private:
   void SignalAllWaitableObjects();
-  void WaitForThreadsToExit(const std::vector<object_ref<XThread>>& threads, uint32_t timeout_ms);
   void LoadKernelModule(object_ref<KernelModule> kernel_module);
   void InitializeProcess(X_KPROCESS* process, uint32_t process_type, uint8_t unk_18, uint8_t unk_19,
                          uint8_t unk_1A);

@@ -321,6 +321,15 @@ void Runtime::Shutdown() {
     instance_ = nullptr;
   }
 
+  // Guest threads reach everything below, so none may run past this point, including the one that
+  // terminated the title, which may still be exiting.
+  if (kernel_state_) {
+    if (!kernel_state_->is_terminating_title()) {
+      kernel_state_->TerminateTitle();
+    }
+    system::XThread::StopTitleThreads();
+  }
+
   if (graphics_system_) {
     graphics_system_->Shutdown();
     graphics_system_.reset();

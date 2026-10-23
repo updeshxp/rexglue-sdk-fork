@@ -163,6 +163,13 @@ class D3D12TextureCache final : public TextureCache {
                                      uint32_t* width_unscaled_out = nullptr,
                                      uint32_t* height_unscaled_out = nullptr);
 
+  // Textures filled from the render target of a resolve instead of being loaded from its memory.
+  // Prepare before the resolve marks its range as resolved, perform after, with the render target
+  // in the copy source state.
+  uint32_t PrepareResolveTextureCopies(const draw_util::ResolveTextureCopy& copy);
+  void PerformResolveTextureCopies(const draw_util::ResolveTextureCopy& copy,
+                                   ID3D12Resource* source);
+
  protected:
   bool IsSignedVersionSeparateForFormat(TextureKey key) const override;
   bool IsScaledResolveSupportedForFormat(TextureKey key) const override;
@@ -257,6 +264,7 @@ class D3D12TextureCache final : public TextureCache {
 
     ID3D12Resource* resource() const { return resource_.Get(); }
 
+    D3D12_RESOURCE_STATES resource_state() const { return resource_state_; }
     D3D12_RESOURCE_STATES SetResourceState(D3D12_RESOURCE_STATES new_state) {
       D3D12_RESOURCE_STATES old_state = resource_state_;
       resource_state_ = new_state;
@@ -484,6 +492,10 @@ class D3D12TextureCache final : public TextureCache {
   D3D12_CPU_DESCRIPTOR_HANDLE null_srv_descriptor_heap_start_;
 
   std::array<D3D12TextureBinding, xenos::kTextureFetchConstantCount> d3d12_texture_bindings_;
+
+  static constexpr uint32_t kMaxResolveTextureCopies = 4;
+  Texture* resolve_copy_textures_[kMaxResolveTextureCopies];
+  uint32_t resolve_copy_texture_count_ = 0;
 
   // Unsupported texture formats used during this frame (for research and
   // testing).

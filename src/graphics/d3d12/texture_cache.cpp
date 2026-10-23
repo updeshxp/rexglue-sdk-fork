@@ -1396,9 +1396,12 @@ ID3D12Resource* D3D12TextureCache::RequestSwapTexture(D3D12_SHADER_RESOURCE_VIEW
       D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
   srv_desc_out.Format = GetDXGIUnormFormat(key);
   srv_desc_out.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+  uint32_t host_swizzle = GuestToHostSwizzle(fetch.swizzle, GetHostFormatSwizzle(key));
+  if (texture->content_red_blue_swapped()) {
+    host_swizzle = SwapRedBlueSwizzle(host_swizzle);
+  }
   srv_desc_out.Shader4ComponentMapping =
-      GuestToHostSwizzle(fetch.swizzle, GetHostFormatSwizzle(key)) |
-      D3D12_SHADER_COMPONENT_MAPPING_ALWAYS_SET_BIT_AVOIDING_ZEROMEM_MISTAKES;
+      host_swizzle | D3D12_SHADER_COMPONENT_MAPPING_ALWAYS_SET_BIT_AVOIDING_ZEROMEM_MISTAKES;
   srv_desc_out.Texture2D.MostDetailedMip = 0;
   srv_desc_out.Texture2D.MipLevels = 1;
   srv_desc_out.Texture2D.PlaneSlice = 0;
@@ -1414,6 +1417,63 @@ ID3D12Resource* D3D12TextureCache::RequestSwapTexture(D3D12_SHADER_RESOURCE_VIEW
   }
   format_out = key.format;
   return texture_resource;
+}
+
+uint32_t D3D12TextureCache::PrepareResolveTextureCopies(const draw_util::ResolveTextureCopy& copy) {
+  Texture* found[kMaxResolveTextureCopies];
+  uint32_t found_count = FindResolveCopyTargets(copy, found, kMaxResolveTextureCopies);
+  resolve_copy_texture_count_ = 0;
+  for (uint32_t i = 0; i < found_count; ++i) {
+    // Loaded with a plain copy into a format of the render target's typeless family. A copy
+    // destination not used since may still have its previous copy unordered with a new one.
+    if (GetLoadShaderIndex(found[i]->key()) == kLoadShaderIndex32bpb &&
+        static_cast<D3D12Texture*>(found[i])->resource_state() !=
+            D3D12_RESOURCE_STATE_COPY_DEST) {
+      resolve_copy_textures_[resolve_copy_texture_count_++] = found[i];
+    }
+  }
+  return resolve_copy_texture_count_;
+}
+
+void D3D12TextureCache::PerformResolveTextureCopies(const draw_util::ResolveTextureCopy& copy,
+                                                    ID3D12Resource* source) {
+  for (uint32_t i = 0; i < resolve_copy_texture_count_; ++i) {
+    D3D12Texture& texture = *static_cast<D3D12Texture*>(resolve_copy_textures_[i]);
+    command_processor_.PushTransitionBarrier(
+        texture.resource(), texture.SetResourceState(D3D12_RESOURCE_STATE_COPY_DEST),
+        D3D12_RESOURCE_STATE_COPY_DEST);
+  }
+  command_processor_.SubmitBarriers();
+  DeferredCommandList& command_list = command_processor_.GetDeferredCommandList();
+  D3D12_TEXTURE_COPY_LOCATION location_source, location_dest;
+  location_source.pResource = source;
+  location_source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+  location_source.SubresourceIndex = 0;
+  location_dest.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+  location_dest.SubresourceIndex = 0;
+  for (uint32_t i = 0; i < resolve_copy_texture_count_; ++i) {
+    D3D12Texture& texture = *static_cast<D3D12Texture*>(resolve_copy_textures_[i]);
+    const TextureKey& key = texture.key();
+    draw_util::ResolveTextureCopyRegion regions[draw_util::kMaxResolveTextureCopyRegions];
+    uint32_t region_count = draw_util::GetResolveTextureCopyRegions(
+        copy, key.GetWidth() * draw_resolution_scale_x(),
+        key.GetHeight() * draw_resolution_scale_y(), regions);
+    location_dest.pResource = texture.resource();
+    for (uint32_t j = 0; j < region_count; ++j) {
+      const draw_util::ResolveTextureCopyRegion& region = regions[j];
+      D3D12_BOX box;
+      box.left = region.source_x;
+      box.top = region.source_y;
+      box.front = 0;
+      box.right = region.source_x + region.width;
+      box.bottom = region.source_y + region.height;
+      box.back = 1;
+      command_list.D3DCopyTextureRegion(&location_dest, region.dest_x, region.dest_y, 0,
+                                        &location_source, &box);
+    }
+    EndResolveCopyIntoTexture(texture, copy.red_blue_swapped);
+  }
+  resolve_copy_texture_count_ = 0;
 }
 
 D3D12TextureCache::D3D12Texture::D3D12Texture(D3D12TextureCache& texture_cache,

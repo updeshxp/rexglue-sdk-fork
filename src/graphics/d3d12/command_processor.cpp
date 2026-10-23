@@ -301,7 +301,7 @@ bool D3D12CommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffe
     return write_fallback_result();
   }
 
-  if (!EndGuestOcclusionQuery(sample_count_addr, sample_counts)) {
+  if (!EndGuestOcclusionQuery(sample_count_addr)) {
     return write_fallback_result();
   }
 
@@ -1015,6 +1015,9 @@ bool D3D12CommandProcessor::SetupContext() {
         "the emulator, reducing to {}x{}",
         draw_resolution_scale_x, draw_resolution_scale_y);
   }
+  uint32_t host_scale_quarters_x, host_scale_quarters_y;
+  TextureCache::GetConfigInternalRenderScale(draw_resolution_scale_x, draw_resolution_scale_y,
+                                             host_scale_quarters_x, host_scale_quarters_y);
 
   shared_memory_ = std::make_unique<D3D12SharedMemory>(*this, *memory_);
   if (!shared_memory_->Initialize()) {
@@ -1027,6 +1030,7 @@ bool D3D12CommandProcessor::SetupContext() {
   render_target_cache_ = std::make_unique<D3D12RenderTargetCache>(
       *register_file_, *memory_, draw_resolution_scale_x, draw_resolution_scale_y, *this,
       bindless_resources_used_);
+  render_target_cache_->SetHostScaleQuarters(host_scale_quarters_x, host_scale_quarters_y);
   if (!render_target_cache_->Initialize()) {
     REXGPU_ERROR("Failed to initialize the render target cache");
     return false;
@@ -2350,10 +2354,42 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
 }
 
 void D3D12CommandProcessor::OnPrimaryBufferEnd() {
-  if (REXCVAR_GET(d3d12_submit_on_primary_buffer_end) && submission_open_ &&
-      CanEndSubmissionImmediately()) {
+  if (ShouldEndSubmissionEarly()) {
     EndSubmission(false);
   }
+  if (!pending_occlusion_queries_.empty()) {
+    CheckSubmissionFence(0);
+  }
+}
+
+bool D3D12CommandProcessor::ShouldEndSubmissionEarly() {
+  constexpr uint64_t kMaxSubmissionsInFlight = 3;
+  // Ending the submission would end the active query early, losing its result.
+  if (!REXCVAR_GET(d3d12_submit_on_primary_buffer_end) || !submission_open_ ||
+      active_occlusion_query_.valid || !CanEndSubmissionImmediately()) {
+    return false;
+  }
+  CheckSubmissionFence(0);
+  return submission_current_ - 1 - submission_completed_ < kMaxSubmissionsInFlight;
+}
+
+bool D3D12CommandProcessor::PollBackgroundWork() {
+  bool submission_held = submission_open_ && REXCVAR_GET(d3d12_submit_on_primary_buffer_end);
+  if (pending_occlusion_queries_.empty() && !submission_held) {
+    return false;
+  }
+  // The guest may be polling the query results, so their submission must not stay open while
+  // there is nothing more to record.
+  bool queries_in_open_submission =
+      !pending_occlusion_queries_.empty() &&
+      pending_occlusion_queries_.back().submission >= submission_current_;
+  if (submission_open_ && !active_occlusion_query_.valid && CanEndSubmissionImmediately() &&
+      (queries_in_open_submission || ShouldEndSubmissionEarly())) {
+    EndSubmission(false);
+  }
+  CheckSubmissionFence(0);
+  return !pending_occlusion_queries_.empty() ||
+         (submission_open_ && REXCVAR_GET(d3d12_submit_on_primary_buffer_end));
 }
 
 Shader* D3D12CommandProcessor::LoadShader(xenos::ShaderType shader_type, uint32_t guest_address,
@@ -2543,8 +2579,8 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   }
 
   // Get dynamic rasterizer state.
-  uint32_t draw_resolution_scale_x = texture_cache_->draw_resolution_scale_x();
-  uint32_t draw_resolution_scale_y = texture_cache_->draw_resolution_scale_y();
+  uint32_t host_scale_quarters_x = render_target_cache_->host_scale_quarters_x();
+  uint32_t host_scale_quarters_y = render_target_cache_->host_scale_quarters_y();
 
   bool convert_z_to_float24 =
       host_render_targets_used && render_target_cache_->depth_float24_convert_in_pixel_shader();
@@ -2568,10 +2604,10 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   if (viewport_cache_valid_ && viewport_key == previous_viewport_key_) {
     viewport_info = previous_viewport_info_;
   } else {
-    draw_util::GetHostViewportInfo(regs, draw_resolution_scale_x, draw_resolution_scale_y, true,
-                                   D3D12_VIEWPORT_BOUNDS_MAX, D3D12_VIEWPORT_BOUNDS_MAX, false,
-                                   normalized_depth_control, convert_z_to_float24,
-                                   host_render_targets_used, ps_writes_depth, viewport_info);
+    draw_util::GetHostViewportInfoAtHostScale(
+        regs, host_scale_quarters_x, host_scale_quarters_y, true, D3D12_VIEWPORT_BOUNDS_MAX,
+        D3D12_VIEWPORT_BOUNDS_MAX, false, normalized_depth_control, convert_z_to_float24,
+        host_render_targets_used, ps_writes_depth, viewport_info);
     previous_viewport_key_ = viewport_key;
     previous_viewport_info_ = viewport_info;
     viewport_cache_valid_ = true;
@@ -2579,10 +2615,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
 
   draw_util::Scissor scissor;
   draw_util::GetScissor(regs, scissor);
-  scissor.offset[0] *= draw_resolution_scale_x;
-  scissor.offset[1] *= draw_resolution_scale_y;
-  scissor.extent[0] *= draw_resolution_scale_x;
-  scissor.extent[1] *= draw_resolution_scale_y;
+  draw_util::ScaleScissorToHost(scissor, host_scale_quarters_x, host_scale_quarters_y);
 
   // Update viewport, scissor, blend factor and stencil reference.
   UpdateFixedFunctionState(viewport_info, scissor, primitive_polygonal, normalized_depth_control);
@@ -3317,6 +3350,8 @@ void D3D12CommandProcessor::CheckSubmissionFence(uint64_t await_submission) {
   primitive_processor_->CompletedSubmissionUpdated();
 
   texture_cache_->CompletedSubmissionUpdated(submission_completed_);
+
+  CompleteOcclusionQueries(false);
 }
 
 void D3D12CommandProcessor::LogDeviceRemovalDiagnostics(ID3D12Device* device, HRESULT reason) {
@@ -3955,10 +3990,10 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
     // to radius conversion to avoid multiplying the per-vertex diameter by an
     // additional constant in the shader.
     float point_screen_diameter_to_ndc_radius_x =
-        (/* 0.5f * 2.0f * */ float(draw_resolution_scale_x)) /
+        (/* 0.5f * 2.0f * */ float(render_target_cache_->host_scale_quarters_x()) * 0.25f) /
         std::max(viewport_info.xy_extent[0], uint32_t(1));
     float point_screen_diameter_to_ndc_radius_y =
-        (/* 0.5f * 2.0f * */ float(draw_resolution_scale_y)) /
+        (/* 0.5f * 2.0f * */ float(render_target_cache_->host_scale_quarters_y()) * 0.25f) /
         std::max(viewport_info.xy_extent[1], uint32_t(1));
     dirty |= system_constants_.point_screen_diameter_to_ndc_radius[0] !=
              point_screen_diameter_to_ndc_radius_x;
@@ -4097,8 +4132,11 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
     // reverted (slope only along the scaled axis), thus max. More bias is
     // better than less bias, because less bias means Z fighting with the
     // background is more likely.
-    float poly_offset_scale_factor = xenos::kPolygonOffsetScaleSubpixelUnit *
-                                     std::max(draw_resolution_scale_x, draw_resolution_scale_y);
+    float poly_offset_scale_factor =
+        xenos::kPolygonOffsetScaleSubpixelUnit *
+        (float(std::max(render_target_cache_->host_scale_quarters_x(),
+                        render_target_cache_->host_scale_quarters_y())) *
+         0.25f);
     poly_offset_front_scale *= poly_offset_scale_factor;
     poly_offset_back_scale *= poly_offset_scale_factor;
     dirty |= system_constants_.edram_poly_offset_front_scale != poly_offset_front_scale;
@@ -5010,6 +5048,7 @@ bool D3D12CommandProcessor::InitializeOcclusionQueryResources() {
 
 void D3D12CommandProcessor::ShutdownOcclusionQueryResources() {
   DisableHostOcclusionQueries();
+  pending_occlusion_queries_.clear();
 
   if (occlusion_query_readback_ && occlusion_query_readback_mapping_) {
     occlusion_query_readback_->Unmap(0, nullptr);
@@ -5021,6 +5060,8 @@ void D3D12CommandProcessor::ShutdownOcclusionQueryResources() {
 
 bool D3D12CommandProcessor::AcquireOcclusionQueryIndex(uint32_t& host_index_out) {
   if (occlusion_query_cursor_ >= kMaxOcclusionQueries) {
+    // Results still in flight must not be overwritten by the reused indices.
+    CompleteOcclusionQueries(true);
     occlusion_query_cursor_ = 0;
   }
   host_index_out = occlusion_query_cursor_++;
@@ -5072,10 +5113,10 @@ bool D3D12CommandProcessor::BeginGuestOcclusionQuery(uint32_t sample_count_addre
   return true;
 }
 
-bool D3D12CommandProcessor::EndGuestOcclusionQuery(
-    uint32_t sample_count_address, xenos::xe_gpu_depth_sample_counts* sample_counts) {
+bool D3D12CommandProcessor::EndGuestOcclusionQuery(uint32_t sample_count_address) {
   if (!REXCVAR_GET(occlusion_query_enable) || !occlusion_query_resources_available_ ||
-      !active_occlusion_query_.valid || !occlusion_query_heap_ || !occlusion_query_readback_) {
+      !active_occlusion_query_.valid || !occlusion_query_heap_ || !occlusion_query_readback_ ||
+      !occlusion_query_readback_mapping_) {
     return false;
   }
 
@@ -5092,32 +5133,55 @@ bool D3D12CommandProcessor::EndGuestOcclusionQuery(
       occlusion_query_heap_.Get(), D3D12_QUERY_TYPE_OCCLUSION, host_index, 1,
       occlusion_query_readback_.Get(), sizeof(uint64_t) * host_index);
 
-  if (!EndSubmission(false)) {
-    return false;
-  }
-
-  uint64_t query_submission = submission_current_ ? submission_current_ - 1 : 0;
-  CheckSubmissionFence(query_submission);
-  if (submission_completed_ < query_submission) {
-    return false;
-  }
-  if (!occlusion_query_readback_mapping_) {
-    return false;
-  }
-
-  uint64_t samples = occlusion_query_readback_mapping_[host_index];
-  samples = NormalizeOcclusionSamples(samples);
-  WriteGuestOcclusionResult(sample_counts, samples);
+  // The guest sees the query as unfinished until the result is written after the submission
+  // completes, like with the GPU running behind the command processor on the console. A result
+  // not yet written for the same address would be overwritten by the new query anyway.
+  pending_occlusion_queries_.erase(
+      std::remove_if(pending_occlusion_queries_.begin(), pending_occlusion_queries_.end(),
+                     [sample_count_address](const PendingOcclusionQuery& query) {
+                       return query.sample_count_address == sample_count_address;
+                     }),
+      pending_occlusion_queries_.end());
+  pending_occlusion_queries_.push_back({submission_current_, host_index, sample_count_address});
   return true;
 }
 
+void D3D12CommandProcessor::CompleteOcclusionQueries(bool wait) {
+  while (!pending_occlusion_queries_.empty()) {
+    uint64_t submission = pending_occlusion_queries_.front().submission;
+    if (submission_completed_ < submission) {
+      if (!wait) {
+        return;
+      }
+      CheckSubmissionFence(submission);
+      if (submission_completed_ < submission) {
+        return;
+      }
+      // Updating the completed submission may have already written the result.
+      continue;
+    }
+    PendingOcclusionQuery query = pending_occlusion_queries_.front();
+    pending_occlusion_queries_.pop_front();
+    if (device_removed_ || !occlusion_query_readback_mapping_) {
+      continue;
+    }
+    WriteGuestOcclusionResult(
+        memory_->TranslatePhysical<xenos::xe_gpu_depth_sample_counts*>(query.sample_count_address),
+        NormalizeOcclusionSamples(occlusion_query_readback_mapping_[query.host_index]));
+  }
+}
+
 uint64_t D3D12CommandProcessor::NormalizeOcclusionSamples(uint64_t samples) const {
-  if (samples == 0 || !texture_cache_) {
+  if (samples == 0 || !texture_cache_ || !render_target_cache_) {
     return samples;
   }
-  uint64_t scale_x = texture_cache_->draw_resolution_scale_x();
-  uint64_t scale_y = texture_cache_->draw_resolution_scale_y();
-  uint64_t scale = scale_x * scale_y;
+  uint64_t quarters_x = render_target_cache_->host_scale_quarters_x();
+  uint64_t quarters_y = render_target_cache_->host_scale_quarters_y();
+  if ((quarters_x | quarters_y) & 3) {
+    uint64_t scale_sixteenths = quarters_x * quarters_y;
+    return (samples * 16 + (scale_sixteenths >> 1)) / scale_sixteenths;
+  }
+  uint64_t scale = (quarters_x >> 2) * (quarters_y >> 2);
   if (scale <= 1) {
     return samples;
   }

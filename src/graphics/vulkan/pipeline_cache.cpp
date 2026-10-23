@@ -297,6 +297,8 @@ bool VulkanPipelineCache::Initialize() {
       render_target_cache_.msaa_2x_no_attachments_supported(), edram_fragment_shader_interlock,
       render_target_cache_.draw_resolution_scale_x(),
       render_target_cache_.draw_resolution_scale_y());
+  shader_translator_->SetHostScaleQuarters(render_target_cache_.host_scale_quarters_x(),
+                                           render_target_cache_.host_scale_quarters_y());
 
   if (edram_fragment_shader_interlock) {
     std::vector<uint8_t> depth_only_fragment_shader_code =

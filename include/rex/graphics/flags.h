@@ -23,6 +23,7 @@ REXCVAR_DECLARE(bool, async_shader_compilation);
 REXCVAR_DECLARE(int32_t, resolution_scale);
 REXCVAR_DECLARE(int32_t, draw_resolution_scale_x);
 REXCVAR_DECLARE(int32_t, draw_resolution_scale_y);
+REXCVAR_DECLARE(int32_t, ssf2t_internal_render_scale);
 REXCVAR_DECLARE(bool, resolve_resolution_scale_fill_half_pixel_offset);
 REXCVAR_DECLARE(bool, draw_resolution_scaled_texture_offsets);
 REXCVAR_DECLARE(std::string, readback_resolve);
